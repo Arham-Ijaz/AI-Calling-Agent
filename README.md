@@ -39,8 +39,8 @@ If you prefer running commands manually:
 
 ```bash
 # 1. Clone the repository
-git clone https://github.com/your-username/digibuzz-ai-calling-agent.git
-cd digibuzz-ai-calling-agent
+git clone https://github.com/Arham-Ijaz/-AI-Calling-Agent.git
+cd ai-calling-agent
 
 # 2. Configure .env file
 # Windows:
