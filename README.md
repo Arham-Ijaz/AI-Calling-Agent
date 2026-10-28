@@ -1,4 +1,4 @@
-# 📞 DigiBuzz — AI Customer Calling Agent
+# 📞 AI Customer Calling Agent
 
 An intelligent, voice-enabled AI Customer Calling Agent tailored for wholesale B2B retail networks. Powered by **FastAPI**, **Google Gemini AI**, **gTTS**, and a modular multi-page responsive web dashboard.
 
@@ -39,8 +39,8 @@ If you prefer running commands manually:
 
 ```bash
 # 1. Clone the repository
-git clone https://github.com/Arham-Ijaz/-AI-Calling-Agent.git
-cd ai-calling-agent
+git clone https://github.com/Arham-Ijaz/AI-Calling-Agent.git
+cd Ai-Calling-Agent
 
 # 2. Configure .env file
 # Windows:
