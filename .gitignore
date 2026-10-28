@@ -1,0 +1,55 @@
+# Environment variables and secrets
+.env
+.env.local
+*.env
+
+# Python runtime & caches
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+venv/
+.venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+
+# IDE / Editor configuration
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# Database runtime files (auto-generated from faq.json & products.json on first run)
+call_logs.db
+call_logs.db-wal
+call_logs.db-shm
+*.db
+*.sqlite3
+
+# Audio / temporary cache
+temp_*.mp3
+*.mp3

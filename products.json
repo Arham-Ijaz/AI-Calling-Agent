@@ -1,0 +1,172 @@
+{
+  "products": [
+    {
+      "name": "Samsung Galaxy A54 5G (8GB/256GB)",
+      "category": "Mobile Phones",
+      "brand": "Samsung",
+      "price": 105000,
+      "stock_status": "in_stock",
+      "description": "Mid-range business smartphone with 50MP camera, Super AMOLED display, and 5000mAh battery."
+    },
+    {
+      "name": "Xiaomi Redmi Note 13 Pro (8GB/256GB)",
+      "category": "Mobile Phones",
+      "brand": "Xiaomi",
+      "price": 68000,
+      "stock_status": "in_stock",
+      "description": "Affordable commercial smartphone with 200MP camera and 67W fast charging."
+    },
+    {
+      "name": "Infinix Note 40 Pro (12GB/256GB)",
+      "category": "Mobile Phones",
+      "brand": "Infinix",
+      "price": 62000,
+      "stock_status": "limited",
+      "description": "Value smartphone with 70W fast charging, AMOLED screen, and wireless charging support."
+    },
+    {
+      "name": "Dell Latitude 3540 (Core i5 13th Gen, 8GB/512GB SSD)",
+      "category": "Laptops",
+      "brand": "Dell",
+      "price": 165000,
+      "stock_status": "in_stock",
+      "description": "Durable commercial laptop for business and office workloads."
+    },
+    {
+      "name": "HP ProBook 450 G10 (Core i7 13th Gen, 16GB/512GB SSD)",
+      "category": "Laptops",
+      "brand": "HP",
+      "price": 215000,
+      "stock_status": "in_stock",
+      "description": "High-performance enterprise laptop with aluminum chassis and long battery life."
+    },
+    {
+      "name": "Lenovo ThinkPad E14 Gen 5 (Ryzen 5, 16GB/512GB SSD)",
+      "category": "Laptops",
+      "brand": "Lenovo",
+      "price": 175000,
+      "stock_status": "limited",
+      "description": "Reliable business laptop with ergonomic keyboard, trackpoint, and TPM security."
+    },
+    {
+      "name": "Samsung Galaxy Tab A9+ (4GB/64GB, Wi-Fi+LTE)",
+      "category": "Tablets",
+      "brand": "Samsung",
+      "price": 58000,
+      "stock_status": "in_stock",
+      "description": "11-inch Android tablet ideal for point-of-sale and store inventory management."
+    },
+    {
+      "name": "Apple iPad 9th Gen (64GB, Wi-Fi)",
+      "category": "Tablets",
+      "brand": "Apple",
+      "price": 85000,
+      "stock_status": "in_stock",
+      "description": "10.2-inch Retina display tablet with A13 Bionic chip for business apps and billing."
+    },
+    {
+      "name": "Lenovo Tab M11 (4GB/128GB with Pen)",
+      "category": "Tablets",
+      "brand": "Lenovo",
+      "price": 46000,
+      "stock_status": "out_of_stock",
+      "description": "Budget tablet with stylus support for digital signatures, notes, and records."
+    },
+    {
+      "name": "Anker Power Bank 20000mAh 20W PD",
+      "category": "Accessories",
+      "brand": "Anker",
+      "price": 11500,
+      "stock_status": "in_stock",
+      "description": "Heavy-duty power bank with dual USB-C fast charging for phones and tablets."
+    },
+    {
+      "name": "Logitech MK270 Wireless Keyboard and Mouse Combo",
+      "category": "Accessories",
+      "brand": "Logitech",
+      "price": 8200,
+      "stock_status": "in_stock",
+      "description": "Long battery life wireless desktop set with 2.4GHz USB receiver."
+    },
+    {
+      "name": "Baseus 65W GaN Fast Charger 3-Port",
+      "category": "Accessories",
+      "brand": "Baseus",
+      "price": 6500,
+      "stock_status": "in_stock",
+      "description": "Multi-port compact wall charger for laptops, tablets, and smartphones."
+    },
+    {
+      "name": "TP-Link Archer AX53 Dual-Band Wi-Fi 6 Router",
+      "category": "Networking Equipment",
+      "brand": "TP-Link",
+      "price": 17500,
+      "stock_status": "in_stock",
+      "description": "Gigabit Wi-Fi 6 router with up to 3000Mbps speed for small offices and retail shops."
+    },
+    {
+      "name": "D-Link 16-Port Gigabit Unmanaged Switch (DGS-1016A)",
+      "category": "Networking Equipment",
+      "brand": "D-Link",
+      "price": 14500,
+      "stock_status": "in_stock",
+      "description": "Plug-and-play desktop/rackmount ethernet network switch for multi-device setups."
+    },
+    {
+      "name": "MikroTik hEX RB750Gr3 5-Port Gigabit Router",
+      "category": "Networking Equipment",
+      "brand": "MikroTik",
+      "price": 16000,
+      "stock_status": "limited",
+      "description": "Advanced configurable wired router for business network management and VPN."
+    },
+    {
+      "name": "HP LaserJet Pro M404dn Monochrome Printer",
+      "category": "Printers",
+      "brand": "HP",
+      "price": 88000,
+      "stock_status": "in_stock",
+      "description": "Fast duplex business laser printer with gigabit networking and high monthly duty cycle."
+    },
+    {
+      "name": "Epson EcoTank L3250 All-in-One Ink Tank Printer",
+      "category": "Printers",
+      "brand": "Epson",
+      "price": 62000,
+      "stock_status": "in_stock",
+      "description": "Low-cost wireless color printing, scanning, and copying with refillable ink tanks."
+    },
+    {
+      "name": "Xprinter XP-420B Thermal Barcode Shipping Label Printer",
+      "category": "Printers",
+      "brand": "Xprinter",
+      "price": 24000,
+      "stock_status": "in_stock",
+      "description": "Direct thermal 4-inch label printer for invoices, barcodes, and shipping parcels."
+    },
+    {
+      "name": "Kingston NV2 1TB M.2 NVMe PCIe 4.0 SSD",
+      "category": "Storage Devices",
+      "brand": "Kingston",
+      "price": 19500,
+      "stock_status": "in_stock",
+      "description": "High-speed internal SSD storage upgrade for business laptops and office PCs."
+    },
+    {
+      "name": "SanDisk Ultra Dual Drive 128GB USB Type-C & Type-A",
+      "category": "Storage Devices",
+      "brand": "SanDisk",
+      "price": 3800,
+      "stock_status": "in_stock",
+      "description": "OTG flash drive for quick file transfers between smartphones and computers."
+    },
+    {
+      "name": "Seagate Expansion 2TB External 2.5-inch USB 3.0 HDD",
+      "category": "Storage Devices",
+      "brand": "Seagate",
+      "price": 21000,
+      "stock_status": "limited",
+      "description": "Portable external hard drive for store backups, accounting ledgers, and CCTV files."
+    }
+  ]
+}

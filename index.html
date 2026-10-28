@@ -1,0 +1,463 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>DigiBuzz AI Calling Agent</title>
+  <link rel="stylesheet" href="/static/main.css" />
+  <link rel="icon" href="/favicon.ico" type="image/x-icon" />
+</head>
+<body>
+  <!-- ===== Top Navigation ===== -->
+  <nav class="navbar">
+    <div class="navbar-brand">
+      <span class="brand-icon">📞</span>
+      <span class="brand-name">DigiBuzz <span class="brand-accent">AI</span></span>
+      <button class="key-status-badge" id="keyStatusBadge" title="API Key Status — click to view Settings">🟢</button>
+    </div>
+    <ul class="nav-links" id="navLinks">
+      <li><a href="#" class="nav-link active" data-page="home">🏠 Home</a></li>
+      <li><a href="#" class="nav-link" data-page="faqs">💬 FAQs</a></li>
+      <li><a href="#" class="nav-link" data-page="products">📦 Products</a></li>
+      <li><a href="#" class="nav-link" data-page="logs">📋 Call Logs</a></li>
+      <li><a href="#" class="nav-link" data-page="settings">⚙️ Settings</a></li>
+    </ul>
+    <div style="display:flex;align-items:center;gap:.5rem;">
+      <button class="theme-toggle" id="themeToggleBtn" title="Toggle Light/Dark Theme" aria-label="Toggle theme">
+        <span class="theme-toggle-icon" id="themeToggleIcon">🌙</span>
+        <span id="themeToggleText" style="font-size:.78rem;font-weight:600;">Dark</span>
+      </button>
+      <button class="nav-hamburger" id="navHamburger" aria-label="Toggle menu">☰</button>
+    </div>
+  </nav>
+
+  <!-- ===== Main Content ===== -->
+  <main class="main-content">
+
+    <!-- ===== HOME PAGE ===== -->
+    <section id="page-home" class="page active">
+      <div class="page-header">
+        <div>
+          <h1>DigiBuzz AI Calling Agent</h1>
+          <p class="page-subtitle">Customer Support Voice Assistant — Ask anything about our products and services</p>
+        </div>
+      </div>
+
+      <div class="call-layout">
+        <!-- Call Card -->
+        <div class="call-card">
+          <!-- Status Bar -->
+          <div class="call-status-bar">
+            <div class="status-indicator" id="statusIndicator">
+              <span class="status-dot idle" id="statusDot"></span>
+              <span id="statusText">Ready to connect</span>
+            </div>
+            <!-- Live Voice Tip Hint Banner -->
+            <div id="callHintBanner" style="display:none;padding:.35rem .75rem;background:var(--brand-light);border:1px solid var(--border-strong);border-radius:20px;font-size:.76rem;color:var(--brand);font-weight:600;align-items:center;gap:.35rem;">
+              <span>💡 Tip:</span> Say <em>"End Call"</em> or <em>"Bye"</em> anytime to finish the call
+            </div>
+            <div class="call-controls">
+              <button class="btn btn-success" id="btnStartCall">📞 Start Call</button>
+              <button class="btn btn-danger hidden" id="btnEndCall">📵 End Call</button>
+              <button class="btn btn-outline" id="btnNewSession" title="Start a new session">🔄 New Session</button>
+            </div>
+          </div>
+
+          <!-- Chat Window -->
+          <div class="chat-window" id="chatWindow">
+            <div class="chat-placeholder" id="chatPlaceholder">
+              <div class="placeholder-icon">🎙️</div>
+              <p>Click <strong>Start Call</strong> to connect with the DigiBuzz AI Calling Agent.</p>
+              <p class="text-muted">You can type or use voice to ask questions about products, pricing, delivery, and more.</p>
+            </div>
+          </div>
+
+          <!-- Typing Indicator -->
+          <div class="typing-indicator hidden" id="typingIndicator">
+            <span></span><span></span><span></span>
+            <span class="typing-label">DigiBuzz AI is responding…</span>
+          </div>
+
+          <!-- Input Bar -->
+          <div class="input-bar">
+            <button class="mic-btn" id="btnMic" title="Hold to speak" disabled>🎤</button>
+            <input
+              type="text"
+              class="chat-input"
+              id="chatInput"
+              placeholder="Type your message…"
+              maxlength="500"
+              disabled
+            />
+            <button class="btn btn-brand" id="btnSend" disabled>Send</button>
+          </div>
+
+          <!-- Quick FAQ Chips Carousel / Slide Bar -->
+          <div class="chips-container-wrapper">
+            <div class="chips-header">
+              <div class="chips-title-group">
+                <span class="chips-icon">⚡</span>
+                <span class="chips-title">Suggested Inquiries (Slide to explore):</span>
+              </div>
+              <div class="chips-controls-group">
+                <button type="button" class="chip-arrow-btn" id="chipScrollLeft" title="Scroll left" aria-label="Previous suggestions">◀</button>
+                <button type="button" class="chip-arrow-btn" id="chipScrollRight" title="Scroll right" aria-label="Next suggestions">▶</button>
+              </div>
+            </div>
+            <div class="chips-slider-viewport">
+              <div class="chips-section" id="chipsSection"></div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Side Info Panel -->
+        <aside class="side-panel">
+          <div class="info-card">
+            <h3>Session Info</h3>
+            <div class="info-row">
+              <span class="info-label">Session ID</span>
+              <span class="info-value mono" id="sideSessionId">—</span>
+            </div>
+            <div class="info-row">
+              <span class="info-label">Status</span>
+              <span class="info-value" id="sideStatus">Idle</span>
+            </div>
+            <div class="info-row">
+              <span class="info-label">Messages</span>
+              <span class="info-value" id="sideMsgCount">0</span>
+            </div>
+            <div class="info-row">
+              <span class="info-label">Voice</span>
+              <span class="info-value" id="sideVoiceStatus">On</span>
+            </div>
+          </div>
+          <div class="info-card">
+            <h3>Voice Controls</h3>
+            <button class="btn btn-outline w-full" id="btnToggleVoice">🔇 Disable Voice</button>
+          </div>
+          <div class="info-card tip-card">
+            <h3>💡 Tips</h3>
+            <ul class="tip-list">
+              <li>Ask about product pricing and availability</li>
+              <li>Inquire about delivery times and areas</li>
+              <li>Ask about payment methods</li>
+              <li>Request a human representative anytime</li>
+              <li>Say <strong>"End call"</strong> or <strong>"Finish call"</strong> to end</li>
+            </ul>
+          </div>
+        </aside>
+      </div>
+    </section>
+
+    <!-- ===== FAQ PAGE ===== -->
+    <section id="page-faqs" class="page hidden">
+      <div class="page-header">
+        <div>
+          <h1>FAQ Management</h1>
+          <p class="page-subtitle">Manage the AI agent's knowledge base — questions and answers</p>
+        </div>
+        <button class="btn btn-brand" id="btnAddFAQ">+ Add FAQ</button>
+      </div>
+      <div class="table-toolbar">
+        <input type="text" class="search-input" id="faqSearch" placeholder="🔍 Search FAQs by question, answer, or intent…" />
+        <select class="filter-select" id="faqIntentFilter">
+          <option value="">All Intents</option>
+        </select>
+        <span class="record-count" id="faqCount">Loading…</span>
+      </div>
+      <div class="table-container">
+        <table class="data-table" id="faqTable">
+          <thead>
+            <tr>
+              <th>ID</th>
+              <th>Intent</th>
+              <th>Question</th>
+              <th>Answer</th>
+              <th>Actions</th>
+            </tr>
+          </thead>
+          <tbody id="faqTableBody">
+            <tr><td colspan="5" class="loading-row">Loading FAQs…</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- ===== PRODUCTS PAGE ===== -->
+    <section id="page-products" class="page hidden">
+      <div class="page-header">
+        <div>
+          <h1>Product Catalog</h1>
+          <p class="page-subtitle">Manage wholesale products available in the AI agent's knowledge base</p>
+        </div>
+        <button class="btn btn-brand" id="btnAddProduct">+ Add Product</button>
+      </div>
+      <div class="table-toolbar">
+        <input type="text" class="search-input" id="productSearch" placeholder="🔍 Search products…" />
+        <select class="filter-select" id="productCategoryFilter">
+          <option value="">All Categories</option>
+        </select>
+        <span class="record-count" id="productCount">Loading…</span>
+      </div>
+      <div class="table-container">
+        <table class="data-table" id="productTable">
+          <thead>
+            <tr>
+              <th>ID</th>
+              <th>Name</th>
+              <th>Category</th>
+              <th>Brand</th>
+              <th>Price (PKR)</th>
+              <th>Stock</th>
+              <th>Actions</th>
+            </tr>
+          </thead>
+          <tbody id="productTableBody">
+            <tr><td colspan="7" class="loading-row">Loading products…</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- ===== CALL LOGS PAGE ===== -->
+    <section id="page-logs" class="page hidden">
+      <div class="page-header">
+        <div>
+          <h1>Call Logs</h1>
+          <p class="page-subtitle">View all call sessions and their transcripts</p>
+        </div>
+        <button class="btn btn-outline" id="btnRefreshLogs">🔄 Refresh</button>
+      </div>
+      <div class="stats-row">
+        <div class="stat-card">
+          <div class="stat-value" id="statTotal">—</div>
+          <div class="stat-label">Total Calls</div>
+        </div>
+        <div class="stat-card green">
+          <div class="stat-value" id="statResolved">—</div>
+          <div class="stat-label">Resolved</div>
+        </div>
+        <div class="stat-card amber">
+          <div class="stat-value" id="statEscalated">—</div>
+          <div class="stat-label">Escalated</div>
+        </div>
+        <div class="stat-card blue">
+          <div class="stat-value" id="statMessages">—</div>
+          <div class="stat-label">Total Messages</div>
+        </div>
+      </div>
+      <div class="table-container">
+        <table class="data-table">
+          <thead>
+            <tr>
+              <th>Session ID</th>
+              <th>Started</th>
+              <th>Last Activity</th>
+              <th>Status</th>
+              <th>Outcome</th>
+              <th>Messages</th>
+              <th>Actions</th>
+            </tr>
+          </thead>
+          <tbody id="logsTableBody">
+            <tr><td colspan="7" class="loading-row">Loading call logs…</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- ===== SETTINGS PAGE ===== -->
+    <section id="page-settings" class="page hidden">
+      <div class="page-header">
+        <div>
+          <h1>Settings</h1>
+          <p class="page-subtitle">Configure voice preferences and view system information</p>
+        </div>
+      </div>
+      <div class="settings-grid">
+        <div class="settings-card">
+          <h3>Current Session</h3>
+          <div class="info-row">
+            <span class="info-label">Session ID</span>
+            <span class="info-value mono" id="settingsSessionId">—</span>
+          </div>
+          <div class="info-row">
+            <span class="info-label">Call Status</span>
+            <span class="info-value" id="settingsCallStatus">Idle</span>
+          </div>
+          <div class="info-row">
+            <span class="info-label">Voice Output</span>
+            <span class="info-value" id="settingsVoiceStatus">Disabled</span>
+          </div>
+          <button class="btn btn-outline mt-2" id="settingsBtnNewSession">🔄 New Session</button>
+        </div>
+
+        <div class="settings-card">
+          <h3>Appearance & Theme</h3>
+          <p class="text-muted">Choose your preferred visual appearance. Select light mode, dark mode, or follow your system settings.</p>
+          <div class="theme-option" style="margin-top:.75rem;">
+            <div>
+              <div class="theme-option-label">Theme Mode</div>
+              <div class="theme-option-desc">Currently: <span id="currentThemeLabel" style="font-weight:600;color:var(--brand)">Light</span></div>
+            </div>
+            <button class="btn btn-outline" id="settingsBtnToggleTheme">🌓 Switch Theme</button>
+          </div>
+        </div>
+
+        <div class="settings-card">
+          <h3>Voice Output</h3>
+          <p class="text-muted">Enable voice responses to hear the AI agent speak its replies aloud via text-to-speech.</p>
+          <button class="btn btn-outline mt-2" id="settingsBtnToggleVoice">🔊 Enable Voice Output</button>
+        </div>
+
+        <div class="settings-card">
+          <h3>API Key Status</h3>
+          <div class="info-row">
+            <span class="info-label">Active Key</span>
+            <span class="info-value" id="keyActiveLabel">—</span>
+          </div>
+          <div class="info-row">
+            <span class="info-label">Primary Key</span>
+            <span class="info-value" id="keyPrimaryStatus">—</span>
+          </div>
+          <div class="info-row">
+            <span class="info-label">Secondary Key</span>
+            <span class="info-value" id="keySecondaryStatus">—</span>
+          </div>
+          <div class="info-row">
+            <span class="info-label">Failover</span>
+            <span class="info-value" id="keyFallback">—</span>
+          </div>
+          <p class="text-muted" style="font-size:.75rem; margin-top:.5rem;" id="keyLastRefreshed">Not yet refreshed</p>
+          <button class="btn btn-outline mt-2" id="btnRefreshKeyStatus">🔄 Refresh Status</button>
+        </div>
+
+        <div class="settings-card">
+          <h3>System Information</h3>
+          <div class="info-row">
+            <span class="info-label">App</span>
+            <span class="info-value">DigiBuzz AI Calling Agent</span>
+          </div>
+          <div class="info-row">
+            <span class="info-label">Version</span>
+            <span class="info-value">2.1.0</span>
+          </div>
+          <div class="info-row">
+            <span class="info-label">AI Model</span>
+            <span class="info-value" id="settingsModel">Loading…</span>
+          </div>
+          <div class="info-row">
+            <span class="info-label">FAQs in DB</span>
+            <span class="info-value" id="settingsFaqs">Loading…</span>
+          </div>
+          <div class="info-row">
+            <span class="info-label">Products in DB</span>
+            <span class="info-value" id="settingsProducts">Loading…</span>
+          </div>
+        </div>
+      </div>
+    </section>
+
+  </main>
+
+  <!-- ===== FAQ Modal ===== -->
+  <div class="modal-overlay hidden" id="faqModal">
+    <div class="modal">
+      <div class="modal-header">
+        <h2 id="faqModalTitle">Add FAQ</h2>
+        <button class="modal-close" id="faqModalClose">&times;</button>
+      </div>
+      <div class="modal-body">
+        <div class="form-group">
+          <label for="faqIntent">Intent <small>(snake_case)</small></label>
+          <input type="text" id="faqIntent" class="form-input" placeholder="e.g. delivery_time" maxlength="100" />
+        </div>
+        <div class="form-group">
+          <label for="faqQuestion">Question</label>
+          <input type="text" id="faqQuestion" class="form-input" placeholder="Enter the FAQ question" maxlength="500" />
+        </div>
+        <div class="form-group">
+          <label for="faqAnswer">Answer</label>
+          <textarea id="faqAnswer" class="form-textarea" rows="4" placeholder="Enter the detailed answer" maxlength="2000"></textarea>
+        </div>
+        <div class="form-error hidden" id="faqFormError"></div>
+      </div>
+      <div class="modal-footer">
+        <button class="btn btn-ghost" id="faqModalCancel">Cancel</button>
+        <button class="btn btn-brand" id="faqModalSave">Save FAQ</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ===== Product Modal ===== -->
+  <div class="modal-overlay hidden" id="productModal">
+    <div class="modal">
+      <div class="modal-header">
+        <h2 id="productModalTitle">Add Product</h2>
+        <button class="modal-close" id="productModalClose">&times;</button>
+      </div>
+      <div class="modal-body">
+        <div class="form-row">
+          <div class="form-group">
+            <label for="productName">Product Name</label>
+            <input type="text" id="productName" class="form-input" placeholder="e.g. Samsung Galaxy A54" maxlength="200" />
+          </div>
+          <div class="form-group">
+            <label for="productBrand">Brand</label>
+            <input type="text" id="productBrand" class="form-input" placeholder="e.g. Samsung" maxlength="100" />
+          </div>
+        </div>
+        <div class="form-row">
+          <div class="form-group">
+            <label for="productCategory">Category</label>
+            <input type="text" id="productCategory" class="form-input" placeholder="e.g. Mobile Phones" maxlength="100" />
+          </div>
+          <div class="form-group">
+            <label for="productPrice">Price (PKR)</label>
+            <input type="number" id="productPrice" class="form-input" placeholder="e.g. 85000" min="0" />
+          </div>
+        </div>
+        <div class="form-group">
+          <label for="productStock">Stock Status</label>
+          <select id="productStock" class="form-input">
+            <option value="in_stock">In Stock</option>
+            <option value="limited">Limited</option>
+            <option value="out_of_stock">Out of Stock</option>
+          </select>
+        </div>
+        <div class="form-group">
+          <label for="productDescription">Description</label>
+          <textarea id="productDescription" class="form-textarea" rows="3" placeholder="Enter product description" maxlength="1000"></textarea>
+        </div>
+        <div class="form-error hidden" id="productFormError"></div>
+      </div>
+      <div class="modal-footer">
+        <button class="btn btn-ghost" id="productModalCancel">Cancel</button>
+        <button class="btn btn-brand" id="productModalSave">Save Product</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ===== Transcript Modal ===== -->
+  <div class="modal-overlay hidden" id="transcriptModal">
+    <div class="modal modal-wide">
+      <div class="modal-header">
+        <h2 id="transcriptModalTitle">Call Transcript</h2>
+        <button class="modal-close" id="transcriptModalClose">&times;</button>
+      </div>
+      <div class="modal-body" id="transcriptModalBody">
+        <div class="loading-row">Loading transcript…</div>
+      </div>
+      <div class="modal-footer">
+        <button class="btn btn-ghost" id="transcriptModalDone">Close</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ===== Scripts ===== -->
+  <script src="/static/main.js"></script>
+  <script src="/static/faq-manager.js"></script>
+  <script src="/static/data-manager.js"></script>
+  <script src="/static/logs.js"></script>
+</body>
+</html>
