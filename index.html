@@ -2,8 +2,8 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>DigiBuzz AI Calling Agent</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=5.0" />
+  <title>DigiBuzz AI Calling Agent — Voice Customer Support SaaS</title>
   <link rel="stylesheet" href="/static/main.css" />
   <link rel="icon" href="/favicon.ico" type="image/x-icon" />
 </head>
@@ -13,19 +13,51 @@
     <div class="navbar-brand">
       <span class="brand-icon">📞</span>
       <span class="brand-name">DigiBuzz <span class="brand-accent">AI</span></span>
-      <button class="key-status-badge" id="keyStatusBadge" title="API Key Status — click to view Settings">🟢</button>
+      <button class="key-status-badge" id="keyStatusBadge" title="API Key Status — click to view Settings" style="display:none;">🟢</button>
     </div>
+    
     <ul class="nav-links" id="navLinks">
       <li><a href="#" class="nav-link active" data-page="home">🏠 Home</a></li>
       <li><a href="#" class="nav-link" data-page="faqs">💬 FAQs</a></li>
       <li><a href="#" class="nav-link" data-page="products">📦 Products</a></li>
       <li><a href="#" class="nav-link" data-page="logs">📋 Call Logs</a></li>
+      <li id="navAdminLink" style="display:none;"><a href="#" class="nav-link" data-page="admin">👑 Admin</a></li>
       <li><a href="#" class="nav-link" data-page="settings">⚙️ Settings</a></li>
+      <!-- Mobile Auth Inside Drawer -->
+      <li class="mobile-only-auth">
+        <div id="mobileAuthGuest" class="mobile-auth-box">
+          <button class="btn btn-brand btn-block" id="mobileBtnLogin">🔐 Sign In / Register</button>
+        </div>
+        <div id="mobileAuthUser" class="mobile-auth-box hidden">
+          <div class="mobile-user-row">
+            <span class="mobile-name" id="mobileAuthName">User</span>
+            <span class="role-badge member" id="mobileAuthRole">Member</span>
+          </div>
+          <button class="btn btn-outline-danger btn-block btn-sm" id="mobileBtnLogout">🚪 Sign Out</button>
+        </div>
+      </li>
     </ul>
-    <div style="display:flex;align-items:center;gap:.5rem;">
+
+    <div class="nav-right-controls">
+      <!-- Desktop Auth Section -->
+      <div id="authNavGuest" class="auth-nav-block">
+        <button class="btn btn-sm btn-brand" id="btnOpenLogin">🔐 Sign In</button>
+      </div>
+      
+      <div id="authNavUser" class="auth-nav-block hidden">
+        <div class="user-pill">
+          <div class="user-avatar" id="authUserAvatar">U</div>
+          <div class="user-meta-text">
+            <span class="user-name-label" id="authUserName">User</span>
+            <span class="role-badge member" id="authUserRole">Member</span>
+          </div>
+          <button class="btn-logout-icon" id="btnLogout" title="Sign Out" aria-label="Sign Out">🚪</button>
+        </div>
+      </div>
+
       <button class="theme-toggle" id="themeToggleBtn" title="Toggle Light/Dark Theme" aria-label="Toggle theme">
         <span class="theme-toggle-icon" id="themeToggleIcon">🌙</span>
-        <span id="themeToggleText" style="font-size:.78rem;font-weight:600;">Dark</span>
+        <span id="themeToggleText" class="theme-toggle-text">Dark</span>
       </button>
       <button class="nav-hamburger" id="navHamburger" aria-label="Toggle menu">☰</button>
     </div>
@@ -39,7 +71,7 @@
       <div class="page-header">
         <div>
           <h1>DigiBuzz AI Calling Agent</h1>
-          <p class="page-subtitle">Customer Support Voice Assistant — Ask anything about our products and services</p>
+          <p class="page-subtitle">Voice-first AI Customer Support Agent — Ask anything about wholesale products and orders</p>
         </div>
       </div>
 
@@ -53,7 +85,7 @@
               <span id="statusText">Ready to connect</span>
             </div>
             <!-- Live Voice Tip Hint Banner -->
-            <div id="callHintBanner" style="display:none;padding:.35rem .75rem;background:var(--brand-light);border:1px solid var(--border-strong);border-radius:20px;font-size:.76rem;color:var(--brand);font-weight:600;align-items:center;gap:.35rem;">
+            <div id="callHintBanner" class="call-hint-banner" style="display:none;">
               <span>💡 Tip:</span> Say <em>"End Call"</em> or <em>"Bye"</em> anytime to finish the call
             </div>
             <div class="call-controls">
@@ -68,7 +100,7 @@
             <div class="chat-placeholder" id="chatPlaceholder">
               <div class="placeholder-icon">🎙️</div>
               <p>Click <strong>Start Call</strong> to connect with the DigiBuzz AI Calling Agent.</p>
-              <p class="text-muted">You can type or use voice to ask questions about products, pricing, delivery, and more.</p>
+              <p class="text-muted">You can speak via your microphone or type messages. The AI answers in real-time with live voice.</p>
             </div>
           </div>
 
@@ -97,89 +129,105 @@
             <div class="chips-header">
               <div class="chips-title-group">
                 <span class="chips-icon">⚡</span>
-                <span class="chips-title">Suggested Inquiries (Slide to explore):</span>
+                <span class="chips-title">Suggested Inquiries</span>
               </div>
               <div class="chips-controls-group">
-                <button type="button" class="chip-arrow-btn" id="chipScrollLeft" title="Scroll left" aria-label="Previous suggestions">◀</button>
-                <button type="button" class="chip-arrow-btn" id="chipScrollRight" title="Scroll right" aria-label="Next suggestions">▶</button>
+                <button type="button" class="chip-arrow-btn" id="chipScrollLeft" title="Scroll left" aria-label="Previous inquiries">‹</button>
+                <button type="button" class="chip-arrow-btn" id="chipScrollRight" title="Scroll right" aria-label="Next inquiries">›</button>
               </div>
             </div>
-            <div class="chips-slider-viewport">
-              <div class="chips-section" id="chipsSection"></div>
+            <div class="chips-section" id="chipsSection">
+              <!-- Dynamically populated -->
             </div>
           </div>
         </div>
 
-        <!-- Side Info Panel -->
-        <aside class="side-panel">
-          <div class="info-card">
-            <h3>Session Info</h3>
+        <!-- Sidebar / Context -->
+        <aside class="sidebar">
+          <div class="sidebar-card">
+            <h3>Active Session</h3>
             <div class="info-row">
               <span class="info-label">Session ID</span>
               <span class="info-value mono" id="sideSessionId">—</span>
             </div>
             <div class="info-row">
-              <span class="info-label">Status</span>
+              <span class="info-label">Call Status</span>
               <span class="info-value" id="sideStatus">Idle</span>
             </div>
             <div class="info-row">
-              <span class="info-label">Messages</span>
-              <span class="info-value" id="sideMsgCount">0</span>
+              <span class="info-label">Turns</span>
+              <span class="info-value" id="sideTurnCount">0</span>
             </div>
             <div class="info-row">
-              <span class="info-label">Voice</span>
-              <span class="info-value" id="sideVoiceStatus">On</span>
+              <span class="info-label">Last Intent</span>
+              <span class="info-value" id="sideIntent">—</span>
+            </div>
+            <div class="info-row">
+              <span class="info-label">Call Outcome</span>
+              <span class="info-value" id="sideOutcome">—</span>
+            </div>
+            <div class="info-row">
+              <span class="info-label">Voice Audio</span>
+              <span class="info-value" id="sideVoiceStatus">Enabled 🔊</span>
             </div>
           </div>
-          <div class="info-card">
-            <h3>Voice Controls</h3>
-            <button class="btn btn-outline w-full" id="btnToggleVoice">🔇 Disable Voice</button>
-          </div>
-          <div class="info-card tip-card">
-            <h3>💡 Tips</h3>
-            <ul class="tip-list">
-              <li>Ask about product pricing and availability</li>
-              <li>Inquire about delivery times and areas</li>
-              <li>Ask about payment methods</li>
-              <li>Request a human representative anytime</li>
-              <li>Say <strong>"End call"</strong> or <strong>"Finish call"</strong> to end</li>
-            </ul>
+
+          <div class="sidebar-card">
+            <h3>Knowledge Base</h3>
+            <p class="text-muted" style="font-size:0.83rem;">
+              The AI uses your live FAQ database and wholesale Product Catalog. Log in to manage custom knowledge for your business.
+            </p>
+            <div class="sidebar-links">
+              <a href="#" class="sidebar-link" onclick="navigateTo('faqs');return false;">💬 Manage FAQs</a>
+              <a href="#" class="sidebar-link" onclick="navigateTo('products');return false;">📦 Manage Products</a>
+              <a href="#" class="sidebar-link" onclick="navigateTo('logs');return false;">📋 View Call Logs</a>
+            </div>
           </div>
         </aside>
       </div>
     </section>
 
-    <!-- ===== FAQ PAGE ===== -->
+    <!-- ===== FAQS PAGE ===== -->
     <section id="page-faqs" class="page hidden">
       <div class="page-header">
         <div>
-          <h1>FAQ Management</h1>
-          <p class="page-subtitle">Manage the AI agent's knowledge base — questions and answers</p>
+          <h1>FAQ Knowledge Base</h1>
+          <p class="page-subtitle">Custom questions and answers referenced live by the AI Agent</p>
         </div>
-        <button class="btn btn-brand" id="btnAddFAQ">+ Add FAQ</button>
+        <div class="header-actions">
+          <button class="btn btn-brand" id="btnAddFaq">+ Add FAQ</button>
+          <button class="btn btn-outline" id="btnRefreshFaqs">🔄 Refresh</button>
+        </div>
       </div>
-      <div class="table-toolbar">
-        <input type="text" class="search-input" id="faqSearch" placeholder="🔍 Search FAQs by question, answer, or intent…" />
-        <select class="filter-select" id="faqIntentFilter">
-          <option value="">All Intents</option>
-        </select>
-        <span class="record-count" id="faqCount">Loading…</span>
-      </div>
-      <div class="table-container">
-        <table class="data-table" id="faqTable">
-          <thead>
-            <tr>
-              <th>ID</th>
-              <th>Intent</th>
-              <th>Question</th>
-              <th>Answer</th>
-              <th>Actions</th>
-            </tr>
-          </thead>
-          <tbody id="faqTableBody">
-            <tr><td colspan="5" class="loading-row">Loading FAQs…</td></tr>
-          </tbody>
-        </table>
+
+      <div class="data-card">
+        <div class="data-card-header">
+          <div class="table-search-group">
+            <input type="text" id="faqSearch" class="search-input" placeholder="Search FAQs by question or answer…" />
+            <select id="faqIntentFilter" class="filter-select">
+              <option value="">All Intents</option>
+            </select>
+          </div>
+          <span class="record-counter" id="faqCount">0 records</span>
+        </div>
+
+        <div class="table-container">
+          <table class="data-table">
+            <thead>
+              <tr>
+                <th style="width:60px">ID</th>
+                <th style="width:130px">Intent</th>
+                <th>Question</th>
+                <th>Answer</th>
+                <th style="width:110px">Scope</th>
+                <th style="width:130px">Actions</th>
+              </tr>
+            </thead>
+            <tbody id="faqTableBody">
+              <tr><td colspan="6" class="loading-row">Loading FAQs…</td></tr>
+            </tbody>
+          </table>
+        </div>
       </div>
     </section>
 
@@ -188,34 +236,44 @@
       <div class="page-header">
         <div>
           <h1>Product Catalog</h1>
-          <p class="page-subtitle">Manage wholesale products available in the AI agent's knowledge base</p>
+          <p class="page-subtitle">Wholesale inventory, prices in PKR, and specifications</p>
         </div>
-        <button class="btn btn-brand" id="btnAddProduct">+ Add Product</button>
+        <div class="header-actions">
+          <button class="btn btn-brand" id="btnAddProduct">+ Add Product</button>
+          <button class="btn btn-outline" id="btnRefreshProducts">🔄 Refresh</button>
+        </div>
       </div>
-      <div class="table-toolbar">
-        <input type="text" class="search-input" id="productSearch" placeholder="🔍 Search products…" />
-        <select class="filter-select" id="productCategoryFilter">
-          <option value="">All Categories</option>
-        </select>
-        <span class="record-count" id="productCount">Loading…</span>
-      </div>
-      <div class="table-container">
-        <table class="data-table" id="productTable">
-          <thead>
-            <tr>
-              <th>ID</th>
-              <th>Name</th>
-              <th>Category</th>
-              <th>Brand</th>
-              <th>Price (PKR)</th>
-              <th>Stock</th>
-              <th>Actions</th>
-            </tr>
-          </thead>
-          <tbody id="productTableBody">
-            <tr><td colspan="7" class="loading-row">Loading products…</td></tr>
-          </tbody>
-        </table>
+
+      <div class="data-card">
+        <div class="data-card-header">
+          <div class="table-search-group">
+            <input type="text" id="productSearch" class="search-input" placeholder="Search products by name, brand, specs…" />
+            <select id="productCategoryFilter" class="filter-select">
+              <option value="">All Categories</option>
+            </select>
+          </div>
+          <span class="record-counter" id="productCount">0 products</span>
+        </div>
+
+        <div class="table-container">
+          <table class="data-table">
+            <thead>
+              <tr>
+                <th style="width:50px">ID</th>
+                <th>Product Name</th>
+                <th style="width:110px">Category</th>
+                <th style="width:100px">Brand</th>
+                <th style="width:110px">Price (PKR)</th>
+                <th style="width:90px">Stock</th>
+                <th style="width:100px">Scope</th>
+                <th style="width:130px">Actions</th>
+              </tr>
+            </thead>
+            <tbody id="productTableBody">
+              <tr><td colspan="8" class="loading-row">Loading products…</td></tr>
+            </tbody>
+          </table>
+        </div>
       </div>
     </section>
 
@@ -223,11 +281,12 @@
     <section id="page-logs" class="page hidden">
       <div class="page-header">
         <div>
-          <h1>Call Logs</h1>
-          <p class="page-subtitle">View all call sessions and their transcripts</p>
+          <h1>Call Logs & Transcripts</h1>
+          <p class="page-subtitle">Track conversation history, detected intents, and resolution outcomes</p>
         </div>
         <button class="btn btn-outline" id="btnRefreshLogs">🔄 Refresh</button>
       </div>
+
       <div class="stats-row">
         <div class="stat-card">
           <div class="stat-value" id="statTotal">—</div>
@@ -246,23 +305,101 @@
           <div class="stat-label">Total Messages</div>
         </div>
       </div>
-      <div class="table-container">
-        <table class="data-table">
-          <thead>
-            <tr>
-              <th>Session ID</th>
-              <th>Started</th>
-              <th>Last Activity</th>
-              <th>Status</th>
-              <th>Outcome</th>
-              <th>Messages</th>
-              <th>Actions</th>
-            </tr>
-          </thead>
-          <tbody id="logsTableBody">
-            <tr><td colspan="7" class="loading-row">Loading call logs…</td></tr>
-          </tbody>
-        </table>
+
+      <div class="data-card">
+        <div class="table-container">
+          <table class="data-table">
+            <thead>
+              <tr>
+                <th>Session ID</th>
+                <th>Started</th>
+                <th>Last Activity</th>
+                <th>Status</th>
+                <th>Outcome</th>
+                <th>Messages</th>
+                <th>Actions</th>
+              </tr>
+            </thead>
+            <tbody id="logsTableBody">
+              <tr><td colspan="7" class="loading-row">Loading call logs…</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
+    <!-- ===== ADMIN PANEL PAGE (RBAC - OWASP Top 10 A01) ===== -->
+    <section id="page-admin" class="page hidden">
+      <div class="page-header">
+        <div>
+          <h1>👑 SaaS Administration</h1>
+          <p class="page-subtitle">User Management, Role Assignments, and System Overview</p>
+        </div>
+        <button class="btn btn-outline" id="btnRefreshAdmin">🔄 Refresh Data</button>
+      </div>
+
+      <!-- Metric Cards Grid -->
+      <div class="metrics-grid">
+        <div class="metric-card">
+          <div class="metric-label">Total Users</div>
+          <div class="metric-value" id="statAdminUsers">0</div>
+          <div class="metric-sub" id="statAdminActive">0 active</div>
+        </div>
+        <div class="metric-card">
+          <div class="metric-label">Total Calls</div>
+          <div class="metric-value" id="statAdminCalls">0</div>
+          <div class="metric-sub" id="statAdminResolved">100% resolved</div>
+        </div>
+        <div class="metric-card">
+          <div class="metric-label">Knowledge FAQs</div>
+          <div class="metric-value" id="statAdminFaqs">0</div>
+          <div class="metric-sub">Across all accounts</div>
+        </div>
+        <div class="metric-card">
+          <div class="metric-label">Catalog Products</div>
+          <div class="metric-value" id="statAdminProducts">0</div>
+          <div class="metric-sub">Wholesale database</div>
+        </div>
+      </div>
+
+      <!-- Users Management Card -->
+      <div class="data-card">
+        <div class="data-card-header">
+          <div class="table-search-group">
+            <input type="text" id="adminUserSearch" class="search-input" placeholder="Search by name, email, or phone…" />
+            <select id="adminRoleFilter" class="filter-select">
+              <option value="">All Roles</option>
+              <option value="admin">Administrators</option>
+              <option value="user">Regular Members</option>
+            </select>
+            <select id="adminStatusFilter" class="filter-select">
+              <option value="">All Statuses</option>
+              <option value="active">Active Accounts</option>
+              <option value="suspended">Suspended Accounts</option>
+            </select>
+          </div>
+          <span class="record-counter" id="adminUsersCount">0 accounts</span>
+        </div>
+
+        <div class="table-container">
+          <table class="data-table">
+            <thead>
+              <tr>
+                <th>User Account</th>
+                <th>Email Address</th>
+                <th>Phone Number</th>
+                <th>Role</th>
+                <th>Status</th>
+                <th>Activity</th>
+                <th>Registered</th>
+                <th>Actions</th>
+              </tr>
+            </thead>
+            <tbody id="adminUsersTableBody">
+              <tr><td colspan="8" class="loading-row">Loading user directory…</td></tr>
+            </tbody>
+          </table>
+        </div>
       </div>
     </section>
 
@@ -270,95 +407,204 @@
     <section id="page-settings" class="page hidden">
       <div class="page-header">
         <div>
-          <h1>Settings</h1>
-          <p class="page-subtitle">Configure voice preferences and view system information</p>
+          <h1>Settings & Preferences</h1>
+          <p class="page-subtitle">Configure your voice preferences, manage active calling session, and view account profile</p>
         </div>
       </div>
+
+      <!-- User Account & Voice Preferences (Visible to All Users & Callers) -->
       <div class="settings-grid">
         <div class="settings-card">
-          <h3>Current Session</h3>
+          <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 0.75rem;">
+            <h3 style="margin: 0;">👤 Account Profile</h3>
+            <span class="role-badge member" id="settingsUserRoleBadge">Member</span>
+          </div>
           <div class="info-row">
-            <span class="info-label">Session ID</span>
+            <span class="info-label">Full Name</span>
+            <span class="info-value" id="settingsUserName">Guest Caller</span>
+          </div>
+          <div class="info-row">
+            <span class="info-label">Email Address</span>
+            <span class="info-value" id="settingsUserEmail">Not signed in</span>
+          </div>
+          <div class="info-row">
+            <span class="info-label">Phone</span>
+            <span class="info-value" id="settingsUserPhone">—</span>
+          </div>
+          <div class="info-row">
+            <span class="info-label">Active Session ID</span>
             <span class="info-value mono" id="settingsSessionId">—</span>
           </div>
           <div class="info-row">
             <span class="info-label">Call Status</span>
             <span class="info-value" id="settingsCallStatus">Idle</span>
           </div>
-          <div class="info-row">
-            <span class="info-label">Voice Output</span>
-            <span class="info-value" id="settingsVoiceStatus">Disabled</span>
-          </div>
-          <button class="btn btn-outline mt-2" id="settingsBtnNewSession">🔄 New Session</button>
         </div>
 
         <div class="settings-card">
-          <h3>Appearance & Theme</h3>
-          <p class="text-muted">Choose your preferred visual appearance. Select light mode, dark mode, or follow your system settings.</p>
-          <div class="theme-option" style="margin-top:.75rem;">
-            <div>
-              <div class="theme-option-label">Theme Mode</div>
-              <div class="theme-option-desc">Currently: <span id="currentThemeLabel" style="font-weight:600;color:var(--brand)">Light</span></div>
+          <h3>🔊 Voice & Audio Settings</h3>
+          <p class="text-muted" style="font-size:0.83rem; margin-bottom:0.75rem;">
+            Audio is synthesized dynamically using Google Text-to-Speech in English and Urdu.
+          </p>
+          <div class="info-row">
+            <span class="info-label">Voice Audio Output</span>
+            <span class="info-value" id="settingsVoiceStatus">Enabled 🔊</span>
+          </div>
+          <div class="info-row">
+            <span class="info-label">English Voice Engine</span>
+            <span class="info-value">Google Standard (en)</span>
+          </div>
+          <div class="info-row">
+            <span class="info-label">Urdu Script Engine</span>
+            <span class="info-value">Google Urdu (ur)</span>
+          </div>
+          <div style="display:flex; flex-direction:column; gap:0.5rem; margin-top:0.75rem;">
+            <button class="btn btn-outline" id="settingsBtnToggleVoice">🔊 Voice Output: Enabled</button>
+            <button class="btn btn-outline" id="settingsBtnNewSession">🔄 Reset Calling Session</button>
+          </div>
+        </div>
+
+        <div class="settings-card">
+          <h3>🎨 Appearance & Platform</h3>
+          <div class="info-row">
+            <span class="info-label">Application Theme</span>
+            <span class="info-value" id="currentThemeLabel">Dark Mode 🌙</span>
+          </div>
+          <div class="info-row">
+            <span class="info-label">Platform Edition</span>
+            <span class="info-value">DigiBuzz SaaS v3.0</span>
+          </div>
+          <div class="info-row">
+            <span class="info-label">Data Privacy</span>
+            <span class="info-value">OWASP Multi-Tenant Isolated</span>
+          </div>
+          <button class="btn btn-outline mt-2" id="settingsBtnToggleTheme">🌓 Toggle Dark / Light Theme</button>
+        </div>
+      </div>
+
+      <!-- Administrator System Diagnostics (STRICTLY RESTRICTED to Admins) -->
+      <div id="settingsAdminSection" style="display: none; margin-top: 2rem;">
+        <div class="page-header" style="margin-bottom: 1rem;">
+          <div>
+            <h2 style="font-size: 1.3rem; display: flex; align-items: center; gap: 0.5rem;">
+              <span>👑</span> Administrator Diagnostics & Infrastructure
+            </h2>
+            <p class="page-subtitle">Restricted system controls, Gemini dual-key failover diagnostics, and model status</p>
+          </div>
+        </div>
+
+        <div class="settings-grid">
+          <div class="settings-card">
+            <h3>Gemini Dual-Key Failover</h3>
+            <div class="info-row">
+              <span class="info-label">Active Key</span>
+              <span class="info-value" id="keyActiveLabel">—</span>
             </div>
-            <button class="btn btn-outline" id="settingsBtnToggleTheme">🌓 Switch Theme</button>
+            <div class="info-row">
+              <span class="info-label">Primary Key Status</span>
+              <span class="info-value" id="keyPrimaryStatus">—</span>
+            </div>
+            <div class="info-row">
+              <span class="info-label">Secondary Key Status</span>
+              <span class="info-value" id="keySecondaryStatus">—</span>
+            </div>
+            <div class="info-row">
+              <span class="info-label">Automatic Failover</span>
+              <span class="info-value" id="keyFallback">—</span>
+            </div>
+            <p class="text-muted" style="font-size:.75rem; margin-top:.5rem;" id="keyLastRefreshed">Not yet checked</p>
+            <button class="btn btn-outline mt-2" id="btnRefreshKeyStatus">🔄 Refresh Key Diagnostics</button>
           </div>
-        </div>
 
-        <div class="settings-card">
-          <h3>Voice Output</h3>
-          <p class="text-muted">Enable voice responses to hear the AI agent speak its replies aloud via text-to-speech.</p>
-          <button class="btn btn-outline mt-2" id="settingsBtnToggleVoice">🔊 Enable Voice Output</button>
-        </div>
-
-        <div class="settings-card">
-          <h3>API Key Status</h3>
-          <div class="info-row">
-            <span class="info-label">Active Key</span>
-            <span class="info-value" id="keyActiveLabel">—</span>
-          </div>
-          <div class="info-row">
-            <span class="info-label">Primary Key</span>
-            <span class="info-value" id="keyPrimaryStatus">—</span>
-          </div>
-          <div class="info-row">
-            <span class="info-label">Secondary Key</span>
-            <span class="info-value" id="keySecondaryStatus">—</span>
-          </div>
-          <div class="info-row">
-            <span class="info-label">Failover</span>
-            <span class="info-value" id="keyFallback">—</span>
-          </div>
-          <p class="text-muted" style="font-size:.75rem; margin-top:.5rem;" id="keyLastRefreshed">Not yet refreshed</p>
-          <button class="btn btn-outline mt-2" id="btnRefreshKeyStatus">🔄 Refresh Status</button>
-        </div>
-
-        <div class="settings-card">
-          <h3>System Information</h3>
-          <div class="info-row">
-            <span class="info-label">App</span>
-            <span class="info-value">DigiBuzz AI Calling Agent</span>
-          </div>
-          <div class="info-row">
-            <span class="info-label">Version</span>
-            <span class="info-value">2.1.0</span>
-          </div>
-          <div class="info-row">
-            <span class="info-label">AI Model</span>
-            <span class="info-value" id="settingsModel">Loading…</span>
-          </div>
-          <div class="info-row">
-            <span class="info-label">FAQs in DB</span>
-            <span class="info-value" id="settingsFaqs">Loading…</span>
-          </div>
-          <div class="info-row">
-            <span class="info-label">Products in DB</span>
-            <span class="info-value" id="settingsProducts">Loading…</span>
+          <div class="settings-card">
+            <h3>Model & Storage Internals</h3>
+            <div class="info-row">
+              <span class="info-label">Gemini AI Model</span>
+              <span class="info-value" id="settingsModel">Loading…</span>
+            </div>
+            <div class="info-row">
+              <span class="info-label">Global FAQs Ingested</span>
+              <span class="info-value" id="settingsFaqs">Loading…</span>
+            </div>
+            <div class="info-row">
+              <span class="info-label">Catalog Products</span>
+              <span class="info-value" id="settingsProducts">Loading…</span>
+            </div>
+            <div class="info-row">
+              <span class="info-label">Database Engine</span>
+              <span class="info-value" id="settingsDbPath">SQLite WAL (Multi-Tenant)</span>
+            </div>
           </div>
         </div>
       </div>
     </section>
 
   </main>
+
+  <!-- ===== AUTHENTICATION MODAL (Sign In & Sign Up) ===== -->
+  <div class="modal-overlay hidden" id="authModal">
+    <div class="modal auth-modal-card">
+      <div class="modal-header">
+        <h2 id="authModalTitle">Sign In</h2>
+        <button class="modal-close" id="authModalClose">&times;</button>
+      </div>
+      <div class="auth-tabs">
+        <button type="button" class="auth-tab-btn active" id="authTabLogin">Sign In</button>
+        <button type="button" class="auth-tab-btn" id="authTabRegister">Create Account</button>
+      </div>
+
+      <div class="modal-body">
+        <div class="auth-error-box hidden" id="authErrorBox"></div>
+
+        <!-- Login Form -->
+        <form id="authFormLogin" autocomplete="on">
+          <div class="form-group">
+            <label for="loginIdentifier">Email or Phone Number</label>
+            <input type="text" id="loginIdentifier" class="form-input" placeholder="e.g. user@example.com or +923001234567" required />
+          </div>
+          <div class="form-group">
+            <label for="loginPassword">Password</label>
+            <div class="password-input-wrapper">
+              <input type="password" id="loginPassword" class="form-input" placeholder="Enter your password" required />
+              <button type="button" class="password-toggle-btn" data-target="loginPassword">🔒</button>
+            </div>
+          </div>
+          <button type="submit" class="btn btn-brand btn-block mt-2" id="btnLoginSubmit">Sign In</button>
+        </form>
+
+        <!-- Registration Form -->
+        <form id="authFormRegister" class="hidden" autocomplete="on">
+          <div class="form-group">
+            <label for="regFullName">Full Name</label>
+            <input type="text" id="regFullName" class="form-input" placeholder="e.g. Muhammad Arham" minlength="2" required />
+          </div>
+          <div class="form-group">
+            <label for="regEmail">Email Address</label>
+            <input type="email" id="regEmail" class="form-input" placeholder="e.g. arham@digibuzz.com" required />
+          </div>
+          <div class="form-group">
+            <label for="regPhone">Mobile Phone Number</label>
+            <input type="tel" id="regPhone" class="form-input" placeholder="e.g. +923001234567" required />
+          </div>
+          <div class="form-group">
+            <label for="regPassword">Password</label>
+            <div class="password-input-wrapper">
+              <input type="password" id="regPassword" class="form-input" placeholder="Min. 8 chars (letters & numbers)" minlength="8" required />
+              <button type="button" class="password-toggle-btn" data-target="regPassword">🔒</button>
+            </div>
+          </div>
+          <div class="form-group">
+            <label for="regPasswordConfirm">Confirm Password</label>
+            <div class="password-input-wrapper">
+              <input type="password" id="regPasswordConfirm" class="form-input" placeholder="Confirm your password" minlength="8" required />
+              <button type="button" class="password-toggle-btn" data-target="regPasswordConfirm">🔒</button>
+            </div>
+          </div>
+          <button type="submit" class="btn btn-brand btn-block mt-2" id="btnRegisterSubmit">Create Account</button>
+        </form>
+      </div>
+    </div>
+  </div>
 
   <!-- ===== FAQ Modal ===== -->
   <div class="modal-overlay hidden" id="faqModal">
@@ -369,16 +615,16 @@
       </div>
       <div class="modal-body">
         <div class="form-group">
-          <label for="faqIntent">Intent <small>(snake_case)</small></label>
-          <input type="text" id="faqIntent" class="form-input" placeholder="e.g. delivery_time" maxlength="100" />
+          <label for="faqIntent">Intent <small>(e.g. delivery_time, return_policy)</small></label>
+          <input type="text" id="faqIntent" class="form-input" placeholder="e.g. warranty_terms" maxlength="100" />
         </div>
         <div class="form-group">
           <label for="faqQuestion">Question</label>
-          <input type="text" id="faqQuestion" class="form-input" placeholder="Enter the FAQ question" maxlength="500" />
+          <input type="text" id="faqQuestion" class="form-input" placeholder="Enter the customer question" maxlength="500" />
         </div>
         <div class="form-group">
           <label for="faqAnswer">Answer</label>
-          <textarea id="faqAnswer" class="form-textarea" rows="4" placeholder="Enter the detailed answer" maxlength="2000"></textarea>
+          <textarea id="faqAnswer" class="form-textarea" rows="4" placeholder="Enter the exact answer provided by the AI" maxlength="2000"></textarea>
         </div>
         <div class="form-error hidden" id="faqFormError"></div>
       </div>
@@ -400,34 +646,34 @@
         <div class="form-row">
           <div class="form-group">
             <label for="productName">Product Name</label>
-            <input type="text" id="productName" class="form-input" placeholder="e.g. Samsung Galaxy A54" maxlength="200" />
+            <input type="text" id="productName" class="form-input" placeholder="e.g. Dell Latitude 3540" maxlength="200" />
           </div>
           <div class="form-group">
             <label for="productBrand">Brand</label>
-            <input type="text" id="productBrand" class="form-input" placeholder="e.g. Samsung" maxlength="100" />
+            <input type="text" id="productBrand" class="form-input" placeholder="e.g. Dell" maxlength="100" />
           </div>
         </div>
         <div class="form-row">
           <div class="form-group">
             <label for="productCategory">Category</label>
-            <input type="text" id="productCategory" class="form-input" placeholder="e.g. Mobile Phones" maxlength="100" />
+            <input type="text" id="productCategory" class="form-input" placeholder="e.g. Laptops" maxlength="100" />
           </div>
           <div class="form-group">
             <label for="productPrice">Price (PKR)</label>
-            <input type="number" id="productPrice" class="form-input" placeholder="e.g. 85000" min="0" />
+            <input type="number" id="productPrice" class="form-input" placeholder="e.g. 165000" min="0" />
           </div>
         </div>
         <div class="form-group">
           <label for="productStock">Stock Status</label>
-          <select id="productStock" class="form-input">
+          <select id="productStock" class="form-select">
             <option value="in_stock">In Stock</option>
             <option value="limited">Limited</option>
             <option value="out_of_stock">Out of Stock</option>
           </select>
         </div>
         <div class="form-group">
-          <label for="productDescription">Description</label>
-          <textarea id="productDescription" class="form-textarea" rows="3" placeholder="Enter product description" maxlength="1000"></textarea>
+          <label for="productDescription">Description / Specifications</label>
+          <textarea id="productDescription" class="form-textarea" rows="3" placeholder="Enter product specs and wholesale warranty details" maxlength="1000"></textarea>
         </div>
         <div class="form-error hidden" id="productFormError"></div>
       </div>
@@ -455,6 +701,8 @@
   </div>
 
   <!-- ===== Scripts ===== -->
+  <script src="/static/auth.js"></script>
+  <script src="/static/admin.js"></script>
   <script src="/static/main.js"></script>
   <script src="/static/faq-manager.js"></script>
   <script src="/static/data-manager.js"></script>

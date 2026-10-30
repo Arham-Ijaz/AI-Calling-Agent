@@ -20,7 +20,7 @@ async function loadCallLogs() {
   try {
     let serverCalls = [];
     try {
-      const res = await fetch("/api/calls?limit=50");
+      const res = await fetch("/api/calls?limit=50", { credentials: "same-origin" });
       if (res.ok) {
         serverCalls = await res.json();
       }
@@ -96,7 +96,10 @@ function renderLogsTable(calls) {
     .map(
       (c) => `
       <tr>
-        <td><span class="mono" style="font-size:.8rem;">${escLog(c.session_id)}</span></td>
+        <td>
+          <span class="mono" style="font-size:.8rem;">${escLog(c.session_id)}</span>
+          ${c.caller_name ? `<div style="font-size:.72rem;color:var(--brand);font-weight:600;">👤 ${escLog(c.caller_name)}</div>` : ""}
+        </td>
         <td>${escLog(c.started_at || "—")}</td>
         <td>${escLog(c.last_activity || "—")}</td>
         <td>${statusBadgeLog(c.status)}</td>
@@ -154,7 +157,7 @@ async function viewSession(sessionId) {
 
   let messages = [];
   try {
-    const res = await fetch(`/api/history?session_id=${encodeURIComponent(sessionId)}`);
+    const res = await fetch(`/api/history?session_id=${encodeURIComponent(sessionId)}`, { credentials: "same-origin" });
     if (res.ok) {
       messages = await res.json();
     }

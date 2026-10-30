@@ -1,7 +1,7 @@
 "use strict";
 
 // =====================================================================
-// DigiBuzz AI Calling Agent — FAQ Manager
+// DigiBuzz AI Calling Agent — FAQ Manager (Multi-Tenant Scoped)
 // =====================================================================
 
 const faqState = {
@@ -14,16 +14,20 @@ const faqState = {
 // =====================================================================
 async function loadFAQs() {
   const tbody = document.getElementById("faqTableBody");
-  tbody.innerHTML = '<tr><td colspan="5" class="loading-row">Loading FAQs…</td></tr>';
+  if (tbody) {
+    tbody.innerHTML = '<tr><td colspan="6" class="loading-row">Loading FAQs…</td></tr>';
+  }
 
   try {
-    const res = await fetch("/api/faqs/all");
+    const res = await fetch("/api/faqs/all", { credentials: "same-origin" });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     faqState.allFaqs = await res.json();
     populateIntentDropdown();
     renderFAQTable(faqState.allFaqs);
   } catch (err) {
-    tbody.innerHTML = `<tr><td colspan="5" class="loading-row" style="color:var(--red)">Failed to load FAQs: ${err.message}</td></tr>`;
+    if (tbody) {
+      tbody.innerHTML = `<tr><td colspan="6" class="loading-row" style="color:var(--red)">Failed to load FAQs: ${err.message}</td></tr>`;
+    }
   }
 }
 
@@ -46,30 +50,47 @@ function populateIntentDropdown() {
 function renderFAQTable(faqs) {
   const tbody = document.getElementById("faqTableBody");
   const countEl = document.getElementById("faqCount");
+  if (!tbody) return;
 
-  countEl.textContent = `${faqs.length} record${faqs.length !== 1 ? "s" : ""}`;
+  if (countEl) countEl.textContent = `${faqs.length} record${faqs.length !== 1 ? "s" : ""}`;
 
-  if (faqs.length === 0) {
-    tbody.innerHTML = '<tr><td colspan="5" class="loading-row">No FAQs match your search criteria.</td></tr>';
+  if (!faqs || faqs.length === 0) {
+    tbody.innerHTML = '<tr><td colspan="6" class="loading-row">No FAQs match your search criteria.</td></tr>';
     return;
   }
 
   tbody.innerHTML = faqs
-    .map(
-      (f) => `
+    .map((f) => {
+      const isOwner = authState.user && f.user_id === authState.user.id;
+      const canEdit = authState.isAdmin || isOwner;
+
+      let scopeBadge = '<span class="badge" style="background:var(--surface-card);color:var(--text-muted);font-size:.7rem;">Platform</span>';
+      if (f.user_id) {
+        const ownerLabel = authState.isAdmin ? (f.owner_name || "Custom") : (isOwner ? "Yours" : "Custom");
+        scopeBadge = `<span class="badge" style="background:var(--brand-light);color:var(--brand);font-size:.7rem;">${escFaq(ownerLabel)}</span>`;
+      }
+
+      return `
       <tr data-id="${f.id}">
         <td><strong>#${f.id}</strong></td>
         <td><code style="font-size:.8rem;background:var(--surface-card);padding:.2rem .45rem;border-radius:4px;font-weight:600;">${escFaq(f.intent)}</code></td>
         <td class="td-truncate" style="font-weight:500;" title="${escFaq(f.question)}">${escFaq(f.question)}</td>
         <td class="td-answer" title="${escFaq(f.answer)}">${escFaq(f.answer)}</td>
+        <td>${scopeBadge}</td>
         <td>
           <div class="action-cell">
-            <button class="btn btn-sm btn-edit-sm" onclick="openEditFAQModal(${f.id})">✏️ Edit</button>
-            <button class="btn btn-sm btn-danger-sm" onclick="deleteFAQ(${f.id})">🗑️ Delete</button>
+            ${
+              canEdit
+                ? `
+              <button class="btn btn-sm btn-edit-sm" onclick="openEditFAQModal(${f.id})">✏️ Edit</button>
+              <button class="btn btn-sm btn-danger-sm" onclick="deleteFAQ(${f.id})">🗑️ Delete</button>
+            `
+                : '<span style="font-size:.75rem;color:var(--text-muted);">Default</span>'
+            }
           </div>
         </td>
-      </tr>`
-    )
+      </tr>`;
+    })
     .join("");
 }
 
@@ -105,8 +126,18 @@ function initFaqSearch() {
 // Modal — Open / Close
 // =====================================================================
 function openAddFAQModal() {
+  if (!authState.isLoggedIn) {
+    if (typeof openAuthModal === "function") {
+      openAuthModal("login");
+    } else {
+      alert("Please sign in to add your custom FAQs.");
+    }
+    return;
+  }
+
   faqState.editingId = null;
-  document.getElementById("faqModalTitle").textContent = "Add FAQ";
+  const title = document.getElementById("faqModalTitle");
+  if (title) title.textContent = "Add FAQ";
   document.getElementById("faqIntent").value = "";
   document.getElementById("faqQuestion").value = "";
   document.getElementById("faqAnswer").value = "";
@@ -118,8 +149,16 @@ function openAddFAQModal() {
 function openEditFAQModal(id) {
   const faq = faqState.allFaqs.find((f) => f.id === id);
   if (!faq) return;
+
+  const isOwner = authState.user && faq.user_id === authState.user.id;
+  if (!authState.isAdmin && !isOwner) {
+    alert("You do not have permission to modify this FAQ.");
+    return;
+  }
+
   faqState.editingId = id;
-  document.getElementById("faqModalTitle").textContent = "Edit FAQ";
+  const title = document.getElementById("faqModalTitle");
+  if (title) title.textContent = "Edit FAQ";
   document.getElementById("faqIntent").value = faq.intent;
   document.getElementById("faqQuestion").value = faq.question;
   document.getElementById("faqAnswer").value = faq.answer;
@@ -129,47 +168,64 @@ function openEditFAQModal(id) {
 }
 
 function closeFAQModal() {
-  document.getElementById("faqModal").classList.add("hidden");
+  const modal = document.getElementById("faqModal");
+  if (modal) modal.classList.add("hidden");
   faqState.editingId = null;
 }
 
 function showFaqError(msg) {
   const el = document.getElementById("faqFormError");
-  el.textContent = msg;
-  el.classList.remove("hidden");
+  if (el) {
+    el.textContent = msg;
+    el.classList.remove("hidden");
+  }
 }
 
 function hideFaqError() {
-  document.getElementById("faqFormError").classList.add("hidden");
+  const el = document.getElementById("faqFormError");
+  if (el) {
+    el.textContent = "";
+    el.classList.add("hidden");
+  }
 }
 
 // =====================================================================
-// Save FAQ (POST or PUT)
+// Save (Create or Update)
 // =====================================================================
 async function saveFAQ() {
+  hideFaqError();
   const intent = document.getElementById("faqIntent").value.trim();
   const question = document.getElementById("faqQuestion").value.trim();
   const answer = document.getElementById("faqAnswer").value.trim();
-
-  if (!intent) { showFaqError("Intent is required."); return; }
-  if (!question) { showFaqError("Question is required."); return; }
-  if (!answer) { showFaqError("Answer is required."); return; }
-
-  hideFaqError();
-
   const saveBtn = document.getElementById("faqModalSave");
+
+  if (!intent) {
+    showFaqError("Intent is required (e.g. delivery_time).");
+    return;
+  }
+  if (!question) {
+    showFaqError("Question is required.");
+    return;
+  }
+  if (!answer) {
+    showFaqError("Answer is required.");
+    return;
+  }
+
   saveBtn.disabled = true;
   saveBtn.textContent = "Saving…";
 
-  try {
-    const isEdit = faqState.editingId !== null;
-    const url = isEdit ? `/api/faqs/${faqState.editingId}` : "/api/faqs";
-    const method = isEdit ? "PUT" : "POST";
+  const payload = { intent, question, answer };
+  const isEdit = faqState.editingId !== null;
+  const url = isEdit ? `/api/faqs/${faqState.editingId}` : "/api/faqs";
+  const method = isEdit ? "PUT" : "POST";
 
+  try {
     const res = await fetch(url, {
       method,
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ intent, question, answer }),
+      body: JSON.stringify(payload),
+      credentials: "same-origin",
     });
 
     if (!res.ok) {
@@ -180,7 +236,7 @@ async function saveFAQ() {
     closeFAQModal();
     await loadFAQs();
   } catch (err) {
-    showFaqError("Save failed: " + err.message);
+    showFaqError(err.message || "Failed to save FAQ.");
   } finally {
     saveBtn.disabled = false;
     saveBtn.textContent = "Save FAQ";
@@ -188,27 +244,28 @@ async function saveFAQ() {
 }
 
 // =====================================================================
-// Delete FAQ
+// Delete
 // =====================================================================
 async function deleteFAQ(id) {
   const faq = faqState.allFaqs.find((f) => f.id === id);
-  const preview = faq ? `"${faq.question.slice(0, 60)}"` : `#${id}`;
-  if (!confirm(`Delete FAQ ${preview}?\n\nThis cannot be undone.`)) return;
+  const qPreview = faq ? `"${faq.question.slice(0, 40)}…"` : `#${id}`;
+
+  if (!confirm(`Are you sure you want to delete FAQ ${qPreview}?`)) return;
 
   try {
-    const res = await fetch(`/api/faqs/${id}`, { method: "DELETE" });
-    if (!res.ok && res.status !== 204) {
+    const res = await fetch(`/api/faqs/${id}`, { method: "DELETE", credentials: "same-origin" });
+    if (!res.ok) {
       const err = await res.json().catch(() => ({}));
       throw new Error(err.detail || `HTTP ${res.status}`);
     }
     await loadFAQs();
   } catch (err) {
-    alert("Delete failed: " + err.message);
+    alert(`Failed to delete FAQ: ${err.message}`);
   }
 }
 
 // =====================================================================
-// Escape helper (local scope)
+// Helpers
 // =====================================================================
 function escFaq(str) {
   return String(str || "")
@@ -222,20 +279,27 @@ function escFaq(str) {
 // Initialization
 // =====================================================================
 document.addEventListener("DOMContentLoaded", () => {
-  document.getElementById("btnAddFAQ").addEventListener("click", openAddFAQModal);
-  document.getElementById("faqModalClose").addEventListener("click", closeFAQModal);
-  document.getElementById("faqModalCancel").addEventListener("click", closeFAQModal);
-  document.getElementById("faqModalSave").addEventListener("click", saveFAQ);
+  const btnAdd = document.getElementById("btnAddFaq");
+  if (btnAdd) btnAdd.addEventListener("click", openAddFAQModal);
 
-  // Close modal when clicking overlay background
-  document.getElementById("faqModal").addEventListener("click", (e) => {
-    if (e.target === document.getElementById("faqModal")) closeFAQModal();
-  });
+  const btnRefresh = document.getElementById("btnRefreshFaqs");
+  if (btnRefresh) btnRefresh.addEventListener("click", loadFAQs);
+
+  const btnCancel = document.getElementById("faqModalCancel");
+  if (btnCancel) btnCancel.addEventListener("click", closeFAQModal);
+
+  const btnClose = document.getElementById("faqModalClose");
+  if (btnClose) btnClose.addEventListener("click", closeFAQModal);
+
+  const btnSave = document.getElementById("faqModalSave");
+  if (btnSave) btnSave.addEventListener("click", saveFAQ);
+
+  const modal = document.getElementById("faqModal");
+  if (modal) {
+    modal.addEventListener("click", (e) => {
+      if (e.target === modal) closeFAQModal();
+    });
+  }
 
   initFaqSearch();
-
-  // Load FAQs when the FAQ tab is active (may already be active on page load)
-  if (document.getElementById("page-faqs").classList.contains("active")) {
-    loadFAQs();
-  }
 });

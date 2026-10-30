@@ -27,8 +27,11 @@ const FILLER_PHRASES = [
   "Got it, checking for you now.",
 ];
 
-// ---- DOM Elements ----
+// ---- DOM Helpers (Null-Safe) ----
 const $ = (id) => document.getElementById(id);
+const setText = (id, val) => { const el = $(id); if (el) el.textContent = val; };
+const setHtml = (id, val) => { const el = $(id); if (el) el.innerHTML = val; };
+const on = (id, event, handler) => { const el = $(id); if (el) el.addEventListener(event, handler); };
 
 // =====================================================================
 // Navigation
@@ -41,20 +44,60 @@ function initNavigation() {
     });
   });
 
-  $("navHamburger").addEventListener("click", () => {
-    $("navLinks").classList.toggle("open");
+  const burger = $("navHamburger");
+  const navLinks = $("navLinks");
+
+  if (burger) {
+    burger.addEventListener("click", (e) => {
+      e.stopPropagation();
+      if (navLinks) navLinks.classList.toggle("open");
+    });
+  }
+
+  // Close mobile drawer when any link inside it is clicked
+  if (navLinks) {
+    navLinks.addEventListener("click", (e) => {
+      if (e.target.closest("a") || e.target.closest("button")) {
+        navLinks.classList.remove("open");
+      }
+    });
+  }
+
+  // Close drawer on outside tap/click
+  document.addEventListener("click", (e) => {
+    if (navLinks && navLinks.classList.contains("open")) {
+      if (!navLinks.contains(e.target) && burger && !burger.contains(e.target)) {
+        navLinks.classList.remove("open");
+      }
+    }
   });
 
-  // Close mobile menu when a link is clicked
-  $("navLinks").addEventListener("click", () => {
-    $("navLinks").classList.remove("open");
+  // Close drawer and open modals on Escape key
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape") {
+      if (navLinks && navLinks.classList.contains("open")) {
+        navLinks.classList.remove("open");
+      }
+      ["authModal", "faqModal", "productModal", "transcriptModal"].forEach((id) => {
+        const modal = $(id);
+        if (modal && !modal.classList.contains("hidden")) {
+          modal.classList.add("hidden");
+        }
+      });
+    }
   });
 
   // Key status badge -> open settings
-  $("keyStatusBadge").addEventListener("click", () => navigateTo("settings"));
+  const keyBadge = $("keyStatusBadge");
+  if (keyBadge) {
+    keyBadge.addEventListener("click", () => navigateTo("settings"));
+  }
 }
 
 function navigateTo(page) {
+  const navLinks = $("navLinks");
+  if (navLinks) navLinks.classList.remove("open");
+
   document.querySelectorAll(".page").forEach((el) => {
     el.classList.remove("active");
     el.classList.add("hidden");
@@ -74,6 +117,7 @@ function navigateTo(page) {
   if (page === "logs" && typeof loadCallLogs === "function") loadCallLogs();
   if (page === "faqs" && typeof loadFAQs === "function") loadFAQs();
   if (page === "products" && typeof loadProducts === "function") loadProducts();
+  if (page === "admin" && typeof loadAdminData === "function") loadAdminData();
   if (page === "settings") refreshSettingsPage();
 }
 
@@ -155,13 +199,15 @@ async function startCall() {
   setStatus("active", "Connected — DigiBuzz AI Calling Agent");
   setInputEnabled(true);
 
-  $("btnStartCall").classList.add("hidden");
-  $("btnEndCall").classList.remove("hidden");
+  const btnStart = $("btnStartCall");
+  const btnEnd = $("btnEndCall");
+  if (btnStart) btnStart.classList.add("hidden");
+  if (btnEnd) btnEnd.classList.remove("hidden");
   const hint = $("callHintBanner");
   if (hint) hint.style.display = "inline-flex";
 
-  $("sideStatus").textContent = "Active";
-  $("settingsCallStatus").textContent = "Active";
+  setText("sideStatus", "Active");
+  setText("settingsCallStatus", "Active");
 
   // Request browser microphone permission right on call start if not done yet
   await requestMicPermission();
@@ -206,13 +252,15 @@ function endCall() {
   setStatus("idle", "Call ended");
   setInputEnabled(false);
 
-  $("btnStartCall").classList.remove("hidden");
-  $("btnEndCall").classList.add("hidden");
+  const btnStart = $("btnStartCall");
+  const btnEnd = $("btnEndCall");
+  if (btnStart) btnStart.classList.remove("hidden");
+  if (btnEnd) btnEnd.classList.add("hidden");
   const hint = $("callHintBanner");
   if (hint) hint.style.display = "none";
 
-  $("sideStatus").textContent = "Ended";
-  $("settingsCallStatus").textContent = "Ended";
+  setText("sideStatus", "Ended");
+  setText("settingsCallStatus", "Ended");
 
   stopAudio();
   addSystemMessage("Call ended. Click Start Call to reconnect.");
@@ -251,10 +299,12 @@ function addUserMessage(text) {
       <div class="message-bubble">${escapeHtml(text)}</div>
       <div class="message-meta">${formatTime()}</div>
     </div>`;
-  $("chatWindow").appendChild(row);
+  const win = $("chatWindow");
+  if (win) win.appendChild(row);
   scrollChatToBottom();
   state.messageCount++;
-  $("sideMsgCount").textContent = state.messageCount;
+  setText("sideTurnCount", state.messageCount);
+  setText("sideMsgCount", state.messageCount);
 }
 
 function addBotMessage(text) {
@@ -460,25 +510,55 @@ async function sendMessage(text) {
 }
 
 // =====================================================================
-// Quick FAQ Chips Carousel / Slide Bar with Mouse Drag & Wheel
+// Quick FAQ Chips Carousel / Slide Bar with Drag & Mobile Touch Support
 // =====================================================================
+let chipsListenersAttached = false;
+let isDown = false;
+let startX = 0;
+let scrollLeft = 0;
+let hasDragged = false;
+
 async function loadChips() {
   const section = $("chipsSection");
   if (!section) return;
-  section.innerHTML = "";
-  try {
-    const res = await fetch("/api/faqs?limit=30");
-    const data = await res.json();
-    const questions = data.questions || [];
 
+  try {
+    let questions = [];
+    try {
+      const res = await fetch("/api/faqs?limit=30");
+      if (res.ok) {
+        const data = await res.json();
+        questions = data.questions || [];
+      }
+    } catch (_) {}
+
+    // Fallback default suggestions if empty or offline
+    if (!questions || questions.length === 0) {
+      questions = [
+        "What are your wholesale minimums?",
+        "What are your delivery times across Pakistan?",
+        "Do you offer bulk purchase discounts?",
+        "Can I track my order status?",
+        "What payment methods do you accept?",
+        "How do I return a damaged shipment?",
+      ];
+    }
+
+    section.innerHTML = "";
     questions.forEach((item) => {
-      const qText = typeof item === "string" ? item : item.question;
+      const qText = typeof item === "string" ? item : (item.question || "");
+      if (!qText) return;
       const chip = document.createElement("button");
       chip.type = "button";
       chip.className = "chip";
       chip.innerHTML = `<span>💬</span> <span>${escapeHtml(qText)}</span>`;
       chip.title = `Click to ask: "${qText}"`;
+
       chip.addEventListener("click", () => {
+        if (hasDragged) {
+          hasDragged = false;
+          return;
+        }
         if (!state.isOnCall) {
           startCall();
           setTimeout(() => sendMessage(qText), 600);
@@ -489,50 +569,59 @@ async function loadChips() {
       section.appendChild(chip);
     });
 
-    // Wire arrow slider scroll buttons (with larger scroll step)
+    // Wire arrow slider scroll buttons
     const leftBtn = $("chipScrollLeft");
     const rightBtn = $("chipScrollRight");
     if (leftBtn) {
-      leftBtn.onclick = () => section.scrollBy({ left: -280, behavior: "smooth" });
+      leftBtn.onclick = (e) => {
+        e.preventDefault();
+        section.scrollBy({ left: -260, behavior: "smooth" });
+      };
     }
     if (rightBtn) {
-      rightBtn.onclick = () => section.scrollBy({ left: 280, behavior: "smooth" });
+      rightBtn.onclick = (e) => {
+        e.preventDefault();
+        section.scrollBy({ left: 260, behavior: "smooth" });
+      };
     }
 
-    // Enable mouse wheel horizontal scrolling on the slider
-    section.addEventListener("wheel", (e) => {
-      if (e.deltaY !== 0) {
-        e.preventDefault();
-        section.scrollBy({ left: e.deltaY * 2, behavior: "smooth" });
-      }
-    }, { passive: false });
+    // Attach drag and wheel listeners once
+    if (!chipsListenersAttached) {
+      chipsListenersAttached = true;
 
-    // Enable mouse drag-to-scroll
-    let isDown = false;
-    let startX = 0;
-    let scrollLeft = 0;
+      section.addEventListener("wheel", (e) => {
+        if (e.deltaY !== 0) {
+          e.preventDefault();
+          section.scrollBy({ left: e.deltaY * 2, behavior: "smooth" });
+        }
+      }, { passive: false });
 
-    section.addEventListener("mousedown", (e) => {
-      isDown = true;
-      startX = e.pageX - section.offsetLeft;
-      scrollLeft = section.scrollLeft;
-      section.style.cursor = "grabbing";
-    });
+      section.addEventListener("mousedown", (e) => {
+        isDown = true;
+        hasDragged = false;
+        startX = e.pageX - section.offsetLeft;
+        scrollLeft = section.scrollLeft;
+        section.style.cursor = "grabbing";
+      });
 
-    window.addEventListener("mouseup", () => {
-      if (isDown) {
-        isDown = false;
-        section.style.cursor = "pointer";
-      }
-    });
+      window.addEventListener("mouseup", () => {
+        if (isDown) {
+          isDown = false;
+          section.style.cursor = "pointer";
+          setTimeout(() => { hasDragged = false; }, 50);
+        }
+      });
 
-    section.addEventListener("mousemove", (e) => {
-      if (!isDown) return;
-      e.preventDefault();
-      const x = e.pageX - section.offsetLeft;
-      const walk = (x - startX) * 1.5;
-      section.scrollLeft = scrollLeft - walk;
-    });
+      section.addEventListener("mousemove", (e) => {
+        if (!isDown) return;
+        const x = e.pageX - section.offsetLeft;
+        const walk = (x - startX) * 1.5;
+        if (Math.abs(walk) > 5) {
+          hasDragged = true;
+        }
+        section.scrollLeft = scrollLeft - walk;
+      });
+    }
 
   } catch (_) { /* chips are non-critical */ }
 }
@@ -744,13 +833,14 @@ function stopAudio() {
 // =====================================================================
 function toggleVoice() {
   state.isVoiceEnabled = !state.isVoiceEnabled;
-  const label = state.isVoiceEnabled ? "🔇 Disable Voice" : "🔊 Enable Voice";
-  const status = state.isVoiceEnabled ? "On" : "Off";
+  const label = state.isVoiceEnabled ? "🔇 Disable Voice Output" : "🔊 Enable Voice Output";
+  const status = state.isVoiceEnabled ? "Enabled 🔊" : "Disabled 🔇";
   ["btnToggleVoice", "settingsBtnToggleVoice"].forEach((id) => {
-    if ($(id)) $(id).textContent = label;
+    const el = $(id);
+    if (el) el.textContent = label;
   });
-  $("sideVoiceStatus").textContent = status;
-  $("settingsVoiceStatus").textContent = state.isVoiceEnabled ? "Enabled" : "Disabled";
+  setText("sideVoiceStatus", status);
+  setText("settingsVoiceStatus", state.isVoiceEnabled ? "Enabled 🔊" : "Disabled 🔇");
   if (!state.isVoiceEnabled) stopAudio();
 }
 
@@ -759,49 +849,66 @@ function toggleVoice() {
 // =====================================================================
 async function refreshSettingsPage() {
   updateSessionDisplay();
-  $("settingsCallStatus").textContent = state.isOnCall ? "Active" : "Idle";
-  $("settingsVoiceStatus").textContent = state.isVoiceEnabled ? "Enabled" : "Disabled";
-  ["settingsBtnToggleVoice"].forEach((id) => {
-    if ($(id)) $(id).textContent = state.isVoiceEnabled ? "🔇 Disable Voice" : "🔊 Enable Voice";
-  });
+  setText("settingsCallStatus", state.isOnCall ? "Active" : "Idle");
+  setText("settingsVoiceStatus", state.isVoiceEnabled ? "Enabled 🔊" : "Disabled 🔇");
+  const toggleBtn = $("settingsBtnToggleVoice");
+  if (toggleBtn) {
+    toggleBtn.textContent = state.isVoiceEnabled ? "🔇 Disable Voice Output" : "🔊 Enable Voice Output";
+  }
 
   try {
     const res = await fetch("/api/health");
     const data = await res.json();
-    $("settingsModel").textContent = data.model || "—";
-    $("settingsFaqs").textContent = data.faqs ?? "—";
-    $("settingsProducts").textContent = data.products ?? "—";
+    setText("settingsModel", data.model || "Gemini 2.5 Flash");
+    setText("settingsFaqs", data.faqs != null ? `${data.faqs} active items` : "—");
+    setText("settingsProducts", data.products != null ? `${data.products} items` : "—");
   } catch (_) {
-    $("settingsModel").textContent = "Unavailable";
+    setText("settingsModel", "Unavailable");
   }
 
   await refreshKeyStatus();
 }
 
 async function refreshKeyStatus() {
-  try {
-    const res = await fetch("/api/key-status");
-    const d = await res.json();
-    $("keyActiveLabel").textContent = d.active_key || "—";
-    $("keyPrimaryStatus").innerHTML = statusBadge(d.primary_status);
-    $("keySecondaryStatus").innerHTML = statusBadge(d.secondary_status);
-    $("keyFallback").textContent = d.has_fallback ? "Available" : "Not configured";
-    $("keyLastRefreshed").textContent = "Last refreshed: " + new Date().toLocaleTimeString();
+  // Only query key status if current user is an admin
+  const isAdmin = typeof authState !== "undefined" && authState && authState.isAdmin;
+  const adminSec = $("settingsAdminSection");
+  const badge = $("keyStatusBadge");
 
-    // Update navbar badge
-    const badge = $("keyStatusBadge");
-    if (d.primary_status === "active") {
-      badge.textContent = "🟢";
-      badge.title = "API: Primary key active";
-    } else if (d.active_key === "Secondary" && d.secondary_status === "active") {
-      badge.textContent = "🟡";
-      badge.title = "API: Switched to Secondary key";
-    } else {
-      badge.textContent = "🔴";
-      badge.title = "API: All keys may be exhausted";
+  if (!isAdmin) {
+    if (adminSec) adminSec.style.display = "none";
+    if (badge) badge.style.display = "none";
+    return;
+  }
+
+  if (adminSec) adminSec.style.display = "block";
+  if (badge) badge.style.display = "inline-flex";
+
+  try {
+    const res = await fetch("/api/key-status", { credentials: "same-origin" });
+    if (!res.ok) {
+      if (adminSec) adminSec.style.display = "none";
+      if (badge) badge.style.display = "none";
+      return;
+    }
+    const d = await res.json();
+    setText("keyActiveLabel", d.active_key || "Primary");
+    setHtml("keyPrimaryStatus", statusBadge(d.primary_status));
+    setHtml("keySecondaryStatus", statusBadge(d.secondary_status));
+    setText("keyFallback", d.failover_triggered ? "Active (Failover engaged)" : (d.has_fallback ? "Configured & Ready" : "Not Configured"));
+    setText("keyLastRefreshed", "Last checked: " + new Date().toLocaleTimeString());
+
+    if (badge) {
+      if (d.failover_triggered) {
+        badge.textContent = "⚠️";
+        badge.title = "Gemini Key: Switched to Failover Key";
+      } else {
+        badge.textContent = "🟢";
+        badge.title = `Gemini Key: ${d.active_key} Active`;
+      }
     }
   } catch (_) {
-    $("keyLastRefreshed").textContent = "Failed to fetch status";
+    if (badge) badge.textContent = "⚪";
   }
 }
 
@@ -881,7 +988,7 @@ function applyTheme(theme) {
 
   const themeLabel = $("currentThemeLabel");
   if (themeLabel) {
-    themeLabel.textContent = theme === "dark" ? "Dark Mode" : "Light Mode";
+    themeLabel.textContent = theme === "dark" ? "Dark Mode 🌙" : "Light Mode ☀️";
   }
 }
 
@@ -893,26 +1000,31 @@ document.addEventListener("DOMContentLoaded", () => {
   initNavigation();
   initSession();
   initSpeechRecognition();
-  loadChips(); // Load FAQ suggestion slider immediately on page load!
+  loadChips();
 
-  // Call controls
-  $("btnStartCall").addEventListener("click", startCall);
-  $("btnEndCall").addEventListener("click", endCall);
-  $("btnNewSession").addEventListener("click", startNewSession);
-  $("btnToggleVoice").addEventListener("click", toggleVoice);
-  $("settingsBtnToggleVoice").addEventListener("click", toggleVoice);
-  $("settingsBtnNewSession").addEventListener("click", startNewSession);
-  $("btnRefreshKeyStatus").addEventListener("click", refreshKeyStatus);
+  // Call controls (with null-safe 'on' helper)
+  on("btnStartCall", "click", startCall);
+  on("btnEndCall", "click", endCall);
+  on("btnNewSession", "click", startNewSession);
+  on("btnToggleVoice", "click", toggleVoice);
+  on("settingsBtnToggleVoice", "click", toggleVoice);
+  on("settingsBtnNewSession", "click", startNewSession);
+  on("btnRefreshKeyStatus", "click", refreshKeyStatus);
 
   // Chat input
-  $("chatInput").addEventListener("keydown", (e) => {
-    if (e.key === "Enter" && !e.shiftKey) {
-      e.preventDefault();
-      sendMessage();
-    }
-  });
-  $("btnSend").addEventListener("click", () => sendMessage());
+  const chatInput = $("chatInput");
+  if (chatInput) {
+    chatInput.addEventListener("keydown", (e) => {
+      if (e.key === "Enter" && !e.shiftKey) {
+        e.preventDefault();
+        sendMessage();
+      }
+    });
+  }
+  on("btnSend", "click", () => sendMessage());
 
-  // Load key status on first load
-  refreshKeyStatus();
+  // Check key status only if admin
+  if (typeof authState !== "undefined" && authState && authState.isAdmin) {
+    refreshKeyStatus();
+  }
 });

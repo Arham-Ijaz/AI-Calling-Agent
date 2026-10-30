@@ -1,7 +1,7 @@
 "use strict";
 
 // =====================================================================
-// DigiBuzz AI Calling Agent — Product/Data Manager
+// DigiBuzz AI Calling Agent — Product Catalog Manager (Multi-Tenant)
 // =====================================================================
 
 const productState = {
@@ -14,48 +14,72 @@ const productState = {
 // =====================================================================
 async function loadProducts() {
   const tbody = document.getElementById("productTableBody");
-  tbody.innerHTML = '<tr><td colspan="7" class="loading-row">Loading products…</td></tr>';
+  if (tbody) {
+    tbody.innerHTML = '<tr><td colspan="8" class="loading-row">Loading products…</td></tr>';
+  }
 
   try {
-    const res = await fetch("/api/products");
+    const res = await fetch("/api/products", { credentials: "same-origin" });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     productState.allProducts = await res.json();
     populateCategoryFilter();
     renderProductTable(productState.allProducts);
   } catch (err) {
-    tbody.innerHTML = `<tr><td colspan="7" class="loading-row" style="color:var(--red)">Failed to load products: ${err.message}</td></tr>`;
+    if (tbody) {
+      tbody.innerHTML = `<tr><td colspan="8" class="loading-row" style="color:var(--red)">Failed to load products: ${err.message}</td></tr>`;
+    }
   }
 }
 
 function renderProductTable(products) {
   const tbody = document.getElementById("productTableBody");
   const countEl = document.getElementById("productCount");
+  if (!tbody) return;
 
-  countEl.textContent = `${products.length} record${products.length !== 1 ? "s" : ""}`;
+  if (countEl) countEl.textContent = `${products.length} product${products.length !== 1 ? "s" : ""}`;
 
-  if (products.length === 0) {
-    tbody.innerHTML = '<tr><td colspan="7" class="loading-row">No products found.</td></tr>';
+  if (!products || products.length === 0) {
+    tbody.innerHTML = '<tr><td colspan="8" class="loading-row">No products match your search criteria.</td></tr>';
     return;
   }
 
   tbody.innerHTML = products
-    .map(
-      (p) => `
+    .map((p) => {
+      const isOwner = authState.user && p.user_id === authState.user.id;
+      const canEdit = authState.isAdmin || isOwner;
+
+      let scopeBadge = '<span class="badge" style="background:var(--surface-card);color:var(--text-muted);font-size:.7rem;">Platform</span>';
+      if (p.user_id) {
+        const ownerLabel = authState.isAdmin ? (p.owner_name || "Custom") : (isOwner ? "Yours" : "Custom");
+        scopeBadge = `<span class="badge" style="background:var(--brand-light);color:var(--brand);font-size:.7rem;">${escProd(ownerLabel)}</span>`;
+      }
+
+      return `
       <tr data-id="${p.id}">
         <td><strong>#${p.id}</strong></td>
-        <td class="td-truncate" title="${escProd(p.name)}">${escProd(p.name)}</td>
-        <td>${escProd(p.category)}</td>
+        <td>
+          <div style="font-weight:600;">${escProd(p.name)}</div>
+          <div style="font-size:0.75rem;color:var(--text-muted);">${escProd(p.description || "")}</div>
+        </td>
+        <td><span class="badge" style="background:var(--surface-card);color:var(--text-muted);">${escProd(p.category)}</span></td>
         <td>${escProd(p.brand)}</td>
-        <td>PKR ${Number(p.price).toLocaleString()}</td>
+        <td><strong>${formatPKR(p.price)}</strong></td>
         <td>${stockBadge(p.stock_status)}</td>
+        <td>${scopeBadge}</td>
         <td>
           <div class="action-cell">
-            <button class="btn btn-sm btn-edit-sm" onclick="openEditProductModal(${p.id})">✏️ Edit</button>
-            <button class="btn btn-sm btn-danger-sm" onclick="deleteProduct(${p.id})">🗑️ Delete</button>
+            ${
+              canEdit
+                ? `
+              <button class="btn btn-sm btn-edit-sm" onclick="openEditProductModal(${p.id})">✏️ Edit</button>
+              <button class="btn btn-sm btn-danger-sm" onclick="deleteProduct(${p.id})">🗑️ Delete</button>
+            `
+                : '<span style="font-size:.75rem;color:var(--text-muted);">Default</span>'
+            }
           </div>
         </td>
-      </tr>`
-    )
+      </tr>`;
+    })
     .join("");
 }
 
@@ -73,6 +97,7 @@ function stockBadge(status) {
 // =====================================================================
 function populateCategoryFilter() {
   const sel = document.getElementById("productCategoryFilter");
+  if (!sel) return;
   const current = sel.value;
   const categories = [...new Set(productState.allProducts.map((p) => p.category))].sort();
 
@@ -88,35 +113,46 @@ function populateCategoryFilter() {
 
 function initProductFilters() {
   const searchInput = document.getElementById("productSearch");
-  const catFilter = document.getElementById("productCategoryFilter");
+  const categoryFilter = document.getElementById("productCategoryFilter");
 
-  function applyFilters() {
-    const q = searchInput.value.toLowerCase().trim();
-    const cat = catFilter.value;
+  function applyProductFilter() {
+    const q = (searchInput ? searchInput.value : "").toLowerCase().trim();
+    const selectedCategory = categoryFilter ? categoryFilter.value : "";
 
     const filtered = productState.allProducts.filter((p) => {
-      const matchesCat = !cat || p.category === cat;
+      const matchesCategory = !selectedCategory || p.category === selectedCategory;
       const matchesQ =
         !q ||
         p.name.toLowerCase().includes(q) ||
         p.brand.toLowerCase().includes(q) ||
-        p.description.toLowerCase().includes(q);
-      return matchesCat && matchesQ;
+        p.category.toLowerCase().includes(q) ||
+        (p.description && p.description.toLowerCase().includes(q));
+      return matchesCategory && matchesQ;
     });
 
     renderProductTable(filtered);
   }
 
-  if (searchInput) searchInput.addEventListener("input", applyFilters);
-  if (catFilter) catFilter.addEventListener("change", applyFilters);
+  if (searchInput) searchInput.addEventListener("input", applyProductFilter);
+  if (categoryFilter) categoryFilter.addEventListener("change", applyProductFilter);
 }
 
 // =====================================================================
 // Modal — Open / Close
 // =====================================================================
 function openAddProductModal() {
+  if (!authState.isLoggedIn) {
+    if (typeof openAuthModal === "function") {
+      openAuthModal("login");
+    } else {
+      alert("Please sign in to add your custom products.");
+    }
+    return;
+  }
+
   productState.editingId = null;
-  document.getElementById("productModalTitle").textContent = "Add Product";
+  const title = document.getElementById("productModalTitle");
+  if (title) title.textContent = "Add Product";
   document.getElementById("productName").value = "";
   document.getElementById("productBrand").value = "";
   document.getElementById("productCategory").value = "";
@@ -129,72 +165,96 @@ function openAddProductModal() {
 }
 
 function openEditProductModal(id) {
-  const product = productState.allProducts.find((p) => p.id === id);
-  if (!product) return;
+  const p = productState.allProducts.find((item) => item.id === id);
+  if (!p) return;
+
+  const isOwner = authState.user && p.user_id === authState.user.id;
+  if (!authState.isAdmin && !isOwner) {
+    alert("You do not have permission to modify this product.");
+    return;
+  }
+
   productState.editingId = id;
-  document.getElementById("productModalTitle").textContent = "Edit Product";
-  document.getElementById("productName").value = product.name;
-  document.getElementById("productBrand").value = product.brand;
-  document.getElementById("productCategory").value = product.category;
-  document.getElementById("productPrice").value = product.price;
-  document.getElementById("productStock").value = product.stock_status;
-  document.getElementById("productDescription").value = product.description;
+  const title = document.getElementById("productModalTitle");
+  if (title) title.textContent = "Edit Product";
+  document.getElementById("productName").value = p.name;
+  document.getElementById("productBrand").value = p.brand;
+  document.getElementById("productCategory").value = p.category;
+  document.getElementById("productPrice").value = p.price;
+  document.getElementById("productStock").value = p.stock_status;
+  document.getElementById("productDescription").value = p.description || "";
   hideProductError();
   document.getElementById("productModal").classList.remove("hidden");
   document.getElementById("productName").focus();
 }
 
 function closeProductModal() {
-  document.getElementById("productModal").classList.add("hidden");
+  const modal = document.getElementById("productModal");
+  if (modal) modal.classList.add("hidden");
   productState.editingId = null;
 }
 
 function showProductError(msg) {
   const el = document.getElementById("productFormError");
-  el.textContent = msg;
-  el.classList.remove("hidden");
+  if (el) {
+    el.textContent = msg;
+    el.classList.remove("hidden");
+  }
 }
 
 function hideProductError() {
-  document.getElementById("productFormError").classList.add("hidden");
+  const el = document.getElementById("productFormError");
+  if (el) {
+    el.textContent = "";
+    el.classList.add("hidden");
+  }
 }
 
 // =====================================================================
-// Save Product (POST or PUT)
+// Save (Create or Update)
 // =====================================================================
 async function saveProduct() {
+  hideProductError();
   const name = document.getElementById("productName").value.trim();
   const brand = document.getElementById("productBrand").value.trim();
   const category = document.getElementById("productCategory").value.trim();
-  const priceRaw = document.getElementById("productPrice").value.trim();
+  const priceRaw = document.getElementById("productPrice").value;
   const stock_status = document.getElementById("productStock").value;
   const description = document.getElementById("productDescription").value.trim();
+  const saveBtn = document.getElementById("productModalSave");
 
-  if (!name) { showProductError("Product name is required."); return; }
-  if (!brand) { showProductError("Brand is required."); return; }
-  if (!category) { showProductError("Category is required."); return; }
-  if (!priceRaw || isNaN(Number(priceRaw)) || Number(priceRaw) < 0) {
-    showProductError("A valid price (PKR) is required."); return;
+  if (!name) {
+    showProductError("Product Name is required.");
+    return;
+  }
+  if (!brand) {
+    showProductError("Brand is required.");
+    return;
+  }
+  if (!category) {
+    showProductError("Category is required.");
+    return;
+  }
+  const price = parseInt(priceRaw, 10);
+  if (isNaN(price) || price < 0) {
+    showProductError("Please enter a valid price in PKR.");
+    return;
   }
 
-  hideProductError();
-
-  const price = parseInt(priceRaw, 10);
-  const payload = { name, brand, category, price, stock_status, description };
-
-  const saveBtn = document.getElementById("productModalSave");
   saveBtn.disabled = true;
   saveBtn.textContent = "Saving…";
 
-  try {
-    const isEdit = productState.editingId !== null;
-    const url = isEdit ? `/api/products/${productState.editingId}` : "/api/products";
-    const method = isEdit ? "PUT" : "POST";
+  const payload = { name, brand, category, price, stock_status, description };
+  const isEdit = productState.editingId !== null;
+  const url = isEdit ? `/api/products/${productState.editingId}` : "/api/products";
+  const method = isEdit ? "PUT" : "POST";
 
+  try {
     const res = await fetch(url, {
       method,
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload),
+      credentials: "same-origin",
     });
 
     if (!res.ok) {
@@ -205,7 +265,7 @@ async function saveProduct() {
     closeProductModal();
     await loadProducts();
   } catch (err) {
-    showProductError("Save failed: " + err.message);
+    showProductError(err.message || "Failed to save product.");
   } finally {
     saveBtn.disabled = false;
     saveBtn.textContent = "Save Product";
@@ -213,28 +273,33 @@ async function saveProduct() {
 }
 
 // =====================================================================
-// Delete Product
+// Delete
 // =====================================================================
 async function deleteProduct(id) {
-  const product = productState.allProducts.find((p) => p.id === id);
-  const label = product ? `"${product.name}"` : `#${id}`;
-  if (!confirm(`Delete product ${label}?\n\nThis cannot be undone.`)) return;
+  const p = productState.allProducts.find((item) => item.id === id);
+  const namePreview = p ? `"${p.name}"` : `#${id}`;
+
+  if (!confirm(`Are you sure you want to delete ${namePreview}?`)) return;
 
   try {
-    const res = await fetch(`/api/products/${id}`, { method: "DELETE" });
-    if (!res.ok && res.status !== 204) {
+    const res = await fetch(`/api/products/${id}`, { method: "DELETE", credentials: "same-origin" });
+    if (!res.ok) {
       const err = await res.json().catch(() => ({}));
       throw new Error(err.detail || `HTTP ${res.status}`);
     }
     await loadProducts();
   } catch (err) {
-    alert("Delete failed: " + err.message);
+    alert(`Failed to delete product: ${err.message}`);
   }
 }
 
 // =====================================================================
-// Escape helper (local scope)
+// Helpers
 // =====================================================================
+function formatPKR(val) {
+  return "PKR " + Number(val || 0).toLocaleString("en-PK");
+}
+
 function escProd(str) {
   return String(str || "")
     .replace(/&/g, "&amp;")
@@ -247,20 +312,27 @@ function escProd(str) {
 // Initialization
 // =====================================================================
 document.addEventListener("DOMContentLoaded", () => {
-  document.getElementById("btnAddProduct").addEventListener("click", openAddProductModal);
-  document.getElementById("productModalClose").addEventListener("click", closeProductModal);
-  document.getElementById("productModalCancel").addEventListener("click", closeProductModal);
-  document.getElementById("productModalSave").addEventListener("click", saveProduct);
+  const btnAdd = document.getElementById("btnAddProduct");
+  if (btnAdd) btnAdd.addEventListener("click", openAddProductModal);
 
-  // Close modal on overlay click
-  document.getElementById("productModal").addEventListener("click", (e) => {
-    if (e.target === document.getElementById("productModal")) closeProductModal();
-  });
+  const btnRefresh = document.getElementById("btnRefreshProducts");
+  if (btnRefresh) btnRefresh.addEventListener("click", loadProducts);
+
+  const btnCancel = document.getElementById("productModalCancel");
+  if (btnCancel) btnCancel.addEventListener("click", closeProductModal);
+
+  const btnClose = document.getElementById("productModalClose");
+  if (btnClose) btnClose.addEventListener("click", closeProductModal);
+
+  const btnSave = document.getElementById("productModalSave");
+  if (btnSave) btnSave.addEventListener("click", saveProduct);
+
+  const modal = document.getElementById("productModal");
+  if (modal) {
+    modal.addEventListener("click", (e) => {
+      if (e.target === modal) closeProductModal();
+    });
+  }
 
   initProductFilters();
-
-  // Load products if starting on products page
-  if (document.getElementById("page-products").classList.contains("active")) {
-    loadProducts();
-  }
 });
