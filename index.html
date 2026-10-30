@@ -335,7 +335,10 @@
           <h1>👑 SaaS Administration</h1>
           <p class="page-subtitle">User Management, Role Assignments, and System Overview</p>
         </div>
-        <button class="btn btn-outline" id="btnRefreshAdmin">🔄 Refresh Data</button>
+        <div style="display:flex; gap:0.5rem; flex-wrap:wrap; align-items:center;">
+          <button class="btn btn-brand" id="btnOpenAddAdminUser">➕ Add User / Admin</button>
+          <button class="btn btn-outline" id="btnRefreshAdmin">🔄 Refresh Data</button>
+        </div>
       </div>
 
       <!-- Metric Cards Grid -->
@@ -696,6 +699,94 @@
       </div>
       <div class="modal-footer">
         <button class="btn btn-ghost" id="transcriptModalDone">Close</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ===== Admin Add User Modal ===== -->
+  <div class="modal-overlay hidden" id="adminAddUserModal">
+    <div class="modal">
+      <div class="modal-header">
+        <h2>➕ Add New User or Administrator</h2>
+        <button class="modal-close" id="adminAddUserModalClose">&times;</button>
+      </div>
+      <div class="modal-body">
+        <div class="form-group">
+          <label for="adminAddName">Full Name *</label>
+          <input type="text" id="adminAddName" class="form-input" placeholder="e.g. Sarah Khan" required />
+        </div>
+        <div class="form-group">
+          <label for="adminAddEmail">Email Address *</label>
+          <input type="email" id="adminAddEmail" class="form-input" placeholder="sarah@example.com" required />
+        </div>
+        <div class="form-group">
+          <label for="adminAddPhone">Phone Number * (e.g. +923001234567)</label>
+          <input type="tel" id="adminAddPhone" class="form-input" placeholder="+923001234567" required />
+        </div>
+        <div class="form-group">
+          <label for="adminAddPassword">Initial Password * (min 8 chars, letters & numbers)</label>
+          <input type="password" id="adminAddPassword" class="form-input" placeholder="Secure password" required />
+        </div>
+        <div class="form-group">
+          <label for="adminAddRole">Account Role *</label>
+          <select id="adminAddRole" class="form-select">
+            <option value="user">Regular Member (Scoped to own account)</option>
+            <option value="admin">Administrator (Full Admin Privileges)</option>
+          </select>
+        </div>
+        <div class="form-error hidden" id="adminAddError"></div>
+      </div>
+      <div class="modal-footer">
+        <button class="btn btn-ghost" id="adminAddUserCancel">Cancel</button>
+        <button class="btn btn-brand" id="btnSaveNewAdminUser">Create Account</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ===== Admin Edit User Modal ===== -->
+  <div class="modal-overlay hidden" id="adminEditUserModal">
+    <div class="modal">
+      <div class="modal-header">
+        <h2>✏️ Edit User Account</h2>
+        <button class="modal-close" id="adminEditUserModalClose">&times;</button>
+      </div>
+      <div class="modal-body">
+        <input type="hidden" id="adminEditUserId" />
+        <div class="form-group">
+          <label for="adminEditName">Full Name *</label>
+          <input type="text" id="adminEditName" class="form-input" required />
+        </div>
+        <div class="form-group">
+          <label for="adminEditEmail">Email Address *</label>
+          <input type="email" id="adminEditEmail" class="form-input" required />
+        </div>
+        <div class="form-group">
+          <label for="adminEditPhone">Phone Number *</label>
+          <input type="tel" id="adminEditPhone" class="form-input" required />
+        </div>
+        <div class="form-group">
+          <label for="adminEditRole">Account Role</label>
+          <select id="adminEditRole" class="form-select">
+            <option value="user">Regular Member</option>
+            <option value="admin">Administrator</option>
+          </select>
+        </div>
+        <div class="form-group">
+          <label for="adminEditStatus">Account Status</label>
+          <select id="adminEditStatus" class="form-select">
+            <option value="active">Active (Access Allowed)</option>
+            <option value="suspended">Suspended (Access Blocked)</option>
+          </select>
+        </div>
+        <div class="form-group">
+          <label for="adminEditPassword">Reset Password (leave blank to keep current password)</label>
+          <input type="password" id="adminEditPassword" class="form-input" placeholder="New secure password" />
+        </div>
+        <div class="form-error hidden" id="adminEditError"></div>
+      </div>
+      <div class="modal-footer">
+        <button class="btn btn-ghost" id="adminEditUserCancel">Cancel</button>
+        <button class="btn btn-brand" id="btnSaveEditAdminUser">Save Changes</button>
       </div>
     </div>
   </div>

@@ -117,9 +117,46 @@ function renderAdminUsersTable(users) {
         .slice(0, 2);
 
       const isCurrentAdmin = authState.user && authState.user.id === u.id;
+      const isPrimary = Boolean(u.is_primary) || u.id === 1 || (u.email && u.email.toLowerCase() === "admin@digibuzz.com");
       const statusClass = u.is_active ? "badge-success" : "badge-danger";
       const statusText = u.is_active ? "Active" : "Suspended";
-      const roleBadge = u.role === "admin" ? '<span class="role-badge admin">Admin</span>' : '<span class="role-badge member">User</span>';
+
+      let roleBadge = '<span class="role-badge member">User</span>';
+      if (isPrimary) {
+        roleBadge = '<span class="role-badge admin">👑 Primary Admin</span>';
+      } else if (u.role === "admin") {
+        roleBadge = '<span class="role-badge admin">⭐ Admin</span>';
+      }
+
+      let actionHtml = "";
+      if (isCurrentAdmin) {
+        actionHtml = '<span style="font-size:.75rem;color:var(--text-muted);font-weight:600;">(Your Account)</span>';
+      } else if (isPrimary) {
+        actionHtml = '<span class="badge" style="background:rgba(234,179,8,0.15);color:#eab308;border:1px solid rgba(234,179,8,0.3);font-size:.75rem;font-weight:600;">🛡️ Protected</span>';
+      } else {
+        actionHtml = `
+          <button class="btn btn-xs btn-outline" 
+            onclick="openEditUserModal(${u.id})" 
+            title="Edit User Details">
+            ✏️ Edit
+          </button>
+          <button class="btn btn-xs ${u.is_active ? "btn-outline-danger" : "btn-outline-success"}" 
+            onclick="toggleUserStatus(${u.id}, ${Boolean(u.is_active)})" 
+            title="${u.is_active ? "Suspend Account" : "Activate Account"}">
+            ${u.is_active ? "🛑 Suspend" : "✅ Activate"}
+          </button>
+          <button class="btn btn-xs btn-outline" 
+            onclick="toggleUserRole(${u.id}, '${u.role}')" 
+            title="${u.role === "admin" ? "Demote to Member" : "Promote to Admin"}">
+            ${u.role === "admin" ? "⬇️ Demote" : "⭐ Make Admin"}
+          </button>
+          <button class="btn btn-xs btn-outline-danger" 
+            onclick="deleteUser(${u.id}, '${escAdmin(u.full_name)}')" 
+            title="Permanently Delete Account">
+            🗑️ Delete
+          </button>
+        `;
+      }
 
       return `
       <tr>
@@ -140,22 +177,7 @@ function renderAdminUsersTable(users) {
         <td style="font-size:.8rem;color:var(--text-muted);">${escAdmin(u.created_at ? u.created_at.slice(0, 10) : "—")}</td>
         <td>
           <div class="action-btn-group">
-            ${
-              isCurrentAdmin
-                ? '<span style="font-size:.75rem;color:var(--text-muted);">(Self)</span>'
-                : `
-              <button class="btn btn-xs ${u.is_active ? "btn-outline-danger" : "btn-outline-success"}" 
-                onclick="toggleUserStatus(${u.id}, ${Boolean(u.is_active)})" 
-                title="${u.is_active ? "Suspend Account" : "Activate Account"}">
-                ${u.is_active ? "🛑 Suspend" : "✅ Activate"}
-              </button>
-              <button class="btn btn-xs btn-outline" 
-                onclick="toggleUserRole(${u.id}, '${u.role}')" 
-                title="${u.role === "admin" ? "Demote to Member" : "Promote to Admin"}">
-                ${u.role === "admin" ? "⬇️ Demote" : "⭐ Make Admin"}
-              </button>
-            `
-            }
+            ${actionHtml}
           </div>
         </td>
       </tr>`;
@@ -164,7 +186,7 @@ function renderAdminUsersTable(users) {
 }
 
 // =====================================================================
-// User Actions (Status & Role Toggle)
+// User Actions (Status, Role, Edit, Delete)
 // =====================================================================
 async function toggleUserStatus(userId, currentStatus) {
   const actionText = currentStatus ? "suspend" : "activate";
@@ -209,6 +231,208 @@ async function toggleUserRole(userId, currentRole) {
   }
 }
 
+async function deleteUser(userId, userName) {
+  if (!confirm(`Are you sure you want to permanently delete account "${userName}"? All associated call sessions will be removed.`)) {
+    return;
+  }
+
+  try {
+    const res = await fetch(`/api/admin/users/${userId}`, {
+      method: "DELETE",
+      credentials: "same-origin",
+    });
+
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.detail || "Failed to delete user account.");
+
+    await loadAdminData();
+  } catch (err) {
+    alert(`Error: ${err.message}`);
+  }
+}
+
+// =====================================================================
+// Add User Modal Handling
+// =====================================================================
+function openAddUserModal() {
+  const modal = document.getElementById("adminAddUserModal");
+  const errEl = document.getElementById("adminAddError");
+  if (!modal) return;
+
+  document.getElementById("adminAddName").value = "";
+  document.getElementById("adminAddEmail").value = "";
+  document.getElementById("adminAddPhone").value = "";
+  document.getElementById("adminAddPassword").value = "";
+  document.getElementById("adminAddRole").value = "user";
+  if (errEl) {
+    errEl.textContent = "";
+    errEl.classList.add("hidden");
+  }
+
+  modal.classList.remove("hidden");
+}
+
+function closeAddUserModal() {
+  const modal = document.getElementById("adminAddUserModal");
+  if (modal) modal.classList.add("hidden");
+}
+
+async function handleSaveNewUser() {
+  const btn = document.getElementById("btnSaveNewAdminUser");
+  const errEl = document.getElementById("adminAddError");
+  const name = document.getElementById("adminAddName").value.trim();
+  const email = document.getElementById("adminAddEmail").value.trim().toLowerCase();
+  const phone = document.getElementById("adminAddPhone").value.trim();
+  const password = document.getElementById("adminAddPassword").value;
+  const role = document.getElementById("adminAddRole").value;
+
+  if (!name || !email || !phone || !password) {
+    if (errEl) {
+      errEl.textContent = "All fields are required.";
+      errEl.classList.remove("hidden");
+    }
+    return;
+  }
+
+  if (password.length < 8 || !/[A-Za-z]/.test(password) || !/[0-9]/.test(password)) {
+    if (errEl) {
+      errEl.textContent = "Password must be at least 8 characters and contain both letters and numbers.";
+      errEl.classList.remove("hidden");
+    }
+    return;
+  }
+
+  btn.disabled = true;
+  btn.textContent = "Creating Account…";
+  if (errEl) errEl.classList.add("hidden");
+
+  try {
+    const res = await fetch("/api/admin/users", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        full_name: name,
+        email: email,
+        phone: phone,
+        password: password,
+        role: role,
+        is_active: true,
+      }),
+      credentials: "same-origin",
+    });
+
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.detail || "Failed to create user account.");
+
+    closeAddUserModal();
+    await loadAdminData();
+  } catch (err) {
+    if (errEl) {
+      errEl.textContent = err.message;
+      errEl.classList.remove("hidden");
+    }
+  } finally {
+    btn.disabled = false;
+    btn.textContent = "Create Account";
+  }
+}
+
+// =====================================================================
+// Edit User Modal Handling
+// =====================================================================
+function openEditUserModal(userId) {
+  const u = adminState.users.find((item) => item.id === userId);
+  if (!u) return;
+
+  const modal = document.getElementById("adminEditUserModal");
+  const errEl = document.getElementById("adminEditError");
+  if (!modal) return;
+
+  document.getElementById("adminEditUserId").value = u.id;
+  document.getElementById("adminEditName").value = u.full_name || "";
+  document.getElementById("adminEditEmail").value = u.email || "";
+  document.getElementById("adminEditPhone").value = u.phone || "";
+  document.getElementById("adminEditRole").value = u.role || "user";
+  document.getElementById("adminEditStatus").value = u.is_active ? "active" : "suspended";
+  document.getElementById("adminEditPassword").value = "";
+
+  if (errEl) {
+    errEl.textContent = "";
+    errEl.classList.add("hidden");
+  }
+
+  modal.classList.remove("hidden");
+}
+
+function closeEditUserModal() {
+  const modal = document.getElementById("adminEditUserModal");
+  if (modal) modal.classList.add("hidden");
+}
+
+async function handleSaveEditUser() {
+  const btn = document.getElementById("btnSaveEditAdminUser");
+  const errEl = document.getElementById("adminEditError");
+  const userId = document.getElementById("adminEditUserId").value;
+  const name = document.getElementById("adminEditName").value.trim();
+  const email = document.getElementById("adminEditEmail").value.trim().toLowerCase();
+  const phone = document.getElementById("adminEditPhone").value.trim();
+  const role = document.getElementById("adminEditRole").value;
+  const statusVal = document.getElementById("adminEditStatus").value;
+  const password = document.getElementById("adminEditPassword").value;
+
+  if (!name || !email || !phone) {
+    if (errEl) {
+      errEl.textContent = "Full name, email, and phone number are required.";
+      errEl.classList.remove("hidden");
+    }
+    return;
+  }
+
+  if (password && (password.length < 8 || !/[A-Za-z]/.test(password) || !/[0-9]/.test(password))) {
+    if (errEl) {
+      errEl.textContent = "New password must be at least 8 characters and contain both letters and numbers.";
+      errEl.classList.remove("hidden");
+    }
+    return;
+  }
+
+  btn.disabled = true;
+  btn.textContent = "Saving Changes…";
+  if (errEl) errEl.classList.add("hidden");
+
+  try {
+    const payload = {
+      full_name: name,
+      email: email,
+      phone: phone,
+      role: role,
+      is_active: statusVal === "active",
+    };
+    if (password) payload.password = password;
+
+    const res = await fetch(`/api/admin/users/${userId}`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+      credentials: "same-origin",
+    });
+
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.detail || "Failed to update user account.");
+
+    closeEditUserModal();
+    await loadAdminData();
+  } catch (err) {
+    if (errEl) {
+      errEl.textContent = err.message;
+      errEl.classList.remove("hidden");
+    }
+  } finally {
+    btn.disabled = false;
+    btn.textContent = "Save Changes";
+  }
+}
+
 function escAdmin(str) {
   return String(str || "")
     .replace(/&/g, "&amp;")
@@ -249,4 +473,27 @@ document.addEventListener("DOMContentLoaded", () => {
   if (btnRefreshAdmin) {
     btnRefreshAdmin.addEventListener("click", loadAdminData);
   }
+
+  // Add User Modal Events
+  const btnOpenAdd = document.getElementById("btnOpenAddAdminUser");
+  if (btnOpenAdd) btnOpenAdd.addEventListener("click", openAddUserModal);
+
+  const addModalClose = document.getElementById("adminAddUserModalClose");
+  if (addModalClose) addModalClose.addEventListener("click", closeAddUserModal);
+
+  const addModalCancel = document.getElementById("adminAddUserCancel");
+  if (addModalCancel) addModalCancel.addEventListener("click", closeAddUserModal);
+
+  const btnSaveNew = document.getElementById("btnSaveNewAdminUser");
+  if (btnSaveNew) btnSaveNew.addEventListener("click", handleSaveNewUser);
+
+  // Edit User Modal Events
+  const editModalClose = document.getElementById("adminEditUserModalClose");
+  if (editModalClose) editModalClose.addEventListener("click", closeEditUserModal);
+
+  const editModalCancel = document.getElementById("adminEditUserCancel");
+  if (editModalCancel) editModalCancel.addEventListener("click", closeEditUserModal);
+
+  const btnSaveEdit = document.getElementById("btnSaveEditAdminUser");
+  if (btnSaveEdit) btnSaveEdit.addEventListener("click", handleSaveEditUser);
 });

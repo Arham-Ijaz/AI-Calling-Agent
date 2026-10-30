@@ -384,12 +384,38 @@ def seed_faqs() -> None:
             log.info("Seeded %d platform FAQs.", len(faq_tuples))
 
 
+PRIMARY_ADMIN_EMAIL = os.getenv("DEFAULT_ADMIN_EMAIL", "admin@digibuzz.com").strip().lower()
+
+
+def is_primary_admin(user_id: int | None = None, email: str | None = None) -> bool:
+    """Check if the given user_id or email corresponds to the Primary Super Admin."""
+    if user_id == 1:
+        return True
+    if email and email.strip().lower() == PRIMARY_ADMIN_EMAIL:
+        return True
+    try:
+        with db() as conn:
+            # The earliest created admin account is the primary platform super admin
+            row = conn.execute(
+                "SELECT id, email FROM users WHERE LOWER(email) = ? OR role = 'admin' ORDER BY id ASC LIMIT 1",
+                (PRIMARY_ADMIN_EMAIL,),
+            ).fetchone()
+            if row:
+                if user_id is not None and row["id"] == user_id:
+                    return True
+                if email and row["email"].strip().lower() == email.strip().lower():
+                    return True
+    except Exception:
+        pass
+    return False
+
+
 def seed_default_admin() -> None:
     """Ensure at least one admin account exists."""
     with db() as conn:
         admin = conn.execute("SELECT id FROM users WHERE role = 'admin' LIMIT 1").fetchone()
         if not admin:
-            admin_email = os.getenv("DEFAULT_ADMIN_EMAIL", "admin@digibuzz.com").strip().lower()
+            admin_email = PRIMARY_ADMIN_EMAIL
             admin_phone = os.getenv("DEFAULT_ADMIN_PHONE", "+923001234567").strip()
             admin_pass = os.getenv("DEFAULT_ADMIN_PASSWORD", "Admin@12345")
             hashed = hash_password(admin_pass)
@@ -881,6 +907,24 @@ class UserRoleUpdate(BaseModel):
     role: str = Field(pattern=r"^(admin|user)$")
 
 
+class AdminUserCreate(BaseModel):
+    full_name: str = Field(min_length=2, max_length=100)
+    email: str = Field(pattern=EMAIL_PATTERN, min_length=5, max_length=120)
+    phone: str = Field(pattern=PHONE_PATTERN)
+    password: str = Field(min_length=8, max_length=128)
+    role: str = Field(default="user", pattern=r"^(admin|user)$")
+    is_active: bool = True
+
+
+class AdminUserUpdate(BaseModel):
+    full_name: str = Field(min_length=2, max_length=100)
+    email: str = Field(pattern=EMAIL_PATTERN, min_length=5, max_length=120)
+    phone: str = Field(pattern=PHONE_PATTERN)
+    password: str | None = Field(default=None, max_length=128)
+    role: str = Field(default="user", pattern=r"^(admin|user)$")
+    is_active: bool = True
+
+
 class ChatRequest(BaseModel):
     session_id: str = Field(min_length=1, max_length=64, pattern=SESSION_ID_PATTERN)
     message: str = Field(min_length=1, max_length=500)
@@ -1202,7 +1246,7 @@ async def get_admin_metrics(_admin: dict = Depends(require_admin)):
 
 @app.get("/api/admin/users")
 async def list_all_users(_admin: dict = Depends(require_admin)):
-    """List all registered users with activity stats."""
+    """List all registered users with activity stats and primary admin protection flag."""
     def query():
         with db() as conn:
             rows = conn.execute(
@@ -1212,18 +1256,132 @@ async def list_all_users(_admin: dict = Depends(require_admin)):
                        (SELECT COUNT(*) FROM faqs f WHERE f.user_id = u.id) AS faq_count,
                        (SELECT COUNT(*) FROM products p WHERE p.user_id = u.id) AS product_count
                 FROM users u
-                ORDER BY u.id DESC
+                ORDER BY u.id ASC
                 """
             ).fetchall()
-            return [dict(r) for r in rows]
+            user_list = []
+            for r in rows:
+                d = dict(r)
+                d["is_primary"] = is_primary_admin(user_id=d["id"], email=d["email"])
+                user_list.append(d)
+            return user_list
     return await asyncio.to_thread(query)
+
+
+@app.post("/api/admin/users", status_code=201)
+async def create_user_by_admin(req: AdminUserCreate, _admin: dict = Depends(require_admin)):
+    """Create a new user or administrator directly from the SaaS administration panel."""
+    clean_email = req.email.strip().lower()
+    clean_phone = re.sub(r"[\s\-()]", "", req.phone.strip())
+
+    if not re.search(r"[A-Za-z]", req.password) or not re.search(r"[0-9]", req.password):
+        raise HTTPException(
+            status_code=400,
+            detail="Password must be at least 8 characters and contain both letters and numbers.",
+        )
+
+    def query():
+        with db() as conn:
+            if conn.execute("SELECT 1 FROM users WHERE LOWER(email) = ?", (clean_email,)).fetchone():
+                return 409, "An account with this email address already exists."
+            if conn.execute("SELECT 1 FROM users WHERE phone = ?", (clean_phone,)).fetchone():
+                return 409, "An account with this phone number already exists."
+
+            password_hash = hash_password(req.password)
+            cursor = conn.execute(
+                "INSERT INTO users (email, phone, full_name, password_hash, role, is_active, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (clean_email, clean_phone, req.full_name.strip(), password_hash, req.role, 1 if req.is_active else 0, now()),
+            )
+            new_id = cursor.lastrowid
+            row = conn.execute(
+                "SELECT id, email, phone, full_name, role, is_active, created_at, last_login FROM users WHERE id = ?",
+                (new_id,),
+            ).fetchone()
+            d = dict(row)
+            d["is_primary"] = is_primary_admin(user_id=d["id"], email=d["email"])
+            return 201, d
+
+    status_code, result = await asyncio.to_thread(query)
+    if status_code == 409:
+        raise HTTPException(status_code=409, detail=result)
+    return result
+
+
+@app.put("/api/admin/users/{user_id}")
+async def update_user_by_admin(user_id: int, req: AdminUserUpdate, admin: dict = Depends(require_admin)):
+    """Update user details (name, email, phone, role, status, optional password)."""
+    clean_email = req.email.strip().lower()
+    clean_phone = re.sub(r"[\s\-()]", "", req.phone.strip())
+
+    if is_primary_admin(user_id=user_id):
+        # Primary Admin cannot be modified by secondary admins, and cannot be demoted or suspended
+        if admin["id"] != user_id or req.role != "admin" or not req.is_active:
+            raise HTTPException(
+                status_code=403,
+                detail="Primary Platform Administrator cannot be modified, demoted, suspended, or deleted.",
+            )
+
+    if req.password:
+        if len(req.password) < 8 or not re.search(r"[A-Za-z]", req.password) or not re.search(r"[0-9]", req.password):
+            raise HTTPException(
+                status_code=400,
+                detail="New password must be at least 8 characters and contain both letters and numbers.",
+            )
+
+    def query():
+        with db() as conn:
+            existing = conn.execute("SELECT id, email, phone, role, is_active FROM users WHERE id = ?", (user_id,)).fetchone()
+            if not existing:
+                return 404, "User not found."
+
+            # Check email uniqueness
+            email_conflict = conn.execute("SELECT 1 FROM users WHERE LOWER(email) = ? AND id != ?", (clean_email, user_id)).fetchone()
+            if email_conflict:
+                return 409, "An account with this email address already exists."
+
+            # Check phone uniqueness
+            phone_conflict = conn.execute("SELECT 1 FROM users WHERE phone = ? AND id != ?", (clean_phone, user_id)).fetchone()
+            if phone_conflict:
+                return 409, "An account with this phone number already exists."
+
+            if req.password:
+                new_hash = hash_password(req.password)
+                conn.execute(
+                    "UPDATE users SET email = ?, phone = ?, full_name = ?, password_hash = ?, role = ?, is_active = ? WHERE id = ?",
+                    (clean_email, clean_phone, req.full_name.strip(), new_hash, req.role, 1 if req.is_active else 0, user_id),
+                )
+            else:
+                conn.execute(
+                    "UPDATE users SET email = ?, phone = ?, full_name = ?, role = ?, is_active = ? WHERE id = ?",
+                    (clean_email, clean_phone, req.full_name.strip(), req.role, 1 if req.is_active else 0, user_id),
+                )
+
+            row = conn.execute(
+                "SELECT id, email, phone, full_name, role, is_active, created_at, last_login FROM users WHERE id = ?",
+                (user_id,),
+            ).fetchone()
+            d = dict(row)
+            d["is_primary"] = is_primary_admin(user_id=d["id"], email=d["email"])
+            return 200, d
+
+    status_code, result = await asyncio.to_thread(query)
+    if status_code == 404:
+        raise HTTPException(status_code=404, detail=result)
+    if status_code == 409:
+        raise HTTPException(status_code=409, detail=result)
+    return result
 
 
 @app.put("/api/admin/users/{user_id}/status")
 async def update_user_status(user_id: int, req: UserStatusUpdate, admin: dict = Depends(require_admin)):
-    """Activate or suspend a user account."""
+    """Activate or suspend a user account with Primary Admin immunity."""
+    if is_primary_admin(user_id=user_id):
+        raise HTTPException(
+            status_code=403,
+            detail="Primary Platform Administrator cannot be modified, demoted, suspended, or deleted.",
+        )
     if user_id == admin["id"] and not req.is_active:
-        raise HTTPException(status_code=400, detail="Administrators cannot suspend their own account.")
+        raise HTTPException(status_code=400, detail="Administrators cannot suspend their own active account.")
 
     def query():
         with db() as conn:
@@ -1241,7 +1399,12 @@ async def update_user_status(user_id: int, req: UserStatusUpdate, admin: dict = 
 
 @app.put("/api/admin/users/{user_id}/role")
 async def update_user_role(user_id: int, req: UserRoleUpdate, admin: dict = Depends(require_admin)):
-    """Promote or demote a user's role (admin or user)."""
+    """Promote or demote a user's role (admin or user) with Primary Admin immunity."""
+    if is_primary_admin(user_id=user_id):
+        raise HTTPException(
+            status_code=403,
+            detail="Primary Platform Administrator cannot be modified, demoted, suspended, or deleted.",
+        )
     if user_id == admin["id"] and req.role != "admin":
         raise HTTPException(status_code=400, detail="Administrators cannot demote themselves.")
 
@@ -1257,6 +1420,40 @@ async def update_user_role(user_id: int, req: UserRoleUpdate, admin: dict = Depe
     if not updated:
         raise HTTPException(status_code=404, detail="User not found.")
     return {"status": "ok", "message": f"User role updated to '{req.role}'."}
+
+
+@app.delete("/api/admin/users/{user_id}")
+async def delete_user_by_admin(user_id: int, admin: dict = Depends(require_admin)):
+    """Permanently delete a user account and associated call history with Primary Admin immunity."""
+    if is_primary_admin(user_id=user_id):
+        raise HTTPException(
+            status_code=403,
+            detail="Primary Platform Administrator cannot be modified, demoted, suspended, or deleted.",
+        )
+    if user_id == admin["id"]:
+        raise HTTPException(status_code=400, detail="Administrators cannot delete their own active session account.")
+
+    def query():
+        with db() as conn:
+            user = conn.execute("SELECT id, email, full_name FROM users WHERE id = ?", (user_id,)).fetchone()
+            if not user:
+                return False
+            # Clean up calls and call_messages
+            user_calls = conn.execute("SELECT id FROM calls WHERE user_id = ?", (user_id,)).fetchall()
+            for c in user_calls:
+                conn.execute("DELETE FROM call_messages WHERE call_id = ?", (c["id"],))
+            conn.execute("DELETE FROM calls WHERE user_id = ?", (user_id,))
+            # Reassign faqs and products to null/platform so catalog integrity is maintained
+            conn.execute("UPDATE faqs SET user_id = NULL WHERE user_id = ?", (user_id,))
+            conn.execute("UPDATE products SET user_id = NULL WHERE user_id = ?", (user_id,))
+            # Delete user
+            conn.execute("DELETE FROM users WHERE id = ?", (user_id,))
+            return True
+
+    deleted = await asyncio.to_thread(query)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="User not found.")
+    return {"status": "ok", "message": "User account and associated records deleted successfully."}
 
 
 # =====================================================================

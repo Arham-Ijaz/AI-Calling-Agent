@@ -46,7 +46,9 @@ async function loadCallLogs() {
         last_activity: c.last_activity,
         status: c.status,
         outcome: c.outcome,
-        total_messages: c.total_messages ?? 0
+        total_messages: c.total_messages ?? 0,
+        caller_name: c.caller_name || null,
+        caller_email: c.caller_email || null,
       });
     }
 
