@@ -3,7 +3,7 @@
 # =====================================================================
 # Description:
 #   A complete voice-enabled AI customer support backend using FastAPI,
-#   Google Gemini AI, and gTTS (Google Text-to-Speech).
+#   Google Gemini AI (google-genai modern SDK), and gTTS.
 #
 # How to run:
 #   Windows:  Double-click run.bat (or run 'run.bat' in terminal)
@@ -22,14 +22,26 @@ import json
 import logging
 import os
 import re
+import shutil
 import sqlite3
+import tempfile
 from collections import OrderedDict
 from contextlib import contextmanager
 from datetime import datetime
 from functools import lru_cache
 from pathlib import Path
 
-import google.generativeai as genai
+# Modern official Google GenAI SDK with fallback
+try:
+    from google import genai
+    from google.genai import types, errors
+    NEW_GENAI_AVAILABLE = True
+except ImportError:
+    import google.generativeai as genai  # type: ignore[no-redef]
+    types = None  # type: ignore[assignment]
+    errors = None  # type: ignore[assignment]
+    NEW_GENAI_AVAILABLE = False
+
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import FileResponse, Response
@@ -43,7 +55,46 @@ from pydantic import BaseModel, Field
 load_dotenv()
 
 BASE_DIR = Path(__file__).resolve().parent
-DB_PATH = BASE_DIR / "call_logs.db"
+
+
+def resolve_db_path() -> Path:
+    """Determine a safe and writable path for SQLite database across local and serverless environments."""
+    if env_path := (os.getenv("DB_PATH") or os.getenv("DATABASE_PATH")):
+        p = Path(env_path)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        return p
+
+    # Running on Vercel, AWS Lambda, or Serverless read-only container
+    if os.getenv("VERCEL") or os.getenv("AWS_LAMBDA_FUNCTION_NAME"):
+        tmp_db = Path(tempfile.gettempdir()) / "call_logs.db"
+        tmp_db.parent.mkdir(parents=True, exist_ok=True)
+        default_local = BASE_DIR / "call_logs.db"
+        if not tmp_db.exists() and default_local.exists():
+            try:
+                shutil.copy2(default_local, tmp_db)
+            except Exception:
+                pass
+        return tmp_db
+
+    # Test if BASE_DIR is writable
+    try:
+        test_file = BASE_DIR / ".write_test"
+        test_file.touch()
+        test_file.unlink()
+        return BASE_DIR / "call_logs.db"
+    except (OSError, PermissionError):
+        tmp_db = Path(tempfile.gettempdir()) / "call_logs.db"
+        tmp_db.parent.mkdir(parents=True, exist_ok=True)
+        default_local = BASE_DIR / "call_logs.db"
+        if not tmp_db.exists() and default_local.exists():
+            try:
+                shutil.copy2(default_local, tmp_db)
+            except Exception:
+                pass
+        return tmp_db
+
+
+DB_PATH = resolve_db_path()
 FAQ_PATH = BASE_DIR / "faq.json"
 PRODUCTS_PATH = BASE_DIR / "products.json"
 INDEX_HTML = BASE_DIR / "index.html"
@@ -68,11 +119,11 @@ FALLBACK_SPEECH = (
 
 RATE_LIMIT_REPLY = (
     "Our server is handling high call volume right now. "
-    "Please try again shortly or connect directly with our support team."
+    "Please stay on the line or contact human support directly."
 )
 RATE_LIMIT_SPEECH = (
-    "Our server is handling high call volume right now. "
-    "Please try again shortly or connect directly with our support team."
+    "Our server is handling high call volume. "
+    "Please hold on or reach out to human support directly."
 )
 
 SESSION_ID_PATTERN = r"^[A-Za-z0-9_-]{1,64}$"
@@ -86,7 +137,7 @@ log = logging.getLogger("ai_calling_agent")
 # 2. API Key Manager (Dual Key with Auto-Failover)
 # =====================================================================
 class ApiKeyManager:
-    # Manages primary and secondary Gemini API keys with auto-failover.
+    """Manages primary and secondary Gemini API keys with auto-failover."""
 
     QUOTA_SIGNALS = ("quota", "resource_exhausted", "429", "resourceexhausted")
 
@@ -94,23 +145,26 @@ class ApiKeyManager:
         self.key1: str | None = os.getenv("GEMINI_API_KEY")
         self.key2: str | None = os.getenv("GEMINI_API_KEY_2")
 
-        if not self.key1:
-            raise RuntimeError("GEMINI_API_KEY is missing. Please check your .env file.")
-
-        self.active_index: int = 0   # 0 = primary, 1 = secondary
+        self.active_index: int = 0  # 0 = primary, 1 = secondary
         self.key1_exhausted: bool = False
         self.key2_exhausted: bool = False
+        self.client = None
 
-        self._configure_active()
+        if not self.key1:
+            log.warning("GEMINI_API_KEY is not set. Please configure it in your .env file.")
+        else:
+            self._configure_active()
 
-    # ------------------------------------------------------------------
     def _configure_active(self) -> None:
-        # Apply the current active key to the genai library.
         key = self.key1 if self.active_index == 0 else self.key2
-        genai.configure(api_key=key)
+        if not key:
+            return
+        if NEW_GENAI_AVAILABLE:
+            self.client = genai.Client(api_key=key)
+        else:
+            genai.configure(api_key=key)
         log.info("Gemini configured with %s key.", self.active_label)
 
-    # ------------------------------------------------------------------
     @property
     def active_label(self) -> str:
         return "Primary" if self.active_index == 0 else "Secondary"
@@ -127,22 +181,20 @@ class ApiKeyManager:
             return "not_configured"
         return "exhausted" if self.key2_exhausted else "active"
 
-    @property 
+    @property
     def has_fallback(self) -> bool:
         return bool(self.key2)
 
-    # ------------------------------------------------------------------
     def is_quota_error(self, exc: Exception) -> bool:
-        """Return True if the exception looks like a quota/rate-limit error."""
+        """Return True if the exception looks like a quota or rate-limit error."""
+        if errors and isinstance(exc, (errors.APIError, errors.ClientError)):
+            if getattr(exc, "code", None) == 429:
+                return True
         text = str(exc).lower()
         return any(sig in text for sig in self.QUOTA_SIGNALS)
 
-    # ------------------------------------------------------------------
     def mark_exhausted_and_switch(self) -> bool:
-        """
-        Mark the current key as exhausted and switch to the other one.
-        Returns True if a usable fallback key is available.
-        """
+        """Mark current key as exhausted and switch to the backup key if available."""
         if self.active_index == 0:
             self.key1_exhausted = True
             if self.key2 and not self.key2_exhausted:
@@ -161,7 +213,6 @@ class ApiKeyManager:
         log.error("All Gemini API keys are exhausted.")
         return False
 
-    # ------------------------------------------------------------------
     def status_dict(self) -> dict:
         return {
             "active_key": self.active_label,
@@ -257,58 +308,68 @@ def seed_faqs() -> None:
 
 
 def init_db() -> None:
-    """Initialize all database tables and indexes."""
-    with db() as conn:
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.executescript(
-            """
-            CREATE TABLE IF NOT EXISTS calls (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                session_id TEXT UNIQUE NOT NULL,
-                started_at TEXT NOT NULL,
-                last_activity TEXT,
-                ended_at TEXT,
-                status TEXT NOT NULL DEFAULT 'active',
-                outcome TEXT NOT NULL DEFAULT 'Resolved',
-                total_messages INTEGER NOT NULL DEFAULT 0
-            );
+    """Initialize all database tables and indexes cleanly across all platforms."""
+    try:
+        with db() as conn:
+            try:
+                conn.execute("PRAGMA journal_mode=WAL")
+            except sqlite3.OperationalError:
+                try:
+                    conn.execute("PRAGMA journal_mode=DELETE")
+                except sqlite3.OperationalError:
+                    pass
 
-            CREATE TABLE IF NOT EXISTS call_messages (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                call_id INTEGER NOT NULL REFERENCES calls(id) ON DELETE CASCADE,
-                timestamp TEXT NOT NULL,
-                user_transcript TEXT,
-                ai_response TEXT,
-                detected_intent TEXT,
-                outcome TEXT
-            );
+            conn.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS calls (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    session_id TEXT UNIQUE NOT NULL,
+                    started_at TEXT NOT NULL,
+                    last_activity TEXT,
+                    ended_at TEXT,
+                    status TEXT NOT NULL DEFAULT 'active',
+                    outcome TEXT NOT NULL DEFAULT 'Resolved',
+                    total_messages INTEGER NOT NULL DEFAULT 0
+                );
 
-            CREATE TABLE IF NOT EXISTS products (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                name TEXT NOT NULL,
-                category TEXT NOT NULL,
-                brand TEXT NOT NULL,
-                price INTEGER NOT NULL,
-                stock_status TEXT NOT NULL,
-                description TEXT NOT NULL
-            );
+                CREATE TABLE IF NOT EXISTS call_messages (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    call_id INTEGER NOT NULL REFERENCES calls(id) ON DELETE CASCADE,
+                    timestamp TEXT NOT NULL,
+                    user_transcript TEXT,
+                    ai_response TEXT,
+                    detected_intent TEXT,
+                    outcome TEXT
+                );
 
-            CREATE TABLE IF NOT EXISTS faqs (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                intent TEXT NOT NULL,
-                question TEXT NOT NULL,
-                answer TEXT NOT NULL
-            );
+                CREATE TABLE IF NOT EXISTS products (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT NOT NULL,
+                    category TEXT NOT NULL,
+                    brand TEXT NOT NULL,
+                    price INTEGER NOT NULL,
+                    stock_status TEXT NOT NULL,
+                    description TEXT NOT NULL
+                );
 
-            CREATE INDEX IF NOT EXISTS idx_msgs_call ON call_messages(call_id, id);
-            CREATE INDEX IF NOT EXISTS idx_calls_session ON calls(session_id);
-            CREATE INDEX IF NOT EXISTS idx_products_category ON products(category);
-            """
-        )
-    seed_products()
-    seed_faqs()
-    resequence_table("products")
-    resequence_table("faqs")
+                CREATE TABLE IF NOT EXISTS faqs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    intent TEXT NOT NULL,
+                    question TEXT NOT NULL,
+                    answer TEXT NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_msgs_call ON call_messages(call_id, id);
+                CREATE INDEX IF NOT EXISTS idx_calls_session ON calls(session_id);
+                CREATE INDEX IF NOT EXISTS idx_products_category ON products(category);
+                """
+            )
+        seed_products()
+        seed_faqs()
+        resequence_table("products")
+        resequence_table("faqs")
+    except Exception as exc:
+        log.error("Notice during database initialization: %r", exc)
 
 
 def resequence_table(table_name: str) -> None:
@@ -357,12 +418,12 @@ def save_message(session_id: str, user_text: str, result: dict) -> None:
 
 
 def now() -> str:
-    """Return current timestamp as a string."""
+    """Return current timestamp as a formatted string."""
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
 # =====================================================================
-# 4. Knowledge Base Loaders
+# 4. Knowledge Base Loaders & System Instructions
 # =====================================================================
 def load_faqs_context() -> str:
     """Load all FAQs from the database and format for Gemini."""
@@ -425,28 +486,30 @@ Return ONLY a JSON object with these exact keys:
 """
 
 
-def create_model() -> genai.GenerativeModel:
-    """Instantiate a Gemini GenerativeModel with the current system instruction."""
-    return genai.GenerativeModel(
-        model_name=MODEL_NAME,
-        system_instruction=build_system_instruction(),
-        generation_config={"temperature": 0.2, "max_output_tokens": 1024},
-    )
+legacy_model = None
+
+
+def get_legacy_model():
+    """Instantiate legacy model if google-genai is unavailable."""
+    global legacy_model
+    if legacy_model is None and not NEW_GENAI_AVAILABLE:
+        legacy_model = genai.GenerativeModel(
+            model_name=MODEL_NAME,
+            system_instruction=build_system_instruction(),
+            generation_config={"temperature": 0.2, "max_output_tokens": 1024},
+        )
+    return legacy_model
 
 
 def refresh_knowledge_base() -> None:
-    """Rebuild Gemini system instructions and reload model whenever database FAQs or products are updated."""
-    global model
-    try:
-        model = create_model()
-        log.info("Knowledge base dynamically refreshed with latest database FAQs and products.")
-    except Exception as exc:
-        log.error("Failed to dynamically refresh knowledge base model: %r", exc)
+    """Rebuild Gemini system instructions and invalidate cached state when FAQs or products change."""
+    global legacy_model
+    legacy_model = None
+    log.info("Knowledge base dynamically refreshed with latest database FAQs and products.")
 
 
-# Initialize DB then build model
+# Initialize DB safely on startup
 init_db()
-model = create_model()
 
 
 # =====================================================================
@@ -457,7 +520,7 @@ CONSECUTIVE_ERRORS: int = 0
 
 
 def remember(session_id: str, user_text: str, reply: str) -> None:
-    """Store the conversation turn in memory for multi-turn context."""
+    """Store conversation turn in memory for multi-turn context."""
     hist = SESSIONS.setdefault(session_id, [])
     hist += [{"role": "user", "parts": [user_text]}, {"role": "model", "parts": [reply]}]
     del hist[: -MAX_HISTORY_TURNS * 2]
@@ -467,15 +530,12 @@ def remember(session_id: str, user_text: str, reply: str) -> None:
 
 
 def parse_model_json(raw: str) -> dict:
-    """Extract and parse JSON from Gemini response with a forgiving fallback."""
+    """Extract and parse JSON from Gemini response with forgiving fallback."""
     text = (raw or "").strip()
-    text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.MULTILINE)
-    text = re.sub(r"```\s*$", "", text, flags=re.MULTILINE).strip()
-    start = text.find("{")
-    end = text.rfind("}")
-    if start != -1 and end != -1 and end > start:
+    match = re.search(r"\{.*\}", text, re.DOTALL)
+    if match:
         try:
-            return json.loads(text[start : end + 1])
+            return json.loads(match.group(0))
         except Exception:
             pass
     clean_text = text.replace("```json", "").replace("```", "").strip()
@@ -487,32 +547,65 @@ def parse_model_json(raw: str) -> dict:
     }
 
 
-async def _call_gemini_once(contents: list) -> str:
-    """Make a single Gemini API call and return raw text."""
-    global model
-    response = await asyncio.wait_for(
-        model.generate_content_async(contents), timeout=GEMINI_TIMEOUT_S
-    )
-    return response.text
+async def _call_gemini_once(session_id: str, user_text: str) -> str:
+    """Make a single Gemini API call using either modern google-genai or legacy fallback."""
+    if NEW_GENAI_AVAILABLE:
+        if not key_manager.client:
+            if key_manager.key1 or key_manager.key2:
+                key_manager._configure_active()
+            if not key_manager.client:
+                raise RuntimeError("GEMINI_API_KEY is not configured. Please set GEMINI_API_KEY in environment variables.")
+
+        contents: list[types.Content] = []
+        for turn in SESSIONS.get(session_id, []):
+            role = "user" if turn.get("role") == "user" else "model"
+            parts = turn.get("parts", [""])
+            part_text = parts[0] if isinstance(parts, list) and parts else str(parts)
+            contents.append(types.Content(role=role, parts=[types.Part.from_text(text=part_text)]))
+
+        contents.append(types.Content(role="user", parts=[types.Part.from_text(text=user_text)]))
+
+        config = types.GenerateContentConfig(
+            system_instruction=build_system_instruction(),
+            temperature=0.2,
+            max_output_tokens=1024,
+            response_mime_type="application/json",
+        )
+
+        response = await asyncio.wait_for(
+            key_manager.client.aio.models.generate_content(
+                model=MODEL_NAME,
+                contents=contents,
+                config=config,
+            ),
+            timeout=GEMINI_TIMEOUT_S,
+        )
+        return response.text or ""
+    else:
+        model = get_legacy_model()
+        if not model:
+            raise RuntimeError("Gemini model could not be initialized.")
+        contents = SESSIONS.get(session_id, []) + [{"role": "user", "parts": [user_text]}]
+        response = await asyncio.wait_for(
+            model.generate_content_async(contents),
+            timeout=GEMINI_TIMEOUT_S,
+        )
+        return response.text or ""
 
 
 async def ask_gemini(session_id: str, user_text: str) -> dict:
     """Send user input with session history to Gemini; auto-failover on quota errors."""
-    global CONSECUTIVE_ERRORS, model
-
-    contents = SESSIONS.get(session_id, []) + [{"role": "user", "parts": [user_text]}]
+    global CONSECUTIVE_ERRORS
 
     try:
-        raw = await _call_gemini_once(contents)
+        raw = await _call_gemini_once(session_id, user_text)
     except Exception as exc:
         if key_manager.is_quota_error(exc):
             switched = key_manager.mark_exhausted_and_switch()
             if switched:
-                # Recreate model with the newly configured key
-                model = create_model()
                 log.info("Retrying Gemini call with %s key.", key_manager.active_label)
                 try:
-                    raw = await _call_gemini_once(contents)
+                    raw = await _call_gemini_once(session_id, user_text)
                 except Exception as retry_exc:
                     return _build_error_response(retry_exc)
             else:
@@ -619,13 +712,16 @@ app = FastAPI(
     version="2.1.0",
 )
 
-app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
+if STATIC_DIR.exists():
+    app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
 
 @app.get("/", include_in_schema=False)
 async def serve_index():
     """Serve the single-page web dashboard."""
-    return FileResponse(INDEX_HTML)
+    if INDEX_HTML.exists():
+        return FileResponse(INDEX_HTML)
+    return {"message": "DigiBuzz AI Calling Agent API is running."}
 
 
 @app.get("/favicon.ico", include_in_schema=False)
@@ -647,7 +743,13 @@ async def health_check():
         return faq_count, product_count
 
     faqs, products = await asyncio.to_thread(query)
-    return {"status": "ok", "model": MODEL_NAME, "faqs": faqs, "products": products}
+    return {
+        "status": "ok",
+        "model": MODEL_NAME,
+        "engine": "google-genai" if NEW_GENAI_AVAILABLE else "google-generativeai",
+        "faqs": faqs,
+        "products": products,
+    }
 
 
 # -------------------- Key Status --------------------
@@ -731,7 +833,7 @@ async def create_faq(faq: FAQCreate):
     try:
         refresh_knowledge_base()
     except Exception as exc:
-        log.warning("Non-blocking failure refreshing knowledge base after FAQ create: %r", exc)
+        log.warning("Non-blocking notice refreshing knowledge base after FAQ create: %r", exc)
     return res
 
 
@@ -755,7 +857,7 @@ async def update_faq(faq_id: int, faq: FAQUpdate):
     try:
         refresh_knowledge_base()
     except Exception as exc:
-        log.warning("Non-blocking failure refreshing knowledge base after FAQ update: %r", exc)
+        log.warning("Non-blocking notice refreshing knowledge base after FAQ update: %r", exc)
     return result
 
 
@@ -776,11 +878,10 @@ async def delete_faq(faq_id: int):
 
     await asyncio.to_thread(resequence_table, "faqs")
 
-    # Reload model in background without blocking or failing the HTTP response
     try:
         refresh_knowledge_base()
     except Exception as exc:
-        log.warning("Non-blocking failure refreshing knowledge base after delete: %r", exc)
+        log.warning("Non-blocking notice refreshing knowledge base after delete: %r", exc)
 
     return Response(status_code=204)
 
@@ -848,7 +949,7 @@ async def create_product(product: ProductCreate):
     try:
         refresh_knowledge_base()
     except Exception as exc:
-        log.warning("Non-blocking failure refreshing knowledge base after product create: %r", exc)
+        log.warning("Non-blocking notice refreshing knowledge base after product create: %r", exc)
     return res
 
 
@@ -881,7 +982,7 @@ async def update_product(product_id: int, product: ProductUpdate):
     try:
         refresh_knowledge_base()
     except Exception as exc:
-        log.warning("Non-blocking failure refreshing knowledge base after product update: %r", exc)
+        log.warning("Non-blocking notice refreshing knowledge base after product update: %r", exc)
     return result
 
 
@@ -905,7 +1006,7 @@ async def delete_product(product_id: int):
     try:
         refresh_knowledge_base()
     except Exception as exc:
-        log.warning("Non-blocking failure refreshing knowledge base after product delete: %r", exc)
+        log.warning("Non-blocking notice refreshing knowledge base after product delete: %r", exc)
     return Response(status_code=204)
 
 
@@ -994,6 +1095,3 @@ if __name__ == "__main__":
     import uvicorn
 
     uvicorn.run("app:app", host="127.0.0.1", port=8000, reload=False)
-
-
-
