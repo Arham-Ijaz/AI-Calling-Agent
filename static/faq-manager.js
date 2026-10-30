@@ -235,6 +235,7 @@ async function saveFAQ() {
 
     closeFAQModal();
     await loadFAQs();
+    if (typeof loadChips === "function") loadChips();
   } catch (err) {
     showFaqError(err.message || "Failed to save FAQ.");
   } finally {
@@ -259,6 +260,7 @@ async function deleteFAQ(id) {
       throw new Error(err.detail || `HTTP ${res.status}`);
     }
     await loadFAQs();
+    if (typeof loadChips === "function") loadChips();
   } catch (err) {
     alert(`Failed to delete FAQ: ${err.message}`);
   }

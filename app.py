@@ -494,8 +494,35 @@ def init_db() -> None:
         seed_products()
         seed_faqs()
         seed_default_admin()
+
+        # Automatically defragment & re-sequence product and FAQ IDs on startup
+        with db() as conn:
+            resequence_table(conn, "products")
+            resequence_table(conn, "faqs")
     except Exception as exc:
         log.error("Notice during database initialization: %r", exc)
+
+
+def resequence_table(conn: sqlite3.Connection, table_name: str) -> None:
+    """
+    Resequence primary keys in a table consecutively (1, 2, 3...)
+    and synchronize sqlite_sequence so that new insertions always receive
+    the exact next sequential ID (e.g. 21 -> 22, and if 22 is deleted,
+    the next item is 22, never skipping numbers).
+    """
+    rows = conn.execute(f"SELECT id FROM {table_name} ORDER BY id ASC").fetchall()
+    if not rows:
+        conn.execute("DELETE FROM sqlite_sequence WHERE name = ?", (table_name,))
+        conn.execute("INSERT INTO sqlite_sequence (name, seq) VALUES (?, 0)", (table_name,))
+        return
+    # Two-phase ID assignment to prevent SQLite UNIQUE constraint collisions
+    for i, row in enumerate(rows, start=1):
+        conn.execute(f"UPDATE {table_name} SET id = ? WHERE id = ?", (-i, row["id"]))
+    for i in range(1, len(rows) + 1):
+        conn.execute(f"UPDATE {table_name} SET id = ? WHERE id = ?", (i, -i))
+    max_id = len(rows)
+    conn.execute("DELETE FROM sqlite_sequence WHERE name = ?", (table_name,))
+    conn.execute("INSERT INTO sqlite_sequence (name, seq) VALUES (?, ?)", (table_name, max_id))
 
 
 def get_or_create_call(conn: sqlite3.Connection, session_id: str, user_id: int | None = None) -> int:
@@ -545,31 +572,55 @@ def now() -> str:
 # 5. Knowledge Base Loaders & Dynamic System Instructions
 # =====================================================================
 def load_faqs_context(user_id: int | None = None) -> str:
-    """Load platform FAQs + custom user FAQs from database."""
+    """Load platform FAQs + admin-created FAQs + custom user FAQs from database."""
     with db() as conn:
         if user_id:
             rows = conn.execute(
-                "SELECT question, answer FROM faqs WHERE user_id IS NULL OR user_id = ? ORDER BY id ASC",
+                """
+                SELECT question, answer FROM faqs
+                WHERE user_id IS NULL
+                   OR user_id IN (SELECT id FROM users WHERE role = 'admin')
+                   OR user_id = ?
+                ORDER BY id ASC
+                """,
                 (user_id,),
             ).fetchall()
         else:
-            rows = conn.execute("SELECT question, answer FROM faqs WHERE user_id IS NULL ORDER BY id ASC").fetchall()
+            rows = conn.execute(
+                """
+                SELECT question, answer FROM faqs
+                WHERE user_id IS NULL
+                   OR user_id IN (SELECT id FROM users WHERE role = 'admin')
+                ORDER BY id ASC
+                """
+            ).fetchall()
     if not rows:
         return "(No FAQs available)"
     return "\n\n".join(f"Q: {r['question']}\nA: {r['answer']}" for r in rows)
 
 
 def load_products_context(user_id: int | None = None) -> str:
-    """Load platform products + custom user products from database."""
+    """Load platform products + admin-created products + custom user products from database."""
     with db() as conn:
         if user_id:
             rows = conn.execute(
-                "SELECT id, name, category, brand, price, stock_status, description FROM products WHERE user_id IS NULL OR user_id = ? ORDER BY category ASC, id ASC",
+                """
+                SELECT id, name, category, brand, price, stock_status, description FROM products
+                WHERE user_id IS NULL
+                   OR user_id IN (SELECT id FROM users WHERE role = 'admin')
+                   OR user_id = ?
+                ORDER BY category ASC, id ASC
+                """,
                 (user_id,),
             ).fetchall()
         else:
             rows = conn.execute(
-                "SELECT id, name, category, brand, price, stock_status, description FROM products WHERE user_id IS NULL ORDER BY category ASC, id ASC"
+                """
+                SELECT id, name, category, brand, price, stock_status, description FROM products
+                WHERE user_id IS NULL
+                   OR user_id IN (SELECT id FROM users WHERE role = 'admin')
+                ORDER BY category ASC, id ASC
+                """
             ).fetchall()
     if not rows:
         return "(No products catalog available)"
@@ -600,9 +651,10 @@ KNOWLEDGE BASE:
 CRITICAL RULES:
 1. BRANDING & GREETING: You are "DigiBuzz AI Calling Agent". Greet callers professionally in English (e.g., "Hello! I am the DigiBuzz AI Calling Agent. How may I assist you today?").
 2. KNOWLEDGE ACCURACY: Answer using ONLY the FAQ knowledge base and Product Catalog above (prices in PKR, stock, specs, comparisons, delivery terms).
-3. OFF-TOPIC PROTECTION: NEVER answer questions outside DigiBuzz products and services. Politely decline: "I am sorry, I can only assist you with DigiBuzz products and services." Set intent to "off_topic" and outcome to "Resolved".
-4. HUMAN ESCALATION: If the user asks about an unlisted item, unknown policy, or explicitly requests a human representative, state you are transferring their call to a Human Support Agent, and set outcome to "Escalated".
-5. LANGUAGE & TONE:
+3. REAL-TIME SYNCHRONIZATION: Your knowledge base above is live and constantly synchronized with the store database. Whenever a caller asks about any item, product, brand, warranty, or policy, always consult the current Product Catalog and Operational FAQs above. If the item or policy is listed above, state its exact name, specifications, stock status, and wholesale price in PKR immediately.
+4. OFF-TOPIC PROTECTION: NEVER answer questions outside DigiBuzz products, wholesale orders, and store policies. Politely decline: "I am sorry, I can only assist you with DigiBuzz products and services." Set intent to "off_topic" and outcome to "Resolved".
+5. HUMAN ESCALATION: If the user asks about an unlisted item, unknown policy, or explicitly requests a human representative, state you are transferring their call to a Human Support Agent, and set outcome to "Escalated".
+6. LANGUAGE & TONE:
    - Reply in clear, concise, professional English.
    - If the caller uses Urdu script or Roman Urdu, respond politely in English or their preferred language.
    - Keep replies short, conversational, and direct (maximum 2 to 3 sentences suitable for a voice call).
@@ -703,15 +755,29 @@ async def _call_gemini_once(session_id: str, user_text: str, user_id: int | None
             response_mime_type="application/json",
         )
 
-        response = await asyncio.wait_for(
-            key_manager.client.aio.models.generate_content(
-                model=MODEL_NAME,
-                contents=contents,
-                config=config,
-            ),
-            timeout=GEMINI_TIMEOUT_S,
-        )
-        return response.text or ""
+        try:
+            response = await asyncio.wait_for(
+                key_manager.client.aio.models.generate_content(
+                    model=MODEL_NAME,
+                    contents=contents,
+                    config=config,
+                ),
+                timeout=GEMINI_TIMEOUT_S,
+            )
+            return response.text or ""
+        except RuntimeError as r_err:
+            if "Event loop" in str(r_err):
+                key_manager._configure_active()
+                response = await asyncio.wait_for(
+                    key_manager.client.aio.models.generate_content(
+                        model=MODEL_NAME,
+                        contents=contents,
+                        config=config,
+                    ),
+                    timeout=GEMINI_TIMEOUT_S,
+                )
+                return response.text or ""
+            raise
     else:
         model = get_legacy_model(user_id)
         if not model:
@@ -941,7 +1007,6 @@ async def add_security_headers(request: Request, call_next):
     response.headers["X-Frame-Options"] = "DENY"
     response.headers["X-XSS-Protection"] = "1; mode=block"
     response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
-    response.headers["Permissions-Policy"] = "microphone=(self)"
     return response
 
 
@@ -1283,14 +1348,24 @@ async def get_faq_chips(request: Request, limit: int = Query(default=18, ge=1, l
 
     def query():
         with db() as conn:
-            if user:
+            if user and user["role"] == "admin":
+                rows = conn.execute("SELECT question, intent FROM faqs ORDER BY id ASC LIMIT ?", (limit,)).fetchall()
+            elif user:
                 rows = conn.execute(
-                    "SELECT question, intent FROM faqs WHERE user_id IS NULL OR user_id = ? ORDER BY id ASC LIMIT ?",
+                    """
+                    SELECT question, intent FROM faqs
+                    WHERE user_id IS NULL OR user_id IN (SELECT id FROM users WHERE role = 'admin') OR user_id = ?
+                    ORDER BY id ASC LIMIT ?
+                    """,
                     (user["id"], limit),
                 ).fetchall()
             else:
                 rows = conn.execute(
-                    "SELECT question, intent FROM faqs WHERE user_id IS NULL ORDER BY id ASC LIMIT ?",
+                    """
+                    SELECT question, intent FROM faqs
+                    WHERE user_id IS NULL OR user_id IN (SELECT id FROM users WHERE role = 'admin')
+                    ORDER BY id ASC LIMIT ?
+                    """,
                     (limit,),
                 ).fetchall()
             return [{"question": r["question"], "intent": r["intent"]} for r in rows]
@@ -1300,7 +1375,7 @@ async def get_faq_chips(request: Request, limit: int = Query(default=18, ge=1, l
 
 @app.get("/api/faqs/all")
 async def get_all_faqs(request: Request):
-    """Return FAQs: regular users see Platform + their own; Admins see all."""
+    """Return FAQs: regular users see Platform/Admin + their own; Admins see all."""
     user = await get_optional_user(request)
 
     def query():
@@ -1309,7 +1384,7 @@ async def get_all_faqs(request: Request):
                 rows = conn.execute(
                     """
                     SELECT f.id, f.intent, f.question, f.answer, f.user_id,
-                           u.full_name AS owner_name, u.email AS owner_email
+                           COALESCE(u.full_name, 'Platform') AS owner_name, u.email AS owner_email
                     FROM faqs f
                     LEFT JOIN users u ON f.user_id = u.id
                     ORDER BY f.id ASC
@@ -1319,16 +1394,26 @@ async def get_all_faqs(request: Request):
                 rows = conn.execute(
                     """
                     SELECT f.id, f.intent, f.question, f.answer, f.user_id,
-                           CASE WHEN f.user_id IS NULL THEN 'Platform' ELSE 'You' END AS owner_name
+                           CASE WHEN f.user_id IS NULL THEN 'Platform'
+                                WHEN u.role = 'admin' THEN 'Platform (Admin)'
+                                WHEN f.user_id = ? THEN 'You'
+                                ELSE 'Custom' END AS owner_name
                     FROM faqs f
-                    WHERE f.user_id IS NULL OR f.user_id = ?
+                    LEFT JOIN users u ON f.user_id = u.id
+                    WHERE f.user_id IS NULL OR f.user_id IN (SELECT id FROM users WHERE role = 'admin') OR f.user_id = ?
                     ORDER BY f.id ASC
                     """,
-                    (user["id"],),
+                    (user["id"], user["id"]),
                 ).fetchall()
             else:
                 rows = conn.execute(
-                    "SELECT id, intent, question, answer, user_id, 'Platform' AS owner_name FROM faqs WHERE user_id IS NULL ORDER BY id ASC"
+                    """
+                    SELECT f.id, f.intent, f.question, f.answer, f.user_id, 'Platform' AS owner_name
+                    FROM faqs f
+                    LEFT JOIN users u ON f.user_id = u.id
+                    WHERE f.user_id IS NULL OR f.user_id IN (SELECT id FROM users WHERE role = 'admin')
+                    ORDER BY f.id ASC
+                    """
                 ).fetchall()
             return [dict(r) for r in rows]
 
@@ -1342,6 +1427,10 @@ async def create_faq(faq: FAQCreate, current_user: dict = Depends(get_current_us
 
     def query():
         with db() as conn:
+            # Sync sequence to current max(id) so new insertion gets max(id) + 1
+            max_id = conn.execute("SELECT COALESCE(MAX(id), 0) FROM faqs").fetchone()[0]
+            conn.execute("DELETE FROM sqlite_sequence WHERE name = 'faqs'")
+            conn.execute("INSERT INTO sqlite_sequence (name, seq) VALUES ('faqs', ?)", (max_id,))
             cursor = conn.execute(
                 "INSERT INTO faqs (intent, question, answer, user_id) VALUES (?, ?, ?, ?)",
                 (faq.intent.strip(), faq.question.strip(), faq.answer.strip(), user_id),
@@ -1395,7 +1484,7 @@ async def update_faq(faq_id: int, faq: FAQUpdate, current_user: dict = Depends(g
 
 @app.delete("/api/faqs/{faq_id}", status_code=204)
 async def delete_faq(faq_id: int, current_user: dict = Depends(get_current_user)):
-    """Delete FAQ entry: users can only delete their own; Admins can delete any."""
+    """Delete FAQ entry and re-sequence database IDs so sequence remains contiguous."""
     def query():
         with db() as conn:
             existing = conn.execute("SELECT id, user_id FROM faqs WHERE id = ?", (int(faq_id),)).fetchone()
@@ -1404,6 +1493,7 @@ async def delete_faq(faq_id: int, current_user: dict = Depends(get_current_user)
             if current_user["role"] != "admin" and existing["user_id"] != current_user["id"]:
                 return 403
             conn.execute("DELETE FROM faqs WHERE id = ?", (int(faq_id),))
+            resequence_table(conn, "faqs")
             return 204
 
     code = await asyncio.to_thread(query)
@@ -1425,7 +1515,7 @@ async def delete_faq(faq_id: int, current_user: dict = Depends(get_current_user)
 # =====================================================================
 @app.get("/api/products")
 async def get_products(request: Request, category: str | None = Query(default=None)):
-    """Return products: Users see Platform + their own; Admins see all."""
+    """Return products: Users see Platform/Admin + their own; Admins see all."""
     user = await get_optional_user(request)
 
     def query():
@@ -1434,9 +1524,9 @@ async def get_products(request: Request, category: str | None = Query(default=No
             where_clauses = []
 
             if not user:
-                where_clauses.append("p.user_id IS NULL")
+                where_clauses.append("(p.user_id IS NULL OR p.user_id IN (SELECT id FROM users WHERE role = 'admin'))")
             elif user["role"] != "admin":
-                where_clauses.append("(p.user_id IS NULL OR p.user_id = ?)")
+                where_clauses.append("(p.user_id IS NULL OR p.user_id IN (SELECT id FROM users WHERE role = 'admin') OR p.user_id = ?)")
                 params.append(user["id"])
 
             if category and category.strip():
@@ -1446,7 +1536,7 @@ async def get_products(request: Request, category: str | None = Query(default=No
             where_sql = f"WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
             query_sql = f"""
                 SELECT p.id, p.name, p.category, p.brand, p.price, p.stock_status, p.description, p.user_id,
-                       u.full_name AS owner_name
+                       COALESCE(u.full_name, 'Platform') AS owner_name
                 FROM products p
                 LEFT JOIN users u ON p.user_id = u.id
                 {where_sql}
@@ -1460,11 +1550,15 @@ async def get_products(request: Request, category: str | None = Query(default=No
 
 @app.post("/api/products", status_code=201)
 async def create_product(product: ProductCreate, current_user: dict = Depends(get_current_user)):
-    """Add a new product entry owned by current user."""
+    """Add a new product entry owned by current user (or platform if admin)."""
     user_id = current_user["id"]
 
     def query():
         with db() as conn:
+            # Sync sequence to current max(id) so new insertion gets max(id) + 1
+            max_id = conn.execute("SELECT COALESCE(MAX(id), 0) FROM products").fetchone()[0]
+            conn.execute("DELETE FROM sqlite_sequence WHERE name = 'products'")
+            conn.execute("INSERT INTO sqlite_sequence (name, seq) VALUES ('products', ?)", (max_id,))
             cursor = conn.execute(
                 "INSERT INTO products (name, category, brand, price, stock_status, description, user_id) VALUES (?, ?, ?, ?, ?, ?, ?)",
                 (
@@ -1535,7 +1629,7 @@ async def update_product(product_id: int, product: ProductUpdate, current_user: 
 
 @app.delete("/api/products/{product_id}", status_code=204)
 async def delete_product(product_id: int, current_user: dict = Depends(get_current_user)):
-    """Delete product: users can only delete their own; Admins can delete any."""
+    """Delete product and re-sequence database IDs so sequence remains contiguous."""
     def query():
         with db() as conn:
             existing = conn.execute("SELECT id, user_id FROM products WHERE id = ?", (int(product_id),)).fetchone()
@@ -1544,6 +1638,7 @@ async def delete_product(product_id: int, current_user: dict = Depends(get_curre
             if current_user["role"] != "admin" and existing["user_id"] != current_user["id"]:
                 return 403
             conn.execute("DELETE FROM products WHERE id = ?", (int(product_id),))
+            resequence_table(conn, "products")
             return 204
 
     code = await asyncio.to_thread(query)

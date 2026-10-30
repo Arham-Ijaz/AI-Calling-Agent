@@ -182,6 +182,7 @@ function recordClientCallTurn(sessionId, userText, botReply, intent, outcome) {
     fetch("/api/calls/sync", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
+      credentials: "same-origin",
       body: JSON.stringify(session),
     }).catch(() => {});
   } catch (e) {
@@ -489,6 +490,7 @@ async function sendMessage(text) {
     const res = await fetch("/api/chat", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
+      credentials: "same-origin",
       body: JSON.stringify({ session_id: state.sessionId, message: text }),
     });
 
@@ -525,7 +527,7 @@ async function loadChips() {
   try {
     let questions = [];
     try {
-      const res = await fetch("/api/faqs?limit=30");
+      const res = await fetch("/api/faqs?limit=30", { credentials: "same-origin" });
       if (res.ok) {
         const data = await res.json();
         questions = data.questions || [];
