@@ -43,12 +43,10 @@ venv.bak/
 .DS_Store
 Thumbs.db
 
-# Database runtime files (auto-generated from faq.json & products.json on first run)
-call_logs.db
+# Database runtime temporary lock files
 call_logs.db-wal
 call_logs.db-shm
-*.db
-*.sqlite3
+*.db-journal
 
 # Audio / temporary cache
 temp_*.mp3

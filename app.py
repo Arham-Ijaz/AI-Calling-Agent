@@ -69,7 +69,7 @@ def resolve_db_path() -> Path:
         tmp_db = Path(tempfile.gettempdir()) / "call_logs.db"
         tmp_db.parent.mkdir(parents=True, exist_ok=True)
         default_local = BASE_DIR / "call_logs.db"
-        if not tmp_db.exists() and default_local.exists():
+        if default_local.exists() and (not tmp_db.exists() or tmp_db.stat().st_size == 0):
             try:
                 shutil.copy2(default_local, tmp_db)
             except Exception:
@@ -86,7 +86,7 @@ def resolve_db_path() -> Path:
         tmp_db = Path(tempfile.gettempdir()) / "call_logs.db"
         tmp_db.parent.mkdir(parents=True, exist_ok=True)
         default_local = BASE_DIR / "call_logs.db"
-        if not tmp_db.exists() and default_local.exists():
+        if default_local.exists() and (not tmp_db.exists() or tmp_db.stat().st_size == 0):
             try:
                 shutil.copy2(default_local, tmp_db)
             except Exception:
@@ -404,17 +404,28 @@ def get_or_create_call(conn: sqlite3.Connection, session_id: str) -> int:
 
 
 def save_message(session_id: str, user_text: str, result: dict) -> None:
-    """Persist a conversation turn to the database."""
-    with db() as conn:
-        call_id = get_or_create_call(conn, session_id)
-        conn.execute(
-            "INSERT INTO call_messages (call_id, timestamp, user_transcript, ai_response, detected_intent, outcome) VALUES (?, ?, ?, ?, ?, ?)",
-            (call_id, now(), user_text, result["reply"], result["intent"], result["outcome"]),
-        )
-        conn.execute(
-            "UPDATE calls SET last_activity = ?, total_messages = total_messages + 1, outcome = ? WHERE id = ?",
-            (now(), result["outcome"], call_id),
-        )
+    """Persist a conversation turn to the database with safe error handling."""
+    try:
+        with db() as conn:
+            call_id = get_or_create_call(conn, session_id)
+            conn.execute(
+                "INSERT INTO call_messages (call_id, timestamp, user_transcript, ai_response, detected_intent, outcome) VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    call_id,
+                    now(),
+                    user_text,
+                    result.get("reply", ""),
+                    result.get("intent", ""),
+                    result.get("outcome", "Resolved"),
+                ),
+            )
+            conn.execute(
+                "UPDATE calls SET last_activity = ?, total_messages = total_messages + 1, outcome = ? WHERE id = ?",
+                (now(), result.get("outcome", "Resolved"), call_id),
+            )
+            log.info("Saved call log turn for session %s (call_id=%d)", session_id, call_id)
+    except Exception as exc:
+        log.error("Failed to persist call message for session %s: %r", session_id, exc)
 
 
 def now() -> str:
@@ -671,6 +682,23 @@ class ChatRequest(BaseModel):
 
 class TTSRequest(BaseModel):
     text: str = Field(min_length=1, max_length=600)
+
+
+class SyncMessage(BaseModel):
+    timestamp: str
+    user_transcript: str
+    ai_response: str
+    detected_intent: str = "general_inquiry"
+    outcome: str = "Resolved"
+
+
+class SyncCallRequest(BaseModel):
+    session_id: str = Field(min_length=1, max_length=64, pattern=SESSION_ID_PATTERN)
+    started_at: str | None = None
+    last_activity: str | None = None
+    outcome: str = "Resolved"
+    status: str = "active"
+    messages: list[SyncMessage] = []
 
 
 class FAQCreate(BaseModel):
@@ -1011,6 +1039,36 @@ async def delete_product(product_id: int):
 
 
 # -------------------- Call Log Endpoints --------------------
+@app.post("/api/calls/sync")
+async def sync_client_calls(req: SyncCallRequest):
+    """Sync client-side recorded session logs into SQLite database."""
+    def _sync():
+        with db() as conn:
+            call_id = get_or_create_call(conn, req.session_id)
+            for m in req.messages:
+                exists = conn.execute(
+                    "SELECT 1 FROM call_messages WHERE call_id = ? AND timestamp = ? AND user_transcript = ?",
+                    (call_id, m.timestamp, m.user_transcript),
+                ).fetchone()
+                if not exists:
+                    conn.execute(
+                        "INSERT INTO call_messages (call_id, timestamp, user_transcript, ai_response, detected_intent, outcome) VALUES (?, ?, ?, ?, ?, ?)",
+                        (call_id, m.timestamp, m.user_transcript, m.ai_response, m.detected_intent, m.outcome),
+                    )
+            msg_count = conn.execute("SELECT COUNT(*) AS n FROM call_messages WHERE call_id = ?", (call_id,)).fetchone()["n"]
+            conn.execute(
+                "UPDATE calls SET last_activity = ?, total_messages = ?, outcome = ? WHERE id = ?",
+                (req.last_activity or now(), msg_count, req.outcome, call_id),
+            )
+        return {"status": "synced", "session_id": req.session_id}
+
+    try:
+        return await asyncio.to_thread(_sync)
+    except Exception as exc:
+        log.error("Call sync failed: %r", exc)
+        return {"status": "error", "detail": str(exc)}
+
+
 @app.get("/api/calls")
 async def get_recent_calls(limit: int = Query(default=20, ge=1, le=100)):
     """Return recent call sessions for the call logs dashboard."""

@@ -106,6 +106,45 @@ function updateSessionDisplay() {
   if (settEl) { settEl.textContent = short; settEl.title = state.sessionId || ""; }
 }
 
+function recordClientCallTurn(sessionId, userText, botReply, intent, outcome) {
+  try {
+    const raw = localStorage.getItem("digibuzz_call_logs");
+    const logs = raw ? JSON.parse(raw) : {};
+    if (!logs[sessionId]) {
+      logs[sessionId] = {
+        session_id: sessionId,
+        started_at: new Date().toISOString().replace("T", " ").slice(0, 19),
+        last_activity: new Date().toISOString().replace("T", " ").slice(0, 19),
+        status: "active",
+        outcome: outcome || "Resolved",
+        total_messages: 0,
+        messages: [],
+      };
+    }
+    const session = logs[sessionId];
+    session.last_activity = new Date().toISOString().replace("T", " ").slice(0, 19);
+    session.outcome = outcome || session.outcome || "Resolved";
+    session.total_messages = (session.total_messages || 0) + 1;
+    session.messages.push({
+      timestamp: session.last_activity,
+      user_transcript: userText,
+      ai_response: botReply,
+      detected_intent: intent || "general_inquiry",
+      outcome: outcome || "Resolved",
+    });
+    localStorage.setItem("digibuzz_call_logs", JSON.stringify(logs));
+
+    // Non-blocking sync to server database
+    fetch("/api/calls/sync", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(session),
+    }).catch(() => {});
+  } catch (e) {
+    console.warn("Could not save to localStorage:", e);
+  }
+}
+
 // =====================================================================
 // Call Start / End
 // =====================================================================
@@ -411,6 +450,7 @@ async function sendMessage(text) {
     const data = await res.json();
     setBusy(false);
     addBotMessage(data.reply);
+    recordClientCallTurn(state.sessionId, text, data.reply, data.intent, data.outcome);
     playAudio(data.speech || data.reply);
   } catch (err) {
     setBusy(false);

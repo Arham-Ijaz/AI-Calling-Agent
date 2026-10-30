@@ -13,23 +13,81 @@ const logsState = {
 // =====================================================================
 async function loadCallLogs() {
   const tbody = document.getElementById("logsTableBody");
-  tbody.innerHTML = '<tr><td colspan="7" class="loading-row">Loading call logs…</td></tr>';
+  if (tbody) {
+    tbody.innerHTML = '<tr><td colspan="7" class="loading-row">Loading call logs…</td></tr>';
+  }
 
   try {
-    const res = await fetch("/api/calls?limit=50");
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    logsState.calls = await res.json();
+    let serverCalls = [];
+    try {
+      const res = await fetch("/api/calls?limit=50");
+      if (res.ok) {
+        serverCalls = await res.json();
+      }
+    } catch (e) {
+      console.warn("Could not fetch server calls:", e);
+    }
+
+    // Load client localStorage calls
+    let clientCalls = {};
+    try {
+      const raw = localStorage.getItem("digibuzz_call_logs");
+      if (raw) clientCalls = JSON.parse(raw);
+    } catch (e) {}
+
+    // Merge server calls and client calls by session_id
+    const mergedMap = new Map();
+
+    // 1. Add server calls first
+    for (const c of serverCalls) {
+      mergedMap.set(c.session_id, {
+        session_id: c.session_id,
+        started_at: c.started_at,
+        last_activity: c.last_activity,
+        status: c.status,
+        outcome: c.outcome,
+        total_messages: c.total_messages ?? 0
+      });
+    }
+
+    // 2. Overlay client calls (ensuring calls on serverless Vercel are never lost)
+    for (const [sid, c] of Object.entries(clientCalls)) {
+      if (mergedMap.has(sid)) {
+        const existing = mergedMap.get(sid);
+        existing.total_messages = Math.max(existing.total_messages || 0, c.total_messages || (c.messages ? c.messages.length : 0));
+        existing.last_activity = c.last_activity || existing.last_activity;
+        existing.outcome = c.outcome || existing.outcome;
+      } else {
+        mergedMap.set(sid, {
+          session_id: sid,
+          started_at: c.started_at || "—",
+          last_activity: c.last_activity || "—",
+          status: c.status || "active",
+          outcome: c.outcome || "Resolved",
+          total_messages: c.total_messages || (c.messages ? c.messages.length : 0),
+        });
+      }
+    }
+
+    const mergedList = Array.from(mergedMap.values());
+    // Sort by last_activity descending
+    mergedList.sort((a, b) => (b.last_activity || "").localeCompare(a.last_activity || ""));
+
+    logsState.calls = mergedList;
     renderLogsTable(logsState.calls);
     renderLogsStats(logsState.calls);
   } catch (err) {
-    tbody.innerHTML = `<tr><td colspan="7" class="loading-row" style="color:var(--red)">Failed to load logs: ${err.message}</td></tr>`;
+    if (tbody) {
+      tbody.innerHTML = `<tr><td colspan="7" class="loading-row" style="color:var(--red)">Failed to load logs: ${err.message}</td></tr>`;
+    }
   }
 }
 
 function renderLogsTable(calls) {
   const tbody = document.getElementById("logsTableBody");
+  if (!tbody) return;
 
-  if (calls.length === 0) {
+  if (!calls || calls.length === 0) {
     tbody.innerHTML = '<tr><td colspan="7" class="loading-row">No call sessions recorded yet.</td></tr>';
     return;
   }
@@ -53,15 +111,20 @@ function renderLogsTable(calls) {
 }
 
 function renderLogsStats(calls) {
-  const total = calls.length;
-  const resolved = calls.filter((c) => c.outcome === "Resolved").length;
-  const escalated = calls.filter((c) => c.outcome === "Escalated").length;
-  const totalMessages = calls.reduce((sum, c) => sum + (c.total_messages || 0), 0);
+  const total = calls ? calls.length : 0;
+  const resolved = calls ? calls.filter((c) => c.outcome === "Resolved").length : 0;
+  const escalated = calls ? calls.filter((c) => c.outcome === "Escalated").length : 0;
+  const totalMessages = calls ? calls.reduce((sum, c) => sum + (c.total_messages || 0), 0) : 0;
 
-  document.getElementById("statTotal").textContent = total;
-  document.getElementById("statResolved").textContent = resolved;
-  document.getElementById("statEscalated").textContent = escalated;
-  document.getElementById("statMessages").textContent = totalMessages;
+  const statTotal = document.getElementById("statTotal");
+  const statResolved = document.getElementById("statResolved");
+  const statEscalated = document.getElementById("statEscalated");
+  const statMessages = document.getElementById("statMessages");
+
+  if (statTotal) statTotal.textContent = total;
+  if (statResolved) statResolved.textContent = resolved;
+  if (statEscalated) statEscalated.textContent = escalated;
+  if (statMessages) statMessages.textContent = totalMessages;
 }
 
 function statusBadgeLog(status) {
@@ -83,22 +146,41 @@ async function viewSession(sessionId) {
   const title = document.getElementById("transcriptModalTitle");
   const body = document.getElementById("transcriptModalBody");
 
-  title.textContent = `Transcript — ${sessionId}`;
+  if (!modal || !body) return;
+
+  if (title) title.textContent = `Transcript — ${sessionId}`;
   body.innerHTML = '<div class="loading-row">Loading transcript…</div>';
   modal.classList.remove("hidden");
 
+  let messages = [];
   try {
     const res = await fetch(`/api/history?session_id=${encodeURIComponent(sessionId)}`);
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    const messages = await res.json();
-    renderTranscript(body, messages);
+    if (res.ok) {
+      messages = await res.json();
+    }
   } catch (err) {
-    body.innerHTML = `<div class="loading-row" style="color:var(--red)">Failed to load transcript: ${err.message}</div>`;
+    console.warn("Server history fetch failed:", err);
   }
+
+  // Fallback to client localStorage if server has no messages for this session
+  if (!messages || messages.length === 0) {
+    try {
+      const raw = localStorage.getItem("digibuzz_call_logs");
+      if (raw) {
+        const clientCalls = JSON.parse(raw);
+        if (clientCalls[sessionId] && clientCalls[sessionId].messages) {
+          messages = clientCalls[sessionId].messages;
+        }
+      }
+    } catch (e) {}
+  }
+
+  renderTranscript(body, messages);
 }
 
 function renderTranscript(container, messages) {
-  if (messages.length === 0) {
+  if (!container) return;
+  if (!messages || messages.length === 0) {
     container.innerHTML = '<div class="loading-row">No messages in this session.</div>';
     return;
   }
@@ -138,20 +220,32 @@ document.addEventListener("DOMContentLoaded", () => {
   if (refreshBtn) refreshBtn.addEventListener("click", loadCallLogs);
 
   // Transcript modal close buttons
-  document.getElementById("transcriptModalClose").addEventListener("click", () => {
-    document.getElementById("transcriptModal").classList.add("hidden");
-  });
-  document.getElementById("transcriptModalDone").addEventListener("click", () => {
-    document.getElementById("transcriptModal").classList.add("hidden");
-  });
-  document.getElementById("transcriptModal").addEventListener("click", (e) => {
-    if (e.target === document.getElementById("transcriptModal")) {
-      document.getElementById("transcriptModal").classList.add("hidden");
-    }
-  });
+  const modalClose = document.getElementById("transcriptModalClose");
+  if (modalClose) {
+    modalClose.addEventListener("click", () => {
+      const modal = document.getElementById("transcriptModal");
+      if (modal) modal.classList.add("hidden");
+    });
+  }
+  const modalDone = document.getElementById("transcriptModalDone");
+  if (modalDone) {
+    modalDone.addEventListener("click", () => {
+      const modal = document.getElementById("transcriptModal");
+      if (modal) modal.classList.add("hidden");
+    });
+  }
+  const transcriptModal = document.getElementById("transcriptModal");
+  if (transcriptModal) {
+    transcriptModal.addEventListener("click", (e) => {
+      if (e.target === transcriptModal) {
+        transcriptModal.classList.add("hidden");
+      }
+    });
+  }
 
   // Auto-load if logs page is already active
-  if (document.getElementById("page-logs").classList.contains("active")) {
+  const pageLogs = document.getElementById("page-logs");
+  if (pageLogs && pageLogs.classList.contains("active")) {
     loadCallLogs();
   }
 });
