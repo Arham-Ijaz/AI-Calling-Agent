@@ -156,6 +156,74 @@ function updateSettingsView() {
   if (isAdmin && typeof refreshKeyStatus === "function") {
     refreshKeyStatus();
   }
+
+  // Self Change Password Card (visible for any logged-in user or admin)
+  const passCard = document.getElementById("settingsChangePasswordCard");
+  if (passCard) {
+    passCard.style.display = isLogged ? "block" : "none";
+  }
+}
+
+async function handleSettingsPasswordChange() {
+  const btn = document.getElementById("btnSettingsChangePass");
+  const errEl = document.getElementById("settingsPassError");
+  const succEl = document.getElementById("settingsPassSuccess");
+  const currentPass = document.getElementById("settingsCurrentPass").value;
+  const newPass = document.getElementById("settingsNewPass").value;
+  const confirmPass = document.getElementById("settingsConfirmPass").value;
+
+  if (errEl) { errEl.textContent = ""; errEl.classList.add("hidden"); }
+  if (succEl) { succEl.textContent = ""; succEl.classList.add("hidden"); }
+
+  if (!currentPass || !newPass || !confirmPass) {
+    if (errEl) { errEl.textContent = "All password fields are required."; errEl.classList.remove("hidden"); }
+    return;
+  }
+
+  if (newPass !== confirmPass) {
+    if (errEl) { errEl.textContent = "New passwords do not match."; errEl.classList.remove("hidden"); }
+    return;
+  }
+
+  if (newPass.length < 8 || !/[A-Za-z]/.test(newPass) || !/[0-9]/.test(newPass)) {
+    if (errEl) {
+      errEl.textContent = "New password must be at least 8 characters and contain both letters and numbers.";
+      errEl.classList.remove("hidden");
+    }
+    return;
+  }
+
+  btn.disabled = true;
+  btn.textContent = "Updating Password…";
+
+  try {
+    const res = await fetch("/api/auth/password", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ current_password: currentPass, new_password: newPass }),
+      credentials: "same-origin",
+    });
+
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.detail || "Failed to update password.");
+
+    document.getElementById("settingsCurrentPass").value = "";
+    document.getElementById("settingsNewPass").value = "";
+    document.getElementById("settingsConfirmPass").value = "";
+
+    if (succEl) {
+      succEl.textContent = "✅ " + data.message;
+      succEl.classList.remove("hidden");
+    }
+  } catch (err) {
+    if (errEl) {
+      errEl.textContent = err.message;
+      errEl.classList.remove("hidden");
+    }
+  } finally {
+    btn.disabled = false;
+    btn.textContent = "Update Password";
+  }
 }
 
 // =====================================================================
@@ -405,6 +473,10 @@ document.addEventListener("DOMContentLoaded", () => {
 
   const formRegister = document.getElementById("authFormRegister");
   if (formRegister) formRegister.addEventListener("submit", handleRegister);
+
+  // Settings change password
+  const btnSettingsChangePass = document.getElementById("btnSettingsChangePass");
+  if (btnSettingsChangePass) btnSettingsChangePass.addEventListener("click", handleSettingsPasswordChange);
 
   // Password visibility toggles
   document.querySelectorAll(".password-toggle-btn").forEach((btn) => {

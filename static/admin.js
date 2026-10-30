@@ -130,9 +130,21 @@ function renderAdminUsersTable(users) {
 
       let actionHtml = "";
       if (isCurrentAdmin) {
-        actionHtml = '<span style="font-size:.75rem;color:var(--text-muted);font-weight:600;">(Your Account)</span>';
+        actionHtml = `
+          <button class="btn btn-xs btn-outline" 
+            onclick="openEditUserModal(${u.id})" 
+            title="Edit Profile Details">
+            ✏️ Edit
+          </button>
+          <button class="btn btn-xs btn-outline" 
+            onclick="openAdminPasswordModal(${u.id}, '${escAdmin(u.full_name)}', '${escAdmin(u.email)}')" 
+            title="Change Your Password">
+            🔑 My Password
+          </button>
+          <span style="font-size:.72rem;color:var(--brand);font-weight:700;">(You)</span>
+        `;
       } else if (isPrimary) {
-        actionHtml = '<span class="badge" style="background:rgba(234,179,8,0.15);color:#eab308;border:1px solid rgba(234,179,8,0.3);font-size:.75rem;font-weight:600;">🛡️ Protected</span>';
+        actionHtml = '<span class="badge" style="background:rgba(234,179,8,0.15);color:#eab308;border:1px solid rgba(234,179,8,0.3);font-size:.75rem;font-weight:600;">🛡️ Protected Primary Admin</span>';
       } else {
         actionHtml = `
           <button class="btn btn-xs btn-outline" 
@@ -140,14 +152,19 @@ function renderAdminUsersTable(users) {
             title="Edit User Details">
             ✏️ Edit
           </button>
+          <button class="btn btn-xs btn-outline" 
+            onclick="openAdminPasswordModal(${u.id}, '${escAdmin(u.full_name)}', '${escAdmin(u.email)}')" 
+            title="Set / Change User Password">
+            🔑 Password
+          </button>
           <button class="btn btn-xs ${u.is_active ? "btn-outline-danger" : "btn-outline-success"}" 
             onclick="toggleUserStatus(${u.id}, ${Boolean(u.is_active)})" 
             title="${u.is_active ? "Suspend Account" : "Activate Account"}">
             ${u.is_active ? "🛑 Suspend" : "✅ Activate"}
           </button>
-          <button class="btn btn-xs btn-outline" 
+          <button class="btn btn-xs ${u.role === "admin" ? "btn-outline" : "btn-brand"}" 
             onclick="toggleUserRole(${u.id}, '${u.role}')" 
-            title="${u.role === "admin" ? "Demote to Member" : "Promote to Admin"}">
+            title="${u.role === "admin" ? "Demote to Member" : "Promote to Administrator"}">
             ${u.role === "admin" ? "⬇️ Demote" : "⭐ Make Admin"}
           </button>
           <button class="btn btn-xs btn-outline-danger" 
@@ -225,6 +242,14 @@ async function toggleUserRole(userId, currentRole) {
     const data = await res.json();
     if (!res.ok) throw new Error(data.detail || "Failed to update user role.");
 
+    // Clear filter if set so promoted user stays visible
+    const roleFilter = document.getElementById("adminRoleFilter");
+    if (roleFilter && adminState.filterRole) {
+      adminState.filterRole = "";
+      roleFilter.value = "";
+    }
+
+    alert(data.message || (newRole === "admin" ? "⭐ User promoted to Administrator!" : "⬇️ User demoted to Member."));
     await loadAdminData();
   } catch (err) {
     alert(`Error: ${err.message}`);
@@ -232,7 +257,7 @@ async function toggleUserRole(userId, currentRole) {
 }
 
 async function deleteUser(userId, userName) {
-  if (!confirm(`Are you sure you want to permanently delete account "${userName}"? All associated call sessions will be removed.`)) {
+  if (!confirm(`Are you sure you want to permanently delete account "${userName}"? All associated call history will be removed.`)) {
     return;
   }
 
@@ -282,7 +307,7 @@ async function handleSaveNewUser() {
   const errEl = document.getElementById("adminAddError");
   const name = document.getElementById("adminAddName").value.trim();
   const email = document.getElementById("adminAddEmail").value.trim().toLowerCase();
-  const phone = document.getElementById("adminAddPhone").value.trim();
+  const phone = document.getElementById("adminAddPhone").value.trim().replace(/[\s\-()]/g, "");
   const password = document.getElementById("adminAddPassword").value;
   const role = document.getElementById("adminAddRole").value;
 
@@ -325,6 +350,7 @@ async function handleSaveNewUser() {
     if (!res.ok) throw new Error(data.detail || "Failed to create user account.");
 
     closeAddUserModal();
+    alert(`✅ Successfully created ${role === "admin" ? "Administrator" : "User"}: ${data.full_name}`);
     await loadAdminData();
   } catch (err) {
     if (errEl) {
@@ -348,6 +374,9 @@ function openEditUserModal(userId) {
   const errEl = document.getElementById("adminEditError");
   if (!modal) return;
 
+  const isCurrentAdmin = authState.user && authState.user.id === u.id;
+  const isPrimary = Boolean(u.is_primary) || u.id === 1;
+
   document.getElementById("adminEditUserId").value = u.id;
   document.getElementById("adminEditName").value = u.full_name || "";
   document.getElementById("adminEditEmail").value = u.email || "";
@@ -355,6 +384,12 @@ function openEditUserModal(userId) {
   document.getElementById("adminEditRole").value = u.role || "user";
   document.getElementById("adminEditStatus").value = u.is_active ? "active" : "suspended";
   document.getElementById("adminEditPassword").value = "";
+
+  // Prevent locking out self
+  const roleSelect = document.getElementById("adminEditRole");
+  const statusSelect = document.getElementById("adminEditStatus");
+  if (roleSelect) roleSelect.disabled = isPrimary || (isCurrentAdmin && u.role === "admin");
+  if (statusSelect) statusSelect.disabled = isPrimary || isCurrentAdmin;
 
   if (errEl) {
     errEl.textContent = "";
@@ -375,7 +410,7 @@ async function handleSaveEditUser() {
   const userId = document.getElementById("adminEditUserId").value;
   const name = document.getElementById("adminEditName").value.trim();
   const email = document.getElementById("adminEditEmail").value.trim().toLowerCase();
-  const phone = document.getElementById("adminEditPhone").value.trim();
+  const phone = document.getElementById("adminEditPhone").value.trim().replace(/[\s\-()]/g, "");
   const role = document.getElementById("adminEditRole").value;
   const statusVal = document.getElementById("adminEditStatus").value;
   const password = document.getElementById("adminEditPassword").value;
@@ -421,6 +456,7 @@ async function handleSaveEditUser() {
     if (!res.ok) throw new Error(data.detail || "Failed to update user account.");
 
     closeEditUserModal();
+    alert(`✅ Changes saved successfully for ${data.full_name}!`);
     await loadAdminData();
   } catch (err) {
     if (errEl) {
@@ -433,6 +469,115 @@ async function handleSaveEditUser() {
   }
 }
 
+// =====================================================================
+// Admin Direct Password Reset Modal Handling
+// =====================================================================
+function openAdminPasswordModal(userId, userName, userEmail) {
+  const modal = document.getElementById("adminPasswordModal");
+  const titleEl = document.getElementById("adminPasswordModalTitle");
+  const descEl = document.getElementById("adminPasswordUserDesc");
+  const idEl = document.getElementById("adminPasswordUserId");
+  const inputEl = document.getElementById("adminNewPasswordInput");
+  const errEl = document.getElementById("adminPasswordError");
+  const succEl = document.getElementById("adminPasswordSuccess");
+
+  if (!modal) return;
+
+  if (idEl) idEl.value = userId;
+  if (titleEl) titleEl.textContent = `🔑 Change Password — ${userName}`;
+  if (descEl) descEl.textContent = `Set or reset password for account: ${userName} (${userEmail})`;
+  if (inputEl) {
+    inputEl.value = "";
+    inputEl.type = "password";
+  }
+  if (errEl) { errEl.textContent = ""; errEl.classList.add("hidden"); }
+  if (succEl) { succEl.textContent = ""; succEl.classList.add("hidden"); }
+
+  modal.classList.remove("hidden");
+  if (inputEl) inputEl.focus();
+}
+
+function closeAdminPasswordModal() {
+  const modal = document.getElementById("adminPasswordModal");
+  if (modal) modal.classList.add("hidden");
+}
+
+function generateRandomStrongPassword() {
+  const charsUpper = "ABCDEFGHJKLMNPQRSTUVWXYZ";
+  const charsLower = "abcdefghijkmnopqrstuvwxyz";
+  const charsNum = "23456789";
+  const charsSym = "@#$%!&*";
+  let pass = "";
+  pass += charsUpper[Math.floor(Math.random() * charsUpper.length)];
+  pass += charsLower[Math.floor(Math.random() * charsLower.length)];
+  pass += charsNum[Math.floor(Math.random() * charsNum.length)];
+  pass += charsSym[Math.floor(Math.random() * charsSym.length)];
+  const all = charsUpper + charsLower + charsNum + charsSym;
+  for (let i = 0; i < 6; i++) {
+    pass += all[Math.floor(Math.random() * all.length)];
+  }
+  return pass;
+}
+
+async function handleSaveAdminPassword() {
+  const btn = document.getElementById("btnSaveAdminPassword");
+  const userId = document.getElementById("adminPasswordUserId").value;
+  const newPass = document.getElementById("adminNewPasswordInput").value;
+  const errEl = document.getElementById("adminPasswordError");
+  const succEl = document.getElementById("adminPasswordSuccess");
+
+  if (errEl) { errEl.textContent = ""; errEl.classList.add("hidden"); }
+  if (succEl) { succEl.textContent = ""; succEl.classList.add("hidden"); }
+
+  if (!newPass || newPass.length < 8) {
+    if (errEl) {
+      errEl.textContent = "Password must be at least 8 characters.";
+      errEl.classList.remove("hidden");
+    }
+    return;
+  }
+
+  if (!/[A-Za-z]/.test(newPass) || !/[0-9]/.test(newPass)) {
+    if (errEl) {
+      errEl.textContent = "Password must contain both letters and numbers.";
+      errEl.classList.remove("hidden");
+    }
+    return;
+  }
+
+  btn.disabled = true;
+  btn.textContent = "Updating Password…";
+
+  try {
+    const res = await fetch(`/api/admin/users/${userId}/password`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ password: newPass }),
+      credentials: "same-origin",
+    });
+
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.detail || "Failed to update password.");
+
+    if (succEl) {
+      succEl.textContent = `✅ Password updated successfully!`;
+      succEl.classList.remove("hidden");
+    }
+
+    setTimeout(() => {
+      closeAdminPasswordModal();
+    }, 1200);
+  } catch (err) {
+    if (errEl) {
+      errEl.textContent = err.message;
+      errEl.classList.remove("hidden");
+    }
+  } finally {
+    btn.disabled = false;
+    btn.textContent = "Save New Password";
+  }
+}
+
 function escAdmin(str) {
   return String(str || "")
     .replace(/&/g, "&amp;")
@@ -440,6 +585,18 @@ function escAdmin(str) {
     .replace(/>/g, "&gt;")
     .replace(/"/g, "&quot;");
 }
+
+// Attach functions to window for onclick safety
+window.openAddUserModal = openAddUserModal;
+window.closeAddUserModal = closeAddUserModal;
+window.openEditUserModal = openEditUserModal;
+window.closeEditUserModal = closeEditUserModal;
+window.openAdminPasswordModal = openAdminPasswordModal;
+window.closeAdminPasswordModal = closeAdminPasswordModal;
+window.toggleUserRole = toggleUserRole;
+window.toggleUserStatus = toggleUserStatus;
+window.deleteUser = deleteUser;
+window.loadAdminData = loadAdminData;
 
 // =====================================================================
 // Initialization
@@ -496,4 +653,36 @@ document.addEventListener("DOMContentLoaded", () => {
 
   const btnSaveEdit = document.getElementById("btnSaveEditAdminUser");
   if (btnSaveEdit) btnSaveEdit.addEventListener("click", handleSaveEditUser);
+
+  // Admin Password Modal Events
+  const passModalClose = document.getElementById("adminPasswordModalClose");
+  if (passModalClose) passModalClose.addEventListener("click", closeAdminPasswordModal);
+
+  const passModalCancel = document.getElementById("adminPasswordCancel");
+  if (passModalCancel) passModalCancel.addEventListener("click", closeAdminPasswordModal);
+
+  const btnSavePass = document.getElementById("btnSaveAdminPassword");
+  if (btnSavePass) btnSavePass.addEventListener("click", handleSaveAdminPassword);
+
+  const btnGenPass = document.getElementById("btnGenPassword");
+  if (btnGenPass) {
+    btnGenPass.addEventListener("click", () => {
+      const p = generateRandomStrongPassword();
+      const input = document.getElementById("adminNewPasswordInput");
+      if (input) {
+        input.type = "text";
+        input.value = p;
+      }
+    });
+  }
+
+  const btnToggleEye = document.getElementById("btnToggleNewPasswordEye");
+  if (btnToggleEye) {
+    btnToggleEye.addEventListener("click", () => {
+      const input = document.getElementById("adminNewPasswordInput");
+      if (input) {
+        input.type = input.type === "password" ? "text" : "password";
+      }
+    });
+  }
 });

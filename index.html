@@ -483,6 +483,29 @@
           </div>
           <button class="btn btn-outline mt-2" id="settingsBtnToggleTheme">🌓 Toggle Dark / Light Theme</button>
         </div>
+
+        <!-- Change Password Card (Visible when signed in) -->
+        <div class="settings-card" id="settingsChangePasswordCard" style="display:none;">
+          <h3>🔐 Change Account Password</h3>
+          <p class="text-muted" style="font-size:0.83rem; margin-bottom:0.75rem;">
+            Update your account password. Must be at least 8 characters with letters & numbers.
+          </p>
+          <div class="form-group" style="margin-bottom:0.6rem;">
+            <label for="settingsCurrentPass" style="font-size:0.8rem;">Current Password *</label>
+            <input type="password" id="settingsCurrentPass" class="form-input" placeholder="Current password" />
+          </div>
+          <div class="form-group" style="margin-bottom:0.6rem;">
+            <label for="settingsNewPass" style="font-size:0.8rem;">New Password *</label>
+            <input type="password" id="settingsNewPass" class="form-input" placeholder="New secure password (min 8 chars)" />
+          </div>
+          <div class="form-group" style="margin-bottom:0.75rem;">
+            <label for="settingsConfirmPass" style="font-size:0.8rem;">Confirm New Password *</label>
+            <input type="password" id="settingsConfirmPass" class="form-input" placeholder="Re-enter new password" />
+          </div>
+          <div class="form-error hidden" id="settingsPassError" style="margin-bottom:0.5rem;"></div>
+          <div class="form-success hidden" id="settingsPassSuccess" style="color:var(--emerald);font-size:0.82rem;margin-bottom:0.5rem;"></div>
+          <button class="btn btn-brand btn-block" id="btnSettingsChangePass">Update Password</button>
+        </div>
       </div>
 
       <!-- Administrator System Diagnostics (STRICTLY RESTRICTED to Admins) -->
@@ -791,12 +814,42 @@
     </div>
   </div>
 
+  <!-- ===== Admin Quick Password Reset Modal ===== -->
+  <div class="modal-overlay hidden" id="adminPasswordModal">
+    <div class="modal">
+      <div class="modal-header">
+        <h2 id="adminPasswordModalTitle">🔑 Set Account Password</h2>
+        <button class="modal-close" id="adminPasswordModalClose">&times;</button>
+      </div>
+      <div class="modal-body">
+        <input type="hidden" id="adminPasswordUserId" />
+        <p style="font-size:0.88rem;color:var(--text-muted);margin-bottom:1rem;" id="adminPasswordUserDesc">
+          Setting password for account.
+        </p>
+        <div class="form-group">
+          <label for="adminNewPasswordInput">New Password * (min 8 chars, letters & numbers)</label>
+          <div style="display:flex;gap:0.4rem;align-items:center;">
+            <input type="password" id="adminNewPasswordInput" class="form-input" placeholder="Enter new password" style="flex:1;" />
+            <button class="btn btn-outline" type="button" id="btnToggleNewPasswordEye" title="Show/Hide Password">👁️</button>
+            <button class="btn btn-outline" type="button" id="btnGenPassword" title="Generate Strong Password">🎲</button>
+          </div>
+        </div>
+        <div class="form-error hidden" id="adminPasswordError"></div>
+        <div class="form-success hidden" id="adminPasswordSuccess" style="color:var(--emerald);font-size:0.85rem;margin-top:0.5rem;"></div>
+      </div>
+      <div class="modal-footer">
+        <button class="btn btn-ghost" id="adminPasswordCancel">Cancel</button>
+        <button class="btn btn-brand" id="btnSaveAdminPassword">Save New Password</button>
+      </div>
+    </div>
+  </div>
+
   <!-- ===== Scripts ===== -->
-  <script src="/static/auth.js"></script>
-  <script src="/static/admin.js"></script>
-  <script src="/static/main.js"></script>
-  <script src="/static/faq-manager.js"></script>
-  <script src="/static/data-manager.js"></script>
-  <script src="/static/logs.js"></script>
+  <script src="/static/auth.js?v=3.2"></script>
+  <script src="/static/admin.js?v=3.2"></script>
+  <script src="/static/main.js?v=3.2"></script>
+  <script src="/static/faq-manager.js?v=3.2"></script>
+  <script src="/static/data-manager.js?v=3.2"></script>
+  <script src="/static/logs.js?v=3.2"></script>
 </body>
 </html>

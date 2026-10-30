@@ -43,7 +43,7 @@ from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response, s
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from gtts import gTTS
-from pydantic import BaseModel, EmailStr, Field
+from pydantic import BaseModel, EmailStr, Field, field_validator
 
 # Modern official Google GenAI SDK with fallback
 try:
@@ -915,6 +915,16 @@ class AdminUserCreate(BaseModel):
     role: str = Field(default="user", pattern=r"^(admin|user)$")
     is_active: bool = True
 
+    @field_validator("phone", mode="before")
+    @classmethod
+    def clean_phone(cls, v: str) -> str:
+        return re.sub(r"[\s\-()]", "", v.strip()) if isinstance(v, str) else v
+
+    @field_validator("email", mode="before")
+    @classmethod
+    def clean_email(cls, v: str) -> str:
+        return v.strip().lower() if isinstance(v, str) else v
+
 
 class AdminUserUpdate(BaseModel):
     full_name: str = Field(min_length=2, max_length=100)
@@ -923,6 +933,25 @@ class AdminUserUpdate(BaseModel):
     password: str | None = Field(default=None, max_length=128)
     role: str = Field(default="user", pattern=r"^(admin|user)$")
     is_active: bool = True
+
+    @field_validator("phone", mode="before")
+    @classmethod
+    def clean_phone(cls, v: str) -> str:
+        return re.sub(r"[\s\-()]", "", v.strip()) if isinstance(v, str) else v
+
+    @field_validator("email", mode="before")
+    @classmethod
+    def clean_email(cls, v: str) -> str:
+        return v.strip().lower() if isinstance(v, str) else v
+
+
+class AdminPasswordUpdate(BaseModel):
+    password: str = Field(min_length=8, max_length=128)
+
+
+class UserPasswordChange(BaseModel):
+    current_password: str = Field(min_length=1, max_length=128)
+    new_password: str = Field(min_length=8, max_length=128)
 
 
 class ChatRequest(BaseModel):
@@ -1213,6 +1242,26 @@ async def get_my_profile(current_user: dict = Depends(get_current_user)):
     return {"user": current_user}
 
 
+@app.put("/api/auth/password")
+async def change_own_password(req: UserPasswordChange, current_user: dict = Depends(get_current_user)):
+    """Allow any authenticated user or administrator to change their own password securely."""
+    if not re.search(r"[A-Za-z]", req.new_password) or not re.search(r"[0-9]", req.new_password):
+        raise HTTPException(
+            status_code=400,
+            detail="New password must be at least 8 characters and contain both letters and numbers.",
+        )
+
+    with db() as conn:
+        row = conn.execute("SELECT password_hash FROM users WHERE id = ?", (current_user["id"],)).fetchone()
+        if not row or not verify_password(req.current_password, row["password_hash"]):
+            raise HTTPException(status_code=400, detail="Current password is incorrect.")
+
+        new_hash = hash_password(req.new_password)
+        conn.execute("UPDATE users SET password_hash = ? WHERE id = ?", (new_hash, current_user["id"]))
+
+    return {"status": "ok", "message": "Your password has been changed successfully."}
+
+
 # =====================================================================
 # 12. Admin Management Endpoints (OWASP Top 10 A01 RBAC)
 # =====================================================================
@@ -1420,6 +1469,39 @@ async def update_user_role(user_id: int, req: UserRoleUpdate, admin: dict = Depe
     if not updated:
         raise HTTPException(status_code=404, detail="User not found.")
     return {"status": "ok", "message": f"User role updated to '{req.role}'."}
+
+
+@app.put("/api/admin/users/{user_id}/password")
+async def update_user_password_by_admin(
+    user_id: int, req: AdminPasswordUpdate, admin: dict = Depends(require_admin)
+):
+    """Update or reset password for any user or own account. Secondary admins cannot change Primary Admin password."""
+    if is_primary_admin(user_id=user_id) and admin["id"] != user_id:
+        raise HTTPException(
+            status_code=403,
+            detail="Primary Platform Administrator password cannot be modified by another administrator.",
+        )
+
+    if not re.search(r"[A-Za-z]", req.password) or not re.search(r"[0-9]", req.password):
+        raise HTTPException(
+            status_code=400,
+            detail="Password must be at least 8 characters and contain both letters and numbers.",
+        )
+
+    new_hash = hash_password(req.password)
+
+    def query():
+        with db() as conn:
+            user = conn.execute("SELECT id, email, full_name FROM users WHERE id = ?", (user_id,)).fetchone()
+            if not user:
+                return False
+            conn.execute("UPDATE users SET password_hash = ? WHERE id = ?", (new_hash, user_id))
+            return True
+
+    updated = await asyncio.to_thread(query)
+    if not updated:
+        raise HTTPException(status_code=404, detail="User not found.")
+    return {"status": "ok", "message": "User password updated successfully."}
 
 
 @app.delete("/api/admin/users/{user_id}")
