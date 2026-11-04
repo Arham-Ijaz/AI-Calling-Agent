@@ -257,6 +257,11 @@ function initNavigation() {
 }
 
 function navigateTo(page) {
+  // FAQs page access restriction: ONLY Admin can access/manage FAQs; regular users only ask questions
+  if (page === "faqs" && (typeof authState === "undefined" || !authState || !authState.isAdmin)) {
+    page = "home";
+  }
+
   const navLinks = $("navLinks");
   if (navLinks) navLinks.classList.remove("open");
 

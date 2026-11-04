@@ -18,7 +18,7 @@
     
     <ul class="nav-links" id="navLinks">
       <li><a href="#" class="nav-link active" data-page="home">🏠 Home</a></li>
-      <li><a href="#" class="nav-link" data-page="faqs">💬 FAQs</a></li>
+      <li id="navFaqsLink" style="display:none;"><a href="#" class="nav-link" data-page="faqs">💬 FAQs</a></li>
       <li><a href="#" class="nav-link" data-page="products">📦 Products</a></li>
       <li><a href="#" class="nav-link" data-page="logs">📋 Call Logs</a></li>
       <li><a href="#" class="nav-link" data-page="orders" id="navOrdersLink">🛍️ My Orders</a></li>
@@ -185,7 +185,7 @@
               The AI uses your live FAQ database and wholesale Product Catalog. Log in to manage custom knowledge for your business.
             </p>
             <div class="sidebar-links">
-              <a href="#" class="sidebar-link" onclick="navigateTo('faqs');return false;">💬 Manage FAQs</a>
+              <a href="#" class="sidebar-link" onclick="navigateTo('faqs');return false;" id="sidebarManageFaqs" style="display:none;">💬 Manage FAQs</a>
               <a href="#" class="sidebar-link" onclick="navigateTo('products');return false;">📦 Manage Products</a>
               <a href="#" class="sidebar-link" onclick="navigateTo('logs');return false;">📋 View Call Logs</a>
             </div>

@@ -98,9 +98,20 @@ function updateAuthUI() {
     }
   }
 
+  // FAQs page visibility: ONLY Admin can see / access FAQs page (regular users only ask questions)
+  const navFaqs = document.getElementById("navFaqsLink");
+  const sidebarFaqs = document.getElementById("sidebarManageFaqs");
+  const isAdm = Boolean(authState.isLoggedIn && authState.isAdmin);
+  if (navFaqs) navFaqs.style.display = isAdm ? "inline-flex" : "none";
+  if (sidebarFaqs) sidebarFaqs.style.display = isAdm ? "block" : "none";
+
+  const pageFaq = document.getElementById("page-faqs");
+  if (pageFaq && pageFaq.classList.contains("active") && !isAdm) {
+    if (typeof navigateTo === "function") navigateTo("home");
+  }
+
   // Refresh current view permissions
-  if (typeof loadFAQs === "function") {
-    const pageFaq = document.getElementById("page-faqs");
+  if (isAdm && typeof loadFAQs === "function") {
     if (pageFaq && pageFaq.classList.contains("active")) loadFAQs();
   }
   if (typeof loadProducts === "function") {

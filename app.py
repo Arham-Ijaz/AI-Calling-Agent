@@ -3454,60 +3454,31 @@ async def get_faq_chips(request: Request, limit: int = Query(default=18, ge=1, l
 
 
 @app.get("/api/faqs/all")
-async def get_all_faqs(request: Request):
-    """Return FAQs: regular users see Platform/Admin + their own; Admins see all."""
-    user = await get_optional_user(request)
-
+async def get_all_faqs(admin: dict = Depends(require_admin)):
+    """Return FAQs: accessible only to Administrators."""
     def query():
         with db() as conn:
-            if user and user["role"] == "admin":
-                rows = conn.execute(
-                    """
-                    SELECT f.id, f.intent, f.question, f.answer, f.user_id,
-                           COALESCE(u.full_name, 'Platform') AS owner_name, u.email AS owner_email
-                    FROM faqs f
-                    LEFT JOIN users u ON f.user_id = u.id
-                    ORDER BY f.id ASC
-                    """
-                ).fetchall()
-            elif user:
-                rows = conn.execute(
-                    """
-                    SELECT f.id, f.intent, f.question, f.answer, f.user_id,
-                           CASE WHEN f.user_id IS NULL THEN 'Platform'
-                                WHEN u.role = 'admin' THEN 'Platform (Admin)'
-                                WHEN f.user_id = ? THEN 'You'
-                                ELSE 'Custom' END AS owner_name
-                    FROM faqs f
-                    LEFT JOIN users u ON f.user_id = u.id
-                    WHERE f.user_id IS NULL OR f.user_id IN (SELECT id FROM users WHERE role = 'admin') OR f.user_id = ?
-                    ORDER BY f.id ASC
-                    """,
-                    (user["id"], user["id"]),
-                ).fetchall()
-            else:
-                rows = conn.execute(
-                    """
-                    SELECT f.id, f.intent, f.question, f.answer, f.user_id, 'Platform' AS owner_name
-                    FROM faqs f
-                    LEFT JOIN users u ON f.user_id = u.id
-                    WHERE f.user_id IS NULL OR f.user_id IN (SELECT id FROM users WHERE role = 'admin')
-                    ORDER BY f.id ASC
-                    """
-                ).fetchall()
+            rows = conn.execute(
+                """
+                SELECT f.id, f.intent, f.question, f.answer, f.user_id,
+                       COALESCE(u.full_name, 'Platform') AS owner_name, u.email AS owner_email
+                FROM faqs f
+                LEFT JOIN users u ON f.user_id = u.id
+                ORDER BY f.id ASC
+                """
+            ).fetchall()
             return [dict(r) for r in rows]
 
     return await asyncio.to_thread(query)
 
 
 @app.post("/api/faqs", status_code=201)
-async def create_faq(faq: FAQCreate, current_user: dict = Depends(get_current_user)):
-    """Add a new FAQ entry owned by current user (or platform if admin)."""
-    user_id = current_user["id"]
+async def create_faq(faq: FAQCreate, admin: dict = Depends(require_admin)):
+    """Add a new FAQ entry to platform knowledge base (Admin only)."""
+    user_id = admin["id"]
 
     def query():
         with db() as conn:
-            # Sync sequence to current max(id) so new insertion gets max(id) + 1
             max_id = conn.execute("SELECT COALESCE(MAX(id), 0) FROM faqs").fetchone()[0]
             conn.execute("DELETE FROM sqlite_sequence WHERE name = 'faqs'")
             conn.execute("INSERT INTO sqlite_sequence (name, seq) VALUES ('faqs', ?)", (max_id,))
@@ -3530,15 +3501,13 @@ async def create_faq(faq: FAQCreate, current_user: dict = Depends(get_current_us
 
 
 @app.put("/api/faqs/{faq_id}")
-async def update_faq(faq_id: int, faq: FAQUpdate, current_user: dict = Depends(get_current_user)):
-    """Update FAQ entry: users can only update their own; Admins can update any."""
+async def update_faq(faq_id: int, faq: FAQUpdate, admin: dict = Depends(require_admin)):
+    """Update FAQ entry in platform knowledge base (Admin only)."""
     def query():
         with db() as conn:
             existing = conn.execute("SELECT id, user_id FROM faqs WHERE id = ?", (faq_id,)).fetchone()
             if not existing:
                 return 404
-            if current_user["role"] != "admin" and existing["user_id"] != current_user["id"]:
-                return 403
 
             conn.execute(
                 "UPDATE faqs SET intent = ?, question = ?, answer = ? WHERE id = ?",
@@ -3552,8 +3521,6 @@ async def update_faq(faq_id: int, faq: FAQUpdate, current_user: dict = Depends(g
     result = await asyncio.to_thread(query)
     if result == 404:
         raise HTTPException(status_code=404, detail="FAQ not found.")
-    if result == 403:
-        raise HTTPException(status_code=403, detail="You do not have permission to modify this FAQ.")
 
     try:
         refresh_knowledge_base()
@@ -3563,15 +3530,13 @@ async def update_faq(faq_id: int, faq: FAQUpdate, current_user: dict = Depends(g
 
 
 @app.delete("/api/faqs/{faq_id}", status_code=204)
-async def delete_faq(faq_id: int, current_user: dict = Depends(get_current_user)):
-    """Delete FAQ entry and re-sequence database IDs so sequence remains contiguous."""
+async def delete_faq(faq_id: int, admin: dict = Depends(require_admin)):
+    """Delete FAQ entry and re-sequence database IDs (Admin only)."""
     def query():
         with db() as conn:
             existing = conn.execute("SELECT id, user_id FROM faqs WHERE id = ?", (int(faq_id),)).fetchone()
             if not existing:
                 return 404
-            if current_user["role"] != "admin" and existing["user_id"] != current_user["id"]:
-                return 403
             conn.execute("DELETE FROM faqs WHERE id = ?", (int(faq_id),))
             resequence_table(conn, "faqs")
             return 204
