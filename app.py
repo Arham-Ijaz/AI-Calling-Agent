@@ -441,12 +441,18 @@ def seed_default_admin() -> None:
 def seed_business_settings() -> None:
     """Seed default business settings if not already present."""
     defaults = {
-        "business_name": "DigiBuzz",
-        "business_hours_en": "We are open Monday through Saturday from 9:00 AM to 9:00 PM. We are closed on Sundays.",
-        "business_hours_ur": "ہم پیر سے ہفتہ صبح 9 بجے سے رات 9 بجے تک کھلے رہتے ہیں۔ اتوار کو ہمارا دفتر بند ہوتا ہے۔",
+        "business_name": "Apex Support Services",
+        "business_type": "Products & Healthcare/Consulting Services",
+        "greeting": "Hello! Welcome to our automated customer assistance. How may I assist you with our catalog and services today?",
+        "working_hours": "Monday to Saturday from 9:00 AM to 6:00 PM",
+        "language_default": "en",
+        "max_order_quantity": "10",
+        "escalation_message": "I will connect you directly with a human staff member to assist you further.",
+        "business_hours_en": "Monday to Saturday from 9:00 AM to 6:00 PM. Closed on Sundays.",
+        "business_hours_ur": "ہم پیر سے ہفتہ صبح 9 بجے سے شام 6 بجے تک کھلے رہتے ہیں۔ اتوار کو ہمارا دفتر بند ہوتا ہے۔",
         "support_phone": "+92 300 1234567",
-        "support_email": "support@digibuzz.com",
-        "office_address": "DigiBuzz Technologies, Main Boulevard, Gulberg III, Lahore, Pakistan",
+        "support_email": "support@example.com",
+        "office_address": "Main Boulevard, Gulberg III, Lahore, Pakistan",
     }
     with db() as conn:
         for k, v in defaults.items():
@@ -457,24 +463,36 @@ def seed_business_settings() -> None:
 
 
 def seed_sample_orders() -> None:
-    """Seed sample orders for order status lookup."""
+    """Seed sample orders for testing status flows and admin confirmation."""
     with db() as conn:
         count = conn.execute("SELECT COUNT(*) AS total FROM orders").fetchone()["total"]
         if count > 0:
             return
         sample_orders = [
-            ("ORD-1001", None, "Ali Ahmed", "+923001112233", "Shipped", "TCS-987654", 4500, now()),
-            ("ORD-1002", None, "Fatima Khan", "+923015556677", "Out for Delivery", "LEO-443322", 12000, now()),
-            ("ORD-1003", None, "Bilal Tariq", "+923214448899", "Confirmed", "PENDING", 8500, now()),
+            ("ORD-1001", None, "Ali Ahmed", "+923001112233", "pending_admin_confirmation", "General Medical Consultation", 2500, 1, "2026-11-10 10:00", 2500, now(), now(), 0),
+            ("ORD-1002", None, "Fatima Khan", "+923015556677", "confirmed", "Logitech MK270 Combo", 6500, 2, None, 13000, now(), now(), 0),
+            ("ORD-1003", None, "Bilal Tariq", "+923214448899", "cancel_requested", "Samsung Galaxy A54", 89500, 1, None, 89500, now(), now(), 0),
         ]
         conn.executemany(
             """
-            INSERT INTO orders (order_number, user_id, customer_name, customer_phone, status, tracking_number, total_pkr, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO orders (
+                order_number, user_id, customer_name, customer_phone,
+                status, item_name_snapshot, unit_price_snapshot, quantity,
+                preferred_datetime, total_pkr, created_at, updated_at, is_locked
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             sample_orders,
         )
-        log.info("Seeded %d sample orders.", len(sample_orders))
+        # Seed initial order events for sample orders
+        for row in conn.execute("SELECT id, status FROM orders").fetchall():
+            conn.execute(
+                """
+                INSERT INTO order_events (order_id, actor_user_id, actor_role, event_type, old_status, new_status, note, created_at)
+                VALUES (?, NULL, 'system', 'order_created', NULL, ?, 'Initial seeded order', ?)
+                """,
+                (row["id"], row["status"], now()),
+            )
+        log.info("Seeded %d sample orders with audit events.", len(sample_orders))
 
 
 def init_db() -> None:
@@ -552,23 +570,56 @@ def init_db() -> None:
 
                 CREATE TABLE IF NOT EXISTS handoff_requests (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    call_id INTEGER REFERENCES calls(id),
                     session_id TEXT NOT NULL,
                     user_id INTEGER REFERENCES users(id),
+                    contact_name TEXT,
+                    contact_phone TEXT,
                     trigger_type TEXT NOT NULL,
                     reason TEXT,
+                    priority TEXT NOT NULL DEFAULT 'normal',
+                    language TEXT NOT NULL DEFAULT 'en',
+                    last_user_message TEXT,
+                    summary TEXT,
+                    status TEXT NOT NULL DEFAULT 'open',
+                    assigned_to INTEGER REFERENCES users(id),
+                    staff_note TEXT,
                     created_at TEXT NOT NULL,
-                    status TEXT NOT NULL DEFAULT 'pending'
+                    assigned_at TEXT,
+                    resolved_at TEXT,
+                    resolved_by INTEGER REFERENCES users(id)
                 );
 
                 CREATE TABLE IF NOT EXISTS orders (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     order_number TEXT UNIQUE NOT NULL,
                     user_id INTEGER REFERENCES users(id),
-                    customer_name TEXT NOT NULL,
-                    customer_phone TEXT,
-                    status TEXT NOT NULL DEFAULT 'confirmed',
-                    tracking_number TEXT,
-                    total_pkr INTEGER NOT NULL DEFAULT 0,
+                    call_session_id TEXT,
+                    item_id INTEGER REFERENCES products(id),
+                    item_name_snapshot TEXT NOT NULL DEFAULT 'Item',
+                    unit_price_snapshot INTEGER NOT NULL DEFAULT 0,
+                    quantity INTEGER NOT NULL DEFAULT 1,
+                    preferred_datetime TEXT,
+                    status TEXT NOT NULL DEFAULT 'pending_admin_confirmation',
+                    cancel_requested_at TEXT,
+                    cancel_reason TEXT,
+                    decided_by INTEGER REFERENCES users(id),
+                    decided_at TEXT,
+                    admin_note TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL DEFAULT '',
+                    is_locked INTEGER DEFAULT 0
+                );
+
+                CREATE TABLE IF NOT EXISTS order_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    order_id INTEGER NOT NULL REFERENCES orders(id),
+                    actor_user_id INTEGER REFERENCES users(id),
+                    actor_role TEXT NOT NULL,
+                    event_type TEXT NOT NULL,
+                    old_status TEXT,
+                    new_status TEXT NOT NULL,
+                    note TEXT,
                     created_at TEXT NOT NULL
                 );
 
@@ -578,7 +629,11 @@ def init_db() -> None:
                 CREATE INDEX IF NOT EXISTS idx_msgs_call ON call_messages(call_id, id);
                 CREATE INDEX IF NOT EXISTS idx_orders_num ON orders(order_number);
                 CREATE INDEX IF NOT EXISTS idx_orders_user ON orders(user_id);
+                CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status);
+                CREATE INDEX IF NOT EXISTS idx_order_events_order ON order_events(order_id);
                 CREATE INDEX IF NOT EXISTS idx_handoff_session ON handoff_requests(session_id);
+                CREATE INDEX IF NOT EXISTS idx_handoff_status ON handoff_requests(status);
+                CREATE INDEX IF NOT EXISTS idx_handoff_priority ON handoff_requests(priority);
                 """
             )
 
@@ -586,6 +641,64 @@ def init_db() -> None:
             for tbl in ("calls", "products", "faqs"):
                 try:
                     conn.execute(f"ALTER TABLE {tbl} ADD COLUMN user_id INTEGER REFERENCES users(id)")
+                except sqlite3.OperationalError:
+                    pass
+
+            # Products item_type migration ('product' | 'service')
+            try:
+                conn.execute("ALTER TABLE products ADD COLUMN item_type TEXT DEFAULT 'product'")
+            except sqlite3.OperationalError:
+                pass
+
+            # Calls table migrations (summary, follow_up_status, detected_intent)
+            for col, col_def in (
+                ("summary", "TEXT"),
+                ("follow_up_status", "TEXT DEFAULT 'none'"),
+                ("detected_intent", "TEXT"),
+            ):
+                try:
+                    conn.execute(f"ALTER TABLE calls ADD COLUMN {col} {col_def}")
+                except sqlite3.OperationalError:
+                    pass
+
+            # Orders table migrations (support generic items, snapshots, datetime, lock)
+            for col, col_def in (
+                ("call_session_id", "TEXT"),
+                ("item_id", "INTEGER"),
+                ("item_name_snapshot", "TEXT DEFAULT 'Item'"),
+                ("unit_price_snapshot", "INTEGER DEFAULT 0"),
+                ("quantity", "INTEGER DEFAULT 1"),
+                ("preferred_datetime", "TEXT"),
+                ("cancel_requested_at", "TEXT"),
+                ("cancel_reason", "TEXT"),
+                ("decided_by", "INTEGER"),
+                ("decided_at", "TEXT"),
+                ("admin_note", "TEXT"),
+                ("updated_at", "TEXT DEFAULT ''"),
+                ("is_locked", "INTEGER DEFAULT 0"),
+            ):
+                try:
+                    conn.execute(f"ALTER TABLE orders ADD COLUMN {col} {col_def}")
+                except sqlite3.OperationalError:
+                    pass
+
+            # Handoff requests migrations (call_id, contact, priority, language, etc.)
+            for col, col_def in (
+                ("call_id", "INTEGER REFERENCES calls(id)"),
+                ("contact_name", "TEXT"),
+                ("contact_phone", "TEXT"),
+                ("priority", "TEXT DEFAULT 'normal'"),
+                ("language", "TEXT DEFAULT 'en'"),
+                ("last_user_message", "TEXT"),
+                ("summary", "TEXT"),
+                ("assigned_to", "TEXT"),
+                ("staff_note", "TEXT"),
+                ("assigned_at", "TEXT"),
+                ("resolved_at", "TEXT"),
+                ("resolved_by", "TEXT"),
+            ):
+                try:
+                    conn.execute(f"ALTER TABLE handoff_requests ADD COLUMN {col} {col_def}")
                 except sqlite3.OperationalError:
                     pass
 
@@ -606,6 +719,13 @@ def init_db() -> None:
 
         # Automatically defragment & re-sequence product and FAQ IDs on startup
         with db() as conn:
+            conn.execute(
+                """
+                UPDATE orders
+                SET status = 'pending_admin_confirmation'
+                WHERE status NOT IN ('pending_admin_confirmation', 'confirmed', 'completed', 'cancel_requested', 'cancelled', 'rejected')
+                """
+            )
             resequence_table(conn, "products")
             resequence_table(conn, "faqs")
     except Exception as exc:
@@ -649,10 +769,14 @@ def get_or_create_call(conn: sqlite3.Connection, session_id: str, user_id: int |
 
 
 def save_message(session_id: str, user_text: str, result: dict, user_id: int | None = None) -> None:
-    """Persist conversation turn to the database with safe error handling."""
+    """Persist conversation turn to the database, update call summary and follow-up status."""
     try:
         with db() as conn:
             call_id = get_or_create_call(conn, session_id, user_id)
+            intent = result.get("intent", "unknown")
+            outcome = result.get("outcome", "Resolved")
+            needs_handoff = result.get("needs_handoff", False) or outcome in ("Escalated", "Transferred")
+
             conn.execute(
                 "INSERT INTO call_messages (call_id, timestamp, user_transcript, ai_response, detected_intent, outcome) VALUES (?, ?, ?, ?, ?, ?)",
                 (
@@ -660,13 +784,29 @@ def save_message(session_id: str, user_text: str, result: dict, user_id: int | N
                     now(),
                     user_text,
                     result.get("reply", ""),
-                    result.get("intent", ""),
-                    result.get("outcome", "Resolved"),
+                    intent,
+                    outcome,
                 ),
             )
+
+            # Auto-generate a clean, non-sensitive summary
+            clean_user = user_text[:80].replace("'", "").replace('"', '').strip()
+            summary = f"Caller inquiry ({intent}): {clean_user}" if clean_user else f"Inquiry about {intent}"
+
+            follow_up = "needs_human" if needs_handoff else "none"
+
             conn.execute(
-                "UPDATE calls SET last_activity = ?, total_messages = total_messages + 1, outcome = ? WHERE id = ?",
-                (now(), result.get("outcome", "Resolved"), call_id),
+                """
+                UPDATE calls
+                SET last_activity = ?,
+                    total_messages = total_messages + 1,
+                    outcome = ?,
+                    detected_intent = COALESCE(NULLIF(detected_intent, 'general_inquiry'), ?),
+                    summary = ?,
+                    follow_up_status = CASE WHEN follow_up_status IN ('needs_human', 'pending_staff') THEN follow_up_status ELSE ? END
+                WHERE id = ?
+                """,
+                (now(), outcome, intent, summary, follow_up, call_id),
             )
     except Exception as exc:
         log.error("Failed to persist call message for session %s: %r", session_id, exc)
@@ -709,12 +849,13 @@ def load_faqs_context(user_id: int | None = None) -> str:
 
 
 def load_products_context(user_id: int | None = None) -> str:
-    """Load platform products + admin-created products + custom user products from database."""
+    """Load platform products & services from database with item_type."""
     with db() as conn:
         if user_id:
             rows = conn.execute(
                 """
-                SELECT id, name, category, brand, price, stock_status, description FROM products
+                SELECT id, name, category, brand, price, stock_status, description,
+                       COALESCE(item_type, 'product') AS item_type FROM products
                 WHERE user_id IS NULL
                    OR user_id IN (SELECT id FROM users WHERE role = 'admin')
                    OR user_id = ?
@@ -725,54 +866,288 @@ def load_products_context(user_id: int | None = None) -> str:
         else:
             rows = conn.execute(
                 """
-                SELECT id, name, category, brand, price, stock_status, description FROM products
+                SELECT id, name, category, brand, price, stock_status, description,
+                       COALESCE(item_type, 'product') AS item_type FROM products
                 WHERE user_id IS NULL
                    OR user_id IN (SELECT id FROM users WHERE role = 'admin')
                 ORDER BY category ASC, id ASC
                 """
             ).fetchall()
     if not rows:
-        return "(No products catalog available)"
+        return "(No catalog items available)"
     lines = [
-        f"- [{r['category']}] {r['name']} by {r['brand']} | "
-        f"Price: PKR {r['price']:,} | Stock: {r['stock_status']} | "
+        f"- [{r['item_type'].upper()}] [{r['category']}] {r['name']} by {r['brand']} | "
+        f"Price: PKR {r['price']:,} | Availability: {r['stock_status']} | "
         f"Details: {r['description']}"
         for r in rows
     ]
     return "\n".join(lines)
 
 
+
+# =====================================================================
+# 5A. Business Settings, Orders Status Flow & Compliance Engine (Phase 4 & 7)
+# =====================================================================
+BUSINESS_SETTINGS_CACHE: dict[str, str] = {}
+
+
+def refresh_business_settings_cache() -> dict[str, str]:
+    """Load business settings from SQLite into memory cache."""
+    global BUSINESS_SETTINGS_CACHE
+    try:
+        with db() as conn:
+            rows = conn.execute("SELECT key, value FROM business_settings").fetchall()
+            BUSINESS_SETTINGS_CACHE = {r["key"]: r["value"] for r in rows}
+    except Exception as exc:
+        log.warning("Failed to refresh business settings cache: %r", exc)
+    return BUSINESS_SETTINGS_CACHE
+
+
+def get_business_setting(key: str, default: str = "") -> str:
+    """Get a business setting value, using in-memory cache with DB fallback."""
+    if not BUSINESS_SETTINGS_CACHE:
+        refresh_business_settings_cache()
+    return BUSINESS_SETTINGS_CACHE.get(key, default)
+
+
+def get_all_business_settings() -> dict[str, str]:
+    """Return all business settings as a dictionary."""
+    if not BUSINESS_SETTINGS_CACHE:
+        refresh_business_settings_cache()
+    return dict(BUSINESS_SETTINGS_CACHE)
+
+
+LOCKED_ORDER_STATUSES = {"cancelled", "rejected", "completed"}
+
+ORDER_TRANSITIONS = {
+    "pending_admin_confirmation": {"confirmed", "rejected", "cancel_requested"},
+    "confirmed": {"completed", "cancel_requested"},
+    "cancel_requested": {"cancelled", "pending_admin_confirmation", "confirmed"},
+    "cancelled": set(),
+    "rejected": set(),
+    "completed": set(),
+}
+
+
+def validate_and_apply_order_transition(
+    conn,
+    order_id: int,
+    target_status: str,
+    actor_user_id: int | None,
+    actor_role: str,
+    note: str | None = None,
+    event_type: str = "status_change",
+) -> dict:
+    """
+    Validate status transition rules for orders, enforce immutability on locked statuses,
+    and append an immutable audit record in order_events.
+    Raises HTTPException 404, 409 if invalid.
+    """
+    order = conn.execute("SELECT * FROM orders WHERE id = ?", (order_id,)).fetchone()
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found.")
+
+    current_status = order["status"]
+    is_locked = bool(order["is_locked"]) or (current_status in LOCKED_ORDER_STATUSES)
+
+    if is_locked:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Order #{order['order_number']} is in terminal locked status '{current_status}' and cannot be altered.",
+        )
+
+    allowed_targets = ORDER_TRANSITIONS.get(current_status, set())
+    if target_status not in allowed_targets:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Invalid order status transition from '{current_status}' to '{target_status}'.",
+        )
+
+    if target_status == "rejected" and (not note or not note.strip()):
+        raise HTTPException(
+            status_code=400,
+            detail="Rejection requires an explanatory admin note for the customer.",
+        )
+
+    new_is_locked = 1 if target_status in LOCKED_ORDER_STATUSES else 0
+    now_str = now()
+
+    extra_updates = []
+    extra_params = []
+
+    if target_status in ("confirmed", "rejected", "completed"):
+        extra_updates.extend(["decided_by = ?", "decided_at = ?", "admin_note = ?"])
+        extra_params.extend([actor_user_id, now_str, note or order["admin_note"]])
+    elif target_status == "cancel_requested":
+        extra_updates.extend(["cancel_requested_at = ?", "cancel_reason = ?"])
+        extra_params.extend([now_str, note or order["cancel_reason"]])
+    elif target_status == "cancelled":
+        extra_updates.extend(["decided_by = ?", "decided_at = ?", "admin_note = ?"])
+        extra_params.extend([actor_user_id, now_str, note or order["admin_note"]])
+
+    update_sql = f"""
+        UPDATE orders
+        SET status = ?, is_locked = ?, updated_at = ?
+        {', ' + ', '.join(extra_updates) if extra_updates else ''}
+        WHERE id = ?
+    """
+    params = [target_status, new_is_locked, now_str] + extra_params + [order_id]
+    conn.execute(update_sql, params)
+
+    conn.execute(
+        """
+        INSERT INTO order_events (order_id, actor_user_id, actor_role, event_type, old_status, new_status, note, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (order_id, actor_user_id, actor_role, event_type, current_status, target_status, note, now_str),
+    )
+
+    updated_order = conn.execute("SELECT * FROM orders WHERE id = ?", (order_id,)).fetchone()
+    return dict(updated_order)
+
+
+def check_service_conflict(conn, item_id: int, preferred_datetime: str | None, exclude_order_id: int | None = None) -> dict:
+    """Check if a service booking at preferred_datetime conflicts with an existing booking."""
+    if not preferred_datetime or not str(preferred_datetime).strip():
+        return {"has_conflict": False}
+
+    prod = conn.execute(
+        "SELECT id, name, COALESCE(item_type, 'product') AS item_type FROM products WHERE id = ?",
+        (item_id,),
+    ).fetchone()
+    if not prod or prod["item_type"] != "service":
+        return {"has_conflict": False}
+
+    query = """
+        SELECT id, order_number, customer_name, preferred_datetime, status
+        FROM orders
+        WHERE item_id = ?
+          AND preferred_datetime = ?
+          AND status IN ('pending_admin_confirmation', 'confirmed')
+    """
+    params = [item_id, str(preferred_datetime).strip()]
+    if exclude_order_id:
+        query += " AND id != ?"
+        params.append(exclude_order_id)
+
+    conflicts = conn.execute(query, params).fetchall()
+    if conflicts:
+        conflict_list = [dict(c) for c in conflicts]
+        return {
+            "has_conflict": True,
+            "warning": f"Double-booking detected: {len(conflicts)} other order(s) already scheduled for {prod['name']} at {preferred_datetime}.",
+            "conflicts": conflict_list,
+        }
+    return {"has_conflict": False}
+
+
+def create_or_update_handoff_request(
+    conn,
+    session_id: str,
+    user_id: int | None,
+    trigger_type: str,
+    reason: str,
+    priority: str = "normal",
+    language: str = "en",
+    contact_name: str | None = None,
+    contact_phone: str | None = None,
+    last_user_message: str | None = None,
+    summary: str | None = None,
+) -> int:
+    """Create or update exactly one open handoff request per call session (Phase 7)."""
+    now_str = now()
+    call = conn.execute("SELECT id FROM calls WHERE session_id = ?", (session_id,)).fetchone()
+    call_id = call["id"] if call else None
+
+    if not contact_name and user_id:
+        user_row = conn.execute("SELECT full_name, phone FROM users WHERE id = ?", (user_id,)).fetchone()
+        if user_row:
+            contact_name = contact_name or user_row["full_name"]
+            contact_phone = contact_phone or user_row["phone"]
+
+    existing = conn.execute(
+        "SELECT id, priority, status FROM handoff_requests WHERE session_id = ? AND status IN ('open', 'assigned')",
+        (session_id,),
+    ).fetchone()
+
+    priority_ranks = {"normal": 1, "high": 2, "urgent": 3}
+
+    if existing:
+        curr_prio = existing["priority"]
+        new_prio = priority if priority_ranks.get(priority, 1) > priority_ranks.get(curr_prio, 1) else curr_prio
+        conn.execute(
+            """
+            UPDATE handoff_requests
+            SET trigger_type = ?, reason = ?, priority = ?, language = ?,
+                contact_name = COALESCE(?, contact_name),
+                contact_phone = COALESCE(?, contact_phone),
+                last_user_message = COALESCE(?, last_user_message),
+                summary = COALESCE(?, summary)
+            WHERE id = ?
+            """,
+            (trigger_type, reason, new_prio, language, contact_name, contact_phone, last_user_message, summary, existing["id"]),
+        )
+        handoff_id = existing["id"]
+    else:
+        cursor = conn.execute(
+            """
+            INSERT INTO handoff_requests (
+                call_id, session_id, user_id, contact_name, contact_phone,
+                trigger_type, reason, priority, language,
+                last_user_message, summary, status, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?)
+            """,
+            (
+                call_id, session_id, user_id, contact_name, contact_phone,
+                trigger_type, reason, priority, language,
+                last_user_message, summary, now_str,
+            ),
+        )
+        handoff_id = cursor.lastrowid
+
+    if call_id:
+        conn.execute(
+            "UPDATE calls SET follow_up_status = 'needs_human', detected_intent = ?, summary = COALESCE(?, summary) WHERE id = ?",
+            (trigger_type, summary, call_id),
+        )
+
+    return handoff_id
+
+
 def build_system_instruction(user_id: int | None = None) -> str:
-    """Build the Gemini system instruction with scoped FAQ and product context."""
+    """Build dynamic system instruction using business_settings and compliance rules."""
+    b_name = get_business_setting("business_name", "our business")
+    b_type = get_business_setting("business_type", "Products & Services")
+    b_hours = get_business_setting("working_hours", "Monday to Saturday from 9:00 AM to 6:00 PM")
     faq_ctx = load_faqs_context(user_id)
     product_ctx = load_products_context(user_id)
+
     return f"""
-You are the DigiBuzz AI Calling Agent, providing customer support for DigiBuzz.
+You are the automated AI Calling Assistant for {b_name} ({b_type}).
 
 KNOWLEDGE BASE:
-
-1. Operational FAQs (policies, delivery, payments):
+1. Operational FAQs (policies, hours, payments):
 {faq_ctx}
 
-2. Product Catalog (wholesale products):
+2. Product Catalog & Services (prices in PKR):
 {product_ctx}
 
-CRITICAL RULES:
-1. BRANDING & GREETING: You are "DigiBuzz AI Calling Agent". Greet callers professionally in English (e.g., "Hello! I am the DigiBuzz AI Calling Agent. How may I assist you today?").
-2. KNOWLEDGE ACCURACY: Answer using ONLY the FAQ knowledge base and Product Catalog above (prices in PKR, stock, specs, comparisons, delivery terms).
-3. REAL-TIME SYNCHRONIZATION: Your knowledge base above is live and constantly synchronized with the store database. Whenever a caller asks about any item, product, brand, warranty, or policy, always consult the current Product Catalog and Operational FAQs above. If the item or policy is listed above, state its exact name, specifications, stock status, and wholesale price in PKR immediately.
-4. OFF-TOPIC PROTECTION: NEVER answer questions outside DigiBuzz products, wholesale orders, and store policies. Politely decline: "I am sorry, I can only assist you with DigiBuzz products and services." Set intent to "off_topic" and outcome to "Resolved".
-5. HUMAN ESCALATION: If the user asks about an unlisted item, unknown policy, or explicitly requests a human representative, state you are transferring their call to a Human Support Agent, and set outcome to "Escalated".
-6. LANGUAGE & TONE:
-   - Reply in clear, concise, professional English.
-   - If the caller uses Urdu script or Roman Urdu, respond politely in English or their preferred language.
-   - Keep replies short, conversational, and direct (maximum 2 to 3 sentences suitable for a voice call).
+3. Working Hours: {b_hours}
+
+COMPLIANCE & ETHICAL RULES:
+1. AUTOMATED ASSISTANT IDENTITY: Always introduce yourself as an automated AI assistant. NEVER claim or imply that you are human.
+2. NO UNAUTHORIZED COMMITMENTS: You have strictly zero authorization to offer refunds, custom price discounts, medical diagnosis, delivery guarantees, or instant order confirmations.
+3. ORDER / APPOINTMENT REQUESTS: When a customer wants to place an order or book an appointment, inform them that an order REQUEST has been received and is waiting for admin confirmation. You must NEVER say "confirmed" or "booked" before an administrator confirms.
+4. KNOWLEDGE ACCURACY: Answer using ONLY the knowledge base and catalog items above.
+5. OFF-TOPIC PROTECTION: Politely decline any query outside {b_name} offerings: "I am sorry, I can only assist you with {b_name} products and services." Set intent to "unknown" and outcome to "Resolved".
+6. HUMAN ESCALATION: If the caller explicitly requests a human representative, reports an urgent medical/legal/payment dispute, or has an unresolvable complaint, escalate to a Human Support Agent and set outcome to "Escalated".
+7. SPOKEN VOICE STYLE: Speak in clear, professional English (or Urdu if the user speaks Urdu). Maximum 1 to 2 short conversational sentences suitable for a live telephone call.
 
 Return ONLY a JSON object with these exact keys:
 {{
   "response_text": "short reply displayed in the chat interface",
   "speech_text": "clean plain text reply used for text-to-speech audio",
-  "intent": "short snake_case intent (e.g., product_inquiry, price_check, delivery_time, human_handoff, off_topic)",
+  "intent": "order_status|business_hours|human_agent_request|faq|place_order|cancel_order|appointment_booking|unknown",
   "outcome": "Resolved" or "Escalated"
 }}
 """
@@ -1168,6 +1543,7 @@ class ProductCreate(BaseModel):
     price: int = Field(ge=0)
     stock_status: str = Field(min_length=1, max_length=50)
     description: str = Field(min_length=0, max_length=1000, default="")
+    item_type: str = Field(default="product", pattern=r"^(product|service)$")
 
 
 class ProductUpdate(BaseModel):
@@ -1177,6 +1553,48 @@ class ProductUpdate(BaseModel):
     price: int = Field(ge=0)
     stock_status: str = Field(min_length=1, max_length=50)
     description: str = Field(min_length=0, max_length=1000, default="")
+    item_type: str = Field(default="product", pattern=r"^(product|service)$")
+
+
+class BusinessSettingsUpdate(BaseModel):
+    business_name: str | None = None
+    business_type: str | None = None
+    greeting: str | None = None
+    working_hours: str | None = None
+    language_default: str | None = None
+    max_order_quantity: int | None = None
+    escalation_message: str | None = None
+    business_hours_en: str | None = None
+    business_hours_ur: str | None = None
+    support_phone: str | None = None
+    support_email: str | None = None
+    office_address: str | None = None
+
+
+class CreateOrderRequest(BaseModel):
+    item_id: int
+    quantity: int = Field(default=1, ge=1, le=100)
+    preferred_datetime: str | None = None
+    call_session_id: str | None = None
+    customer_name: str | None = None
+    customer_phone: str | None = None
+
+
+class OrderCancelRequest(BaseModel):
+    reason: str | None = Field(default=None, max_length=500)
+
+
+class OrderDecisionRequest(BaseModel):
+    action: str = Field(pattern=r"^(confirm|reject|approve_cancel|reject_cancel|complete)$")
+    admin_note: str | None = Field(default=None, max_length=1000)
+
+
+class HandoffResolveRequest(BaseModel):
+    staff_note: str | None = Field(default=None, max_length=1000)
+
+
+class HandoffPriorityRequest(BaseModel):
+    priority: str = Field(pattern=r"^(normal|high|urgent)$")
 
 
 # =====================================================================
@@ -1788,23 +2206,23 @@ def _expand_knowledge_keywords(words: set[str]) -> set[str]:
 CONVERSATIONAL_INTENTS: dict[str, tuple[set[str], str]] = {
     "greeting": (
         {"hello", "hi", "hey", "salam", "assalam", "aoa", "morning", "evening", "afternoon"},
-        "Hello! I am the DigiBuzz AI Calling Agent. How may I assist you with our wholesale products or services today?"
+        "Hello! Welcome to our automated assistance. How may I assist you with our catalog and services today?"
     ),
     "identity": (
-        {"who", "name", "identity", "kaun", "calling"},
-        "I am the DigiBuzz AI Calling Agent, your 24/7 automated assistant for wholesale orders, group buying pools, and product inquiries."
+        {"who are you", "who is this", "your name", "what is your name", "kaun ho", "kaun hain", "ap kaun", "tum kaun"},
+        "I am an automated AI Calling Assistant, here to assist you 24/7 with our catalog, services, and order inquiries."
     ),
     "status": (
-        {"how", "doing", "haal", "kaise"},
-        "I am doing great, thank you! How may I assist you with DigiBuzz products or business orders today?"
+        {"how are you", "how are u", "kaise ho", "kya haal"},
+        "I am doing great, thank you! How may I assist you today?"
     ),
     "gratitude": (
-        {"thanks", "thank", "shukriya", "jazakallah", "welcome"},
+        {"thanks", "thank you", "shukriya", "jazakallah"},
         "You are very welcome! Please let me know if there is anything else I can help you with today."
     ),
     "catalog_overview": (
-        {"catalog", "categories", "products", "items", "list", "offer"},
-        "We offer wholesale pricing across mobile phones, laptops, tablets, power banks, networking routers, and printers. What product can I check for you?"
+        {"catalog", "categories", "products", "items list", "services list"},
+        "We offer a wide range of verified products and professional services. What item or service can I check for you?"
     ),
 }
 
@@ -1816,9 +2234,9 @@ def check_fast_knowledge_response(user_text: str, user_id: int | None = None) ->
     if not words_all:
         return None
 
-    # 1. Check conversational intents (greetings, identity, gratitude)
+    # 1. Check conversational intents
     for intent, (triggers, reply) in CONVERSATIONAL_INTENTS.items():
-        if words_all.intersection(triggers) and len(words_all) <= 6:
+        if any(trig in clean_query for trig in triggers) and len(words_all) <= 8:
             return {
                 "type": "conversational",
                 "answer": reply,
@@ -1896,7 +2314,7 @@ WORD_TO_NUMBER = {
     "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10,
     "eleven": 11, "twelve": 12, "twenty": 20, "thirty": 30, "fifty": 50, "hundred": 100,
     "ek": 1, "aik": 1, "do": 2, "teen": 3, "char": 4, "chaar": 4, "paanch": 5, "panch": 5,
-    "che": 6, "chay": 6, "saat": 7, "aath": 8, "ath": 8, "nau": 9, "no": 9, "das": 10,
+    "che": 6, "chay": 6, "saat": 7, "aath": 8, "ath": 8, "nau": 9, "das": 10,
     "ایک": 1, "دو": 2, "تین": 3, "چار": 4, "پانچ": 5, "چھ": 6, "سات": 7, "آٹھ": 8, "نو": 9, "دس": 10,
 }
 
@@ -1968,12 +2386,30 @@ def lookup_order_status(text: str, user_id: int | None = None) -> dict | None:
                 ).fetchone()
 
             if row:
-                status_str = row["status"]
-                tracking_str = f"Tracking ID is {row['tracking_number']}." if row["tracking_number"] and row["tracking_number"] != "PENDING" else "Tracking details will be sent via SMS shortly."
+                status_raw = row["status"]
+                status_map_en = {
+                    "pending_admin_confirmation": "waiting for admin confirmation",
+                    "confirmed": "confirmed by administrator",
+                    "completed": "completed",
+                    "rejected": "rejected by administrator",
+                    "cancel_requested": "under review for cancellation",
+                    "cancelled": "cancelled",
+                }
+                status_map_ur = {
+                    "pending_admin_confirmation": "ایڈمن کی تصدیق کا منتظر",
+                    "confirmed": "ایڈمن سے تصدیق شدہ",
+                    "completed": "مکمل ہو چکا",
+                    "rejected": "ایڈمن سے مسترد شدہ",
+                    "cancel_requested": "منسوخی کی درخواست کے زیرِ جائزہ",
+                    "cancelled": "منسوخ ہو چکا",
+                }
+                status_en = status_map_en.get(status_raw, status_raw.replace("_", " "))
+                status_ur = status_map_ur.get(status_raw, status_raw)
+                total_val = row["total_pkr"] or 0
                 if is_urdu:
-                    reply = f"آپ کا آرڈر نمبر {row['order_number']} اس وقت {status_str} ہے اور کل رقم {row['total_pkr']} روپے ہے۔"
+                    reply = f"آپ کا آرڈر نمبر {row['order_number']} اس وقت {status_ur} ہے اور کل رقم {total_val:,} روپے ہے۔"
                     return {"reply": reply, "language": "ur", "intent": "order_status", "outcome": "Resolved", "confidence": 1.0}
-                reply = f"Your order {row['order_number']} is currently {status_str}. Total amount is PKR {row['total_pkr']:,}. {tracking_str}"
+                reply = f"Your order {row['order_number']} has been received and is currently {status_en}. Total amount is PKR {total_val:,}."
                 return {"reply": reply, "language": "en", "intent": "order_status", "outcome": "Resolved", "confidence": 1.0}
     except Exception as exc:
         log.warning("Order lookup error: %r", exc)
@@ -2042,26 +2478,50 @@ CRITICAL RULES:
 def check_instant_fast_path(text: str, session_id: str, user_id: int | None = None) -> dict | None:
     """Instant 0ms deterministic handler for greetings, hours, bye, orders, handoff, confirmations, quantities, and cached FAQs."""
     clean = text.lower().strip()
-    is_urdu = bool(ARABIC_SCRIPT.search(text)) or any(w in clean.split() for w in ["kya", "mera", "karo", "hai", "hain", "mujhe", "batao", "chahiye", "kahan", "kaise", "ap", "aap", "shukriya", "theek"])
+    is_urdu = bool(ARABIC_SCRIPT.search(text)) or any(w in clean.split() for w in ["kya", "mera", "karo", "hai", "hain", "mujhe", "batao", "chahiye", "kahan", "kaise", "ap", "aap", "shukriya", "theek", "kardo"])
     words = clean.split()
     word_count = len(words)
+    b_name = get_business_setting("business_name", "our support")
 
-    # 1. Human agent escalation keywords
+    # 1. Human agent escalation & sensitive emergency keywords (Phase 7 Compliance)
+    sensitive_urgent_keywords = [
+        "emergency", "fraud", "police", "lawyer", "legal", "scam", "chori", "court",
+        "police bulao", "dhoka", "فراڈ", "ایمرجنسی", "پولیس", "وکیل", "قانونی", "دھوکہ"
+    ]
+    complaint_high_keywords = [
+        "supervisor", "manager", "complaint", "shikayat", "dispute", "bad service",
+        "ruined", "bakwas", "شکایت", "منیجر", "خراب سروس"
+    ]
     human_keywords = [
         "talk to human", "speak with agent", "agent se baat", "human agent",
         "insan se baat", "operator", "customer service representative",
         "transfer call", "live agent", "kisi bande se", "representative",
-        "نمائندہ", "انسان سے بات", "ایجنٹ سے بات", "بات کرواؤ", "بات کراؤ"
+        "human support", "real person", "support agent", "live support",
+        "connect to live", "connect to",
+        "نمائندہ", "نمائندے", "انسان سے بات", "ایجنٹ سے بات", "بات کرواؤ", "بات کراؤ",
+        "کسٹمر سروس", "کسٹمر کیئر"
     ]
-    if any(k in clean for k in human_keywords):
+
+    is_urgent = any(k in clean for k in sensitive_urgent_keywords)
+    is_complaint = any(k in clean for k in complaint_high_keywords)
+    is_human_req = any(k in clean for k in human_keywords)
+
+    if is_urgent or is_complaint or is_human_req:
+        priority = "urgent" if is_urgent else ("high" if is_complaint else "high")
+        trigger_type = "emergency_legal_dispute" if is_urgent else ("complaint_escalation" if is_complaint else "human_agent_request")
+        reason = f"User triggered human escalation: {clean[:100]}"
         try:
             with db() as conn:
-                conn.execute(
-                    """
-                    INSERT INTO handoff_requests (session_id, user_id, trigger_type, reason, created_at, status)
-                    VALUES (?, ?, 'user_requested', 'Caller requested human agent transfer', ?, 'pending')
-                    """,
-                    (session_id, user_id, now()),
+                create_or_update_handoff_request(
+                    conn=conn,
+                    session_id=session_id,
+                    user_id=user_id,
+                    trigger_type=trigger_type,
+                    reason=reason,
+                    priority=priority,
+                    language="ur" if is_urdu else "en",
+                    last_user_message=text,
+                    summary=f"Caller requested human assistance ({priority} priority).",
                 )
         except Exception as e:
             log.warning("Handoff record error: %r", e)
@@ -2069,12 +2529,13 @@ def check_instant_fast_path(text: str, session_id: str, user_id: int | None = No
         if is_urdu:
             reply = "جی بالکل، میں آپ کی کال کسٹمر سپورٹ نمائندے کو ٹرانسفر کر رہی ہوں۔ براہ کرم ہولڈ کیجیے۔"
         else:
-            reply = "I am transferring your call to a human support agent right now. Please hold on."
+            default_esc = "I will connect you directly with a human staff member to assist you further."
+            reply = get_business_setting("escalation_message", default_esc)
         return {
             "reply": reply,
             "language": "ur" if is_urdu else "en",
-            "intent": "human_handoff",
-            "outcome": "Transferred",
+            "intent": "human_agent_request",
+            "outcome": "Escalated",
             "needs_handoff": True,
             "confidence": 1.0,
         }
@@ -2092,13 +2553,92 @@ def check_instant_fast_path(text: str, session_id: str, user_id: int | None = No
             "confidence": 1.0,
         }
 
-    # 3. Order status lookup
+    # 3. Order status lookup or cancellation request
+    cancel_keywords = ["cancel my order", "order cancel", "cancel order", "آرڈر کینسل", "ارڈر کینسل", "منسوخ", "cancel kar do", "cancel kardo"]
+    if any(k in clean for k in cancel_keywords):
+        m = re.search(r"\b(?:ord(?:er)?[- ]?)?(\d{4,6})\b", clean, re.IGNORECASE)
+        digits = m.group(1) if m else None
+        order_num = f"ORD-{digits}" if digits else None
+        try:
+            with db() as conn:
+                order_row = None
+                if order_num:
+                    order_row = conn.execute("SELECT * FROM orders WHERE order_number = ?", (order_num,)).fetchone()
+                elif user_id:
+                    order_row = conn.execute("SELECT * FROM orders WHERE user_id = ? ORDER BY id DESC LIMIT 1", (user_id,)).fetchone()
+                else:
+                    order_row = conn.execute("SELECT * FROM orders ORDER BY id DESC LIMIT 1").fetchone()
+
+                if order_row:
+                    o_num = order_row["order_number"]
+                    st = order_row["status"]
+                    if order_row["is_locked"] or st in LOCKED_ORDER_STATUSES:
+                        if is_urdu:
+                            reply = f"آرڈر نمبر {o_num} پہلے ہی {st} ہے اور اسے منسوخ نہیں کیا جا سکتا۔"
+                        else:
+                            reply = f"Order #{o_num} is already {st.replace('_', ' ')} and cannot be cancelled."
+                    elif st == "cancel_requested":
+                        if is_urdu:
+                            reply = f"آرڈر نمبر {o_num} کی منسوخی کی درخواست پہلے ہی ایڈمن کے پاس زیرِ جائزہ ہے۔"
+                        else:
+                            reply = f"A cancellation request for order #{o_num} is already pending admin review."
+                    else:
+                        validate_and_apply_order_transition(
+                            conn=conn,
+                            order_id=order_row["id"],
+                            target_status="cancel_requested",
+                            actor_user_id=user_id,
+                            actor_role="customer",
+                            note="Customer requested cancellation via voice call",
+                            event_type="cancel_requested",
+                        )
+                        if is_urdu:
+                            reply = f"آپ کے آرڈر نمبر {o_num} کی منسوخی کی درخواست جمع کر دی گئی ہے اور ایڈمن کی منظوری کی منتظر ہے۔"
+                        else:
+                            reply = f"A cancellation request for order #{o_num} has been submitted and is waiting for admin approval."
+                    return {
+                        "reply": reply,
+                        "language": "ur" if is_urdu else "en",
+                        "intent": "cancel_order",
+                        "outcome": "Resolved",
+                        "needs_handoff": False,
+                        "confidence": 1.0,
+                    }
+        except Exception as exc:
+            log.warning("Voice order cancellation error: %r", exc)
+
     order_res = lookup_order_status(text, user_id)
     if order_res:
         order_res["needs_handoff"] = False
         return order_res
 
-    # 4. Quantity verification steps
+    # 4. Yes / No confirmations (checked before generic quantities)
+    confirm_words_en = {"yes", "yeah", "yep", "sure", "ok", "okay", "confirm", "proceed", "no", "nope", "cancel"}
+    confirm_words_ur = {"جی", "ہاں", "جی ہاں", "نہیں", "ٹھیک ہے", "بالکل", "کینسل", "theek", "haan", "jee", "nahi"}
+    confirm_phrases = ["theek hai", "confirm karo", "confirm it", "yes confirm", "no cancel", "cancel that", "جی بالکل ٹھیک", "ٹھیک ہے", "بالکل ٹھیک", "جی ہاں", "جی بالکل"]
+    clean_no_punc = re.sub(r"[^\w\s\u0600-\u06FF]", "", clean)
+    words_no_punc = set(clean_no_punc.split())
+
+    if word_count <= 6 and (
+        clean_no_punc in confirm_words_en
+        or clean_no_punc in confirm_words_ur
+        or any(p in clean_no_punc for p in confirm_phrases)
+        or any(w in confirm_words_en | confirm_words_ur for w in words_no_punc)
+    ):
+        if any(w in ["no", "nope", "cancel", "نہیں"] for w in words):
+            reply = "کوئی مسئلہ نہیں، یہ کینسل کر دیا گیا ہے۔ کیا آپ کو مزید کچھ درکار ہے؟" if is_urdu else "No problem at all, I have cancelled that. How else can I assist you?"
+        else:
+            reply = "جی سمجھ گئی، بتائیے مزید کیا معلومات درکار ہیں؟" if is_urdu else "Understood. How would you like to proceed?"
+        return {
+            "reply": reply,
+            "language": "ur" if is_urdu else "en",
+            "intent": "confirmation",
+            "outcome": "Resolved",
+            "needs_handoff": False,
+            "confidence": 1.0,
+        }
+
+    # 5. Quantity verification steps
     if word_count <= 4:
         qty = parse_quantity(text)
         if qty is not None:
@@ -2116,32 +2656,13 @@ def check_instant_fast_path(text: str, session_id: str, user_id: int | None = No
                 "quantity": qty,
             }
 
-    # 5. Yes / No confirmations
-    confirm_words_en = {"yes", "yeah", "yep", "sure", "ok", "okay", "confirm", "proceed", "no", "nope", "cancel"}
-    confirm_words_ur = {"جی", "ہاں", "جی ہاں", "نہیں", "ٹھیک ہے", "بالکل", "کینسل", "theek", "haan", "jee", "nahi"}
-    if word_count <= 3:
-        clean_no_punc = re.sub(r"[^\w\s]", "", clean)
-        if clean_no_punc in confirm_words_en or clean_no_punc in confirm_words_ur or any(w in confirm_words_en | confirm_words_ur for w in words):
-            if any(w in ["no", "nope", "cancel", "نہیں"] for w in words):
-                reply = "کوئی مسئلہ نہیں، یہ کینسل کر دیا گیا ہے۔ کیا آپ کو مزید کچھ درکار ہے؟" if is_urdu else "No problem at all, I have cancelled that. How else can I assist you?"
-            else:
-                reply = "جی سمجھ گئی، بتائیے مزید کیا معلومات درکار ہیں؟" if is_urdu else "Understood. How would you like to proceed?"
-            return {
-                "reply": reply,
-                "language": "ur" if is_urdu else "en",
-                "intent": "confirmation",
-                "outcome": "Resolved",
-                "needs_handoff": False,
-                "confidence": 1.0,
-            }
-
     # 6. Thank you / Bye
     farewell_words = {"bye", "goodbye", "thanks", "thank", "shukriya", "jazakallah", "allah hafiz", "khuda hafiz", "شکریہ", "اللہ حافظ", "خدا حافظ"}
     if any(w in clean for w in farewell_words) and word_count <= 6:
         if is_urdu:
-            reply = "ڈیجی بز پر رابطہ کرنے کا بہت شکریہ۔ اپنا خیال رکھیے گا، اللہ حافظ!"
+            reply = f"{b_name} پر رابطہ کرنے کا بہت شکریہ۔ اپنا خیال رکھیے گا، اللہ حافظ!"
         else:
-            reply = "Thank you for calling DigiBuzz Support. Have a wonderful day ahead! Goodbye."
+            reply = f"Thank you for contacting {b_name}. Have a wonderful day ahead! Goodbye."
         return {
             "reply": reply,
             "language": "ur" if is_urdu else "en",
@@ -2152,12 +2673,22 @@ def check_instant_fast_path(text: str, session_id: str, user_id: int | None = No
         }
 
     # 7. Greetings
-    greeting_words = {"hi", "hello", "hey", "salam", "assalam", "aoa", "adaab", "اسلام علیکم", "سلام", "آداب", "صبح بخیر"}
-    if any(w in words for w in greeting_words) and word_count <= 5:
+    greeting_words = {"hi", "hello", "hey", "salam", "assalam", "aoa", "adaab", "صبح بخیر"}
+    greeting_phrases = ["اسلام علیکم", "السلام علیکم", "salam", "assalam", "hello", "hi there", "good morning"]
+    if (any(w in words for w in greeting_words) or any(p in clean_no_punc for p in greeting_phrases)) and word_count <= 8:
         if is_urdu:
-            reply = "اسلام علیکم! ڈیجی بز سپورٹ میں خوش آمدید۔ میں آپ کی کیا مدد کر سکتی ہوں؟"
+            reply = f"اسلام علیکم! {b_name} میں خوش آمدید۔ میں آپ کی کیا مدد کر سکتی ہوں؟"
         else:
-            reply = "Hello! Welcome to DigiBuzz AI calling service. How may I assist you with our wholesale catalog today?"
+            default_greet = f"Hello! Welcome to {b_name} automated customer assistance. How may I assist you today?"
+            reply = get_business_setting("greeting", default_greet)
+        return {
+            "reply": reply,
+            "language": "ur" if is_urdu else "en",
+            "intent": "greeting",
+            "outcome": "Resolved",
+            "needs_handoff": False,
+            "confidence": 1.0,
+        }
         return {
             "reply": reply,
             "language": "ur" if is_urdu else "en",
@@ -2292,30 +2823,35 @@ class StreamingSentenceEmitter:
 
 def build_voice_system_instruction(user_id: int | None = None) -> str:
     """Build concise, conversational instructions tailored for low-latency live voice calls."""
+    b_name = get_business_setting("business_name", "our business")
+    b_type = get_business_setting("business_type", "Products & Services")
+    b_hours = get_business_setting("working_hours", "Monday to Saturday from 9:00 AM to 6:00 PM")
     faq_ctx = load_faqs_context(user_id)
     product_ctx = load_products_context(user_id)
     return f"""
-You are the DigiBuzz AI Calling Agent, speaking live with a customer over an active voice call.
+You are the automated AI Calling Assistant speaking live with a customer for {b_name} ({b_type}).
 
 KNOWLEDGE BASE:
 1. Operational FAQs (policies, delivery, payments):
 {faq_ctx}
 
-2. Product Catalog (wholesale products):
+2. Product Catalog & Services (prices in PKR):
 {product_ctx}
 
+3. Working Hours: {b_hours}
+
 CRITICAL RULES FOR LIVE VOICE CALL:
-1. BRANDING: You are "DigiBuzz AI Calling Agent". Speak professionally, warmly, and helpfully.
-2. ACCURACY: Answer using ONLY the FAQ knowledge base and Product Catalog above. State exact product names, specifications, stock status, and wholesale prices in PKR.
-3. SPOKEN VOICE FORMAT:
+1. AUTOMATED IDENTITY: Introduce yourself as an automated assistant. Never claim to be human.
+2. NO UNAUTHORIZED COMMITMENTS: Never promise refunds, unauthorized discounts, medical advice, delivery guarantees, or instant confirmations.
+3. ORDERS & APPOINTMENTS: Always inform callers that an order or appointment is a REQUEST waiting for admin confirmation. Never say "confirmed" or "booked" before admin confirms.
+4. ACCURACY: Answer using ONLY the FAQ knowledge base and Catalog above.
+5. SPOKEN VOICE FORMAT:
    - Speak in clear, natural, conversational sentences suitable for live Text-to-Speech audio.
    - Do NOT use markdown asterisks (*), hashtags (#), bullet points (-), emojis, or JSON formatting.
-   - Keep answers concise and direct: maximum 1 to 3 short sentences so the caller can listen easily.
-4. LANGUAGE:
-   - Speak in English by default.
-   - If the caller speaks or types in Urdu or Roman Urdu, respond politely in clear Urdu or English.
-5. ESCALATION: If the caller asks for an unlisted product, unknown policy, or asks for a human agent, state: "I am transferring your call to a dedicated Human Support Agent. Please hold on."
-6. OFF-TOPIC: If the user asks something completely outside DigiBuzz products, wholesale orders, or policies, politely decline: "I am sorry, I can only assist you with DigiBuzz products, wholesale orders, and store services."
+   - Keep answers concise and direct: maximum 1 to 2 short sentences.
+6. LANGUAGE: Speak in English or conversational Urdu depending on caller's language.
+7. ESCALATION: If the caller asks for a human agent or has an emergency/dispute, state: "I will connect you directly with a human staff member to assist you further."
+8. OFF-TOPIC: Politely decline any queries outside {b_name} offerings: "I am sorry, I can only assist you with {b_name} products and services."
 """
 
 
@@ -3079,7 +3615,8 @@ async def get_products(request: Request, category: str | None = Query(default=No
 
             where_sql = f"WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
             query_sql = f"""
-                SELECT p.id, p.name, p.category, p.brand, p.price, p.stock_status, p.description, p.user_id,
+                SELECT p.id, p.name, p.category, p.brand, p.price, p.stock_status, p.description,
+                       COALESCE(p.item_type, 'product') AS item_type, p.user_id,
                        COALESCE(u.full_name, 'Platform') AS owner_name
                 FROM products p
                 LEFT JOIN users u ON p.user_id = u.id
@@ -3103,8 +3640,9 @@ async def create_product(product: ProductCreate, current_user: dict = Depends(ge
             max_id = conn.execute("SELECT COALESCE(MAX(id), 0) FROM products").fetchone()[0]
             conn.execute("DELETE FROM sqlite_sequence WHERE name = 'products'")
             conn.execute("INSERT INTO sqlite_sequence (name, seq) VALUES ('products', ?)", (max_id,))
+            item_type = getattr(product, "item_type", "product") or "product"
             cursor = conn.execute(
-                "INSERT INTO products (name, category, brand, price, stock_status, description, user_id) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO products (name, category, brand, price, stock_status, description, item_type, user_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     product.name.strip(),
                     product.category.strip(),
@@ -3112,11 +3650,12 @@ async def create_product(product: ProductCreate, current_user: dict = Depends(ge
                     product.price,
                     product.stock_status.strip(),
                     product.description.strip(),
+                    item_type,
                     user_id,
                 ),
             )
             row = conn.execute(
-                "SELECT id, name, category, brand, price, stock_status, description, user_id FROM products WHERE id = ?",
+                "SELECT id, name, category, brand, price, stock_status, description, item_type, user_id FROM products WHERE id = ?",
                 (cursor.lastrowid,),
             ).fetchone()
             return dict(row)
@@ -3140,8 +3679,9 @@ async def update_product(product_id: int, product: ProductUpdate, current_user: 
             if current_user["role"] != "admin" and existing["user_id"] != current_user["id"]:
                 return 403
 
+            item_type = getattr(product, "item_type", "product") or "product"
             conn.execute(
-                "UPDATE products SET name = ?, category = ?, brand = ?, price = ?, stock_status = ?, description = ? WHERE id = ?",
+                "UPDATE products SET name = ?, category = ?, brand = ?, price = ?, stock_status = ?, description = ?, item_type = ? WHERE id = ?",
                 (
                     product.name.strip(),
                     product.category.strip(),
@@ -3149,11 +3689,12 @@ async def update_product(product_id: int, product: ProductUpdate, current_user: 
                     product.price,
                     product.stock_status.strip(),
                     product.description.strip(),
+                    item_type,
                     int(product_id),
                 ),
             )
             row = conn.execute(
-                "SELECT id, name, category, brand, price, stock_status, description, user_id FROM products WHERE id = ?",
+                "SELECT id, name, category, brand, price, stock_status, description, item_type, user_id FROM products WHERE id = ?",
                 (int(product_id),),
             ).fetchone()
             return dict(row)
@@ -3332,7 +3873,504 @@ async def sync_client_calls(req: SyncCallRequest, request: Request):
 
 
 # =====================================================================
-# 18. Main Server Entrypoint
+# 17. Business Settings Endpoints (Phase 4 Generic Store & Services)
+# =====================================================================
+@app.get("/api/business-settings")
+async def get_business_settings_endpoint():
+    """Return all platform business settings."""
+    return await asyncio.to_thread(get_all_business_settings)
+
+
+@app.put("/api/business-settings")
+async def update_business_settings_endpoint(settings: BusinessSettingsUpdate, admin: dict = Depends(require_admin)):
+    """Update platform business settings (Admin only)."""
+    def _update():
+        updates = {k: v for k, v in settings.model_dump().items() if v is not None}
+        if not updates:
+            return get_all_business_settings()
+        with db() as conn:
+            for k, v in updates.items():
+                conn.execute(
+                    """
+                    INSERT INTO business_settings (key, value) VALUES (?, ?)
+                    ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                    """,
+                    (k, str(v)),
+                )
+        refresh_business_settings_cache()
+        CACHED_STREAM_SYSTEM_INSTRUCTION.clear()
+        return get_all_business_settings()
+
+    return await asyncio.to_thread(_update)
+
+
+# =====================================================================
+# 18. Customer & Admin Orders Endpoints (Phase 4 Orders & Audit Flow)
+# =====================================================================
+@app.post("/api/orders")
+async def create_order_endpoint(req: CreateOrderRequest, request: Request):
+    """
+    Create a new order / appointment booking.
+    Order is ALWAYS created with status='pending_admin_confirmation'.
+    """
+    user = await get_optional_user(request)
+    user_id = user["id"] if user else None
+
+    def _create():
+        with db() as conn:
+            prod = conn.execute("SELECT * FROM products WHERE id = ?", (req.item_id,)).fetchone()
+            if not prod:
+                raise HTTPException(status_code=404, detail="Item not found.")
+
+            c_name = req.customer_name or (user["full_name"] if user else "Customer")
+            c_phone = req.customer_phone or (user["phone"] if user else "")
+
+            # Generate unique order number ORD-XXXX
+            order_num = f"ORD-{random.randint(1000, 9999)}"
+            while conn.execute("SELECT 1 FROM orders WHERE order_number = ?", (order_num,)).fetchone():
+                order_num = f"ORD-{random.randint(1000, 9999)}"
+
+            unit_price = prod["price"]
+            total_pkr = unit_price * req.quantity
+            now_str = now()
+
+            conflict_info = check_service_conflict(conn, req.item_id, req.preferred_datetime)
+
+            cursor = conn.execute(
+                """
+                INSERT INTO orders (
+                    order_number, user_id, call_session_id, customer_name, customer_phone,
+                    item_id, item_name_snapshot, unit_price_snapshot, quantity,
+                    preferred_datetime, total_pkr, status, is_locked, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending_admin_confirmation', 0, ?, ?)
+                """,
+                (
+                    order_num, user_id, req.call_session_id, c_name, c_phone,
+                    req.item_id, prod["name"], unit_price, req.quantity,
+                    req.preferred_datetime, total_pkr, now_str, now_str,
+                ),
+            )
+            order_id = cursor.lastrowid
+
+            # Append initial audit event
+            conn.execute(
+                """
+                INSERT INTO order_events (order_id, actor_user_id, actor_role, event_type, old_status, new_status, note, created_at)
+                VALUES (?, ?, 'customer', 'order_created', NULL, 'pending_admin_confirmation', 'Order request submitted waiting for admin confirmation', ?)
+                """,
+                (order_id, user_id, now_str),
+            )
+
+            created_order = dict(conn.execute("SELECT * FROM orders WHERE id = ?", (order_id,)).fetchone())
+            created_order["service_conflict"] = conflict_info
+            return created_order
+
+    return await asyncio.to_thread(_create)
+
+
+@app.get("/api/orders/mine")
+async def get_my_orders(current_user: dict = Depends(get_current_user)):
+    """Return all orders belonging to authenticated customer with BOLA protection."""
+    def _query():
+        with db() as conn:
+            rows = conn.execute(
+                """
+                SELECT o.*, p.category, COALESCE(p.item_type, 'product') AS item_type
+                FROM orders o
+                LEFT JOIN products p ON o.item_id = p.id
+                WHERE o.user_id = ?
+                ORDER BY o.id DESC
+                """,
+                (current_user["id"],),
+            ).fetchall()
+            return [dict(r) for r in rows]
+
+    return await asyncio.to_thread(_query)
+
+
+@app.post("/api/orders/{order_id}/cancel-request")
+async def request_order_cancellation(order_id: int, req: OrderCancelRequest, current_user: dict = Depends(get_current_user)):
+    """Request order cancellation for a customer's order."""
+    def _cancel():
+        with db() as conn:
+            order = conn.execute("SELECT * FROM orders WHERE id = ?", (order_id,)).fetchone()
+            if not order:
+                raise HTTPException(status_code=404, detail="Order not found.")
+
+            # BOLA check: only order owner or admin can request cancel
+            if current_user["role"] != "admin" and order["user_id"] != current_user["id"]:
+                raise HTTPException(status_code=403, detail="Access denied. You do not own this order.")
+
+            if order["is_locked"] or order["status"] in LOCKED_ORDER_STATUSES:
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"Order #{order['order_number']} is in locked status '{order['status']}' and cannot be cancelled.",
+                )
+
+            if order["status"] == "cancel_requested":
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"A cancellation request is already pending for order #{order['order_number']}.",
+                )
+
+            reason_str = req.reason.strip() if req.reason else "Customer requested cancellation via portal"
+            return validate_and_apply_order_transition(
+                conn=conn,
+                order_id=order_id,
+                target_status="cancel_requested",
+                actor_user_id=current_user["id"],
+                actor_role=current_user["role"],
+                note=reason_str,
+                event_type="cancel_requested",
+            )
+
+    return await asyncio.to_thread(_cancel)
+
+
+@app.delete("/api/orders/{order_id}")
+async def delete_order_prohibited(order_id: int):
+    """Orders cannot be deleted; financial and audit trail is strictly immutable."""
+    raise HTTPException(
+        status_code=405,
+        detail="Order deletion is prohibited. Orders are immutable audit records; use status transitions instead.",
+    )
+
+
+@app.get("/api/admin/orders")
+async def list_admin_orders(
+    status_filter: str | None = Query(default=None, alias="status"),
+    search: str | None = Query(default=None),
+    customer_id: int | None = Query(default=None),
+    admin: dict = Depends(require_admin),
+):
+    """Admin view: List all orders with filters, search, and double-booking warning."""
+    def _query():
+        with db() as conn:
+            where_clauses = []
+            params = []
+
+            if status_filter and status_filter.strip():
+                where_clauses.append("o.status = ?")
+                params.append(status_filter.strip())
+
+            if customer_id:
+                where_clauses.append("o.user_id = ?")
+                params.append(customer_id)
+
+            if search and search.strip():
+                s = f"%{search.strip()}%"
+                where_clauses.append("(o.order_number LIKE ? OR o.customer_name LIKE ? OR o.customer_phone LIKE ? OR o.item_name_snapshot LIKE ?)")
+                params.extend([s, s, s, s])
+
+            where_sql = f"WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
+            sql = f"""
+                SELECT o.*, u.email AS user_email, COALESCE(p.item_type, 'product') AS item_type
+                FROM orders o
+                LEFT JOIN users u ON o.user_id = u.id
+                LEFT JOIN products p ON o.item_id = p.id
+                {where_sql}
+                ORDER BY
+                    CASE WHEN o.status = 'pending_admin_confirmation' THEN 1
+                         WHEN o.status = 'cancel_requested' THEN 2
+                         ELSE 3 END,
+                    o.id DESC
+            """
+            rows = conn.execute(sql, params).fetchall()
+            result = []
+            for r in rows:
+                d = dict(r)
+                if d.get("item_type") == "service" and d.get("preferred_datetime"):
+                    d["double_booking_warning"] = check_service_conflict(
+                        conn, d["item_id"], d["preferred_datetime"], exclude_order_id=d["id"]
+                    )
+                else:
+                    d["double_booking_warning"] = {"has_conflict": False}
+                result.append(d)
+            return result
+
+    return await asyncio.to_thread(_query)
+
+
+@app.get("/api/admin/orders/summary")
+async def get_admin_orders_summary(admin: dict = Depends(require_admin)):
+    """Return summary counts of pending confirmation, cancel requests, and totals."""
+    def _summary():
+        with db() as conn:
+            pending = conn.execute("SELECT COUNT(*) AS c FROM orders WHERE status = 'pending_admin_confirmation'").fetchone()["c"]
+            cancel_req = conn.execute("SELECT COUNT(*) AS c FROM orders WHERE status = 'cancel_requested'").fetchone()["c"]
+            confirmed = conn.execute("SELECT COUNT(*) AS c FROM orders WHERE status = 'confirmed'").fetchone()["c"]
+            total = conn.execute("SELECT COUNT(*) AS c FROM orders").fetchone()["c"]
+            return {
+                "pending_confirmation_count": pending,
+                "cancel_requested_count": cancel_req,
+                "confirmed_count": confirmed,
+                "total_count": total,
+            }
+
+    return await asyncio.to_thread(_summary)
+
+
+@app.post("/api/admin/orders/{order_id}/decision")
+async def decide_order(order_id: int, req: OrderDecisionRequest, admin: dict = Depends(require_admin)):
+    """Admin confirms, rejects, approves cancel, rejects cancel, or completes an order."""
+    def _decide():
+        with db() as conn:
+            order = conn.execute("SELECT * FROM orders WHERE id = ?", (order_id,)).fetchone()
+            if not order:
+                raise HTTPException(status_code=404, detail="Order not found.")
+
+            curr = order["status"]
+            action = req.action
+
+            if action == "confirm":
+                if curr != "pending_admin_confirmation":
+                    raise HTTPException(status_code=409, detail=f"Cannot confirm order in status '{curr}'.")
+                return validate_and_apply_order_transition(
+                    conn=conn,
+                    order_id=order_id,
+                    target_status="confirmed",
+                    actor_user_id=admin["id"],
+                    actor_role="admin",
+                    note=req.admin_note,
+                    event_type="admin_confirmed",
+                )
+
+            elif action == "reject":
+                if curr != "pending_admin_confirmation":
+                    raise HTTPException(status_code=409, detail=f"Cannot reject order in status '{curr}'.")
+                if not req.admin_note or not req.admin_note.strip():
+                    raise HTTPException(status_code=400, detail="Rejection requires an explanatory admin note.")
+                return validate_and_apply_order_transition(
+                    conn=conn,
+                    order_id=order_id,
+                    target_status="rejected",
+                    actor_user_id=admin["id"],
+                    actor_role="admin",
+                    note=req.admin_note.strip(),
+                    event_type="admin_rejected",
+                )
+
+            elif action == "approve_cancel":
+                if curr != "cancel_requested":
+                    raise HTTPException(status_code=409, detail=f"Cannot approve cancellation for status '{curr}'.")
+                return validate_and_apply_order_transition(
+                    conn=conn,
+                    order_id=order_id,
+                    target_status="cancelled",
+                    actor_user_id=admin["id"],
+                    actor_role="admin",
+                    note=req.admin_note,
+                    event_type="cancel_approved",
+                )
+
+            elif action == "reject_cancel":
+                if curr != "cancel_requested":
+                    raise HTTPException(status_code=409, detail=f"Cannot reject cancellation for status '{curr}'.")
+                last_event = conn.execute(
+                    """
+                    SELECT old_status FROM order_events
+                    WHERE order_id = ? AND new_status = 'cancel_requested'
+                    ORDER BY id DESC LIMIT 1
+                    """,
+                    (order_id,),
+                ).fetchone()
+                revert_status = last_event["old_status"] if last_event and last_event["old_status"] else "confirmed"
+                return validate_and_apply_order_transition(
+                    conn=conn,
+                    order_id=order_id,
+                    target_status=revert_status,
+                    actor_user_id=admin["id"],
+                    actor_role="admin",
+                    note=req.admin_note or "Admin rejected cancellation request",
+                    event_type="cancel_rejected",
+                )
+
+            elif action == "complete":
+                if curr != "confirmed":
+                    raise HTTPException(status_code=409, detail=f"Only confirmed orders can be marked completed.")
+                return validate_and_apply_order_transition(
+                    conn=conn,
+                    order_id=order_id,
+                    target_status="completed",
+                    actor_user_id=admin["id"],
+                    actor_role="admin",
+                    note=req.admin_note,
+                    event_type="order_completed",
+                )
+
+            else:
+                raise HTTPException(status_code=400, detail=f"Unknown decision action '{action}'.")
+
+    return await asyncio.to_thread(_decide)
+
+
+@app.get("/api/admin/orders/{order_id}/events")
+async def get_order_audit_events(order_id: int, admin: dict = Depends(require_admin)):
+    """Return append-only audit trail for an order."""
+    def _query():
+        with db() as conn:
+            rows = conn.execute(
+                """
+                SELECT e.*, u.email AS actor_email, u.full_name AS actor_name
+                FROM order_events e
+                LEFT JOIN users u ON e.actor_user_id = u.id
+                WHERE e.order_id = ?
+                ORDER BY e.id ASC
+                """,
+                (order_id,),
+            ).fetchall()
+            return [dict(r) for r in rows]
+
+    return await asyncio.to_thread(_query)
+
+
+# =====================================================================
+# 19. Compliance & Human Handoff Endpoints (Phase 7)
+# =====================================================================
+@app.get("/api/admin/handoffs")
+async def list_admin_handoffs(
+    status_filter: str | None = Query(default=None, alias="status"),
+    admin: dict = Depends(require_admin),
+):
+    """Admin view: List all human handoff requests ordered by priority."""
+    def _query():
+        with db() as conn:
+            where_sql = ""
+            params = []
+            if status_filter and status_filter.strip() and status_filter != "all":
+                where_sql = "WHERE h.status = ?"
+                params.append(status_filter.strip())
+
+            sql = f"""
+                SELECT h.*, c.session_id, c.customer_name AS call_customer_name,
+                       c.contact_phone AS call_customer_phone, u.email AS user_email
+                FROM handoff_requests h
+                LEFT JOIN calls c ON h.call_id = c.id
+                LEFT JOIN users u ON h.user_id = u.id
+                {where_sql}
+                ORDER BY
+                    CASE h.priority WHEN 'urgent' THEN 1 WHEN 'high' THEN 2 ELSE 3 END,
+                    CASE h.status WHEN 'open' THEN 1 WHEN 'assigned' THEN 2 ELSE 3 END,
+                    h.id DESC
+            """
+            rows = conn.execute(sql, params).fetchall()
+            return [dict(r) for r in rows]
+
+    return await asyncio.to_thread(_query)
+
+
+@app.get("/api/admin/handoffs/summary")
+async def get_admin_handoffs_summary(admin: dict = Depends(require_admin)):
+    """Return summary counts of open, urgent, and assigned handoffs."""
+    def _summary():
+        with db() as conn:
+            open_c = conn.execute("SELECT COUNT(*) AS c FROM handoff_requests WHERE status = 'open'").fetchone()["c"]
+            urgent_c = conn.execute("SELECT COUNT(*) AS c FROM handoff_requests WHERE status = 'open' AND priority = 'urgent'").fetchone()["c"]
+            assigned_c = conn.execute("SELECT COUNT(*) AS c FROM handoff_requests WHERE status = 'assigned'").fetchone()["c"]
+            total_c = conn.execute("SELECT COUNT(*) AS c FROM handoff_requests").fetchone()["c"]
+            return {
+                "open_count": open_c,
+                "urgent_count": urgent_c,
+                "assigned_count": assigned_c,
+                "total_count": total_c,
+            }
+
+    return await asyncio.to_thread(_summary)
+
+
+@app.post("/api/admin/handoffs/{handoff_id}/assign")
+async def assign_handoff(handoff_id: int, admin: dict = Depends(require_admin)):
+    """Assign handoff request to current administrator."""
+    def _assign():
+        with db() as conn:
+            h = conn.execute("SELECT * FROM handoff_requests WHERE id = ?", (handoff_id,)).fetchone()
+            if not h:
+                raise HTTPException(status_code=404, detail="Handoff request not found.")
+            now_str = now()
+            conn.execute(
+                """
+                UPDATE handoff_requests
+                SET assigned_to = ?, assigned_at = ?, status = 'assigned'
+                WHERE id = ?
+                """,
+                (admin["email"], now_str, handoff_id),
+            )
+            if h["call_id"]:
+                conn.execute("UPDATE calls SET follow_up_status = 'pending_staff' WHERE id = ?", (h["call_id"],))
+            return dict(conn.execute("SELECT * FROM handoff_requests WHERE id = ?", (handoff_id,)).fetchone())
+
+    return await asyncio.to_thread(_assign)
+
+
+@app.post("/api/admin/handoffs/{handoff_id}/resolve")
+async def resolve_handoff(handoff_id: int, req: HandoffResolveRequest, admin: dict = Depends(require_admin)):
+    """Resolve handoff request with staff notes."""
+    def _resolve():
+        with db() as conn:
+            h = conn.execute("SELECT * FROM handoff_requests WHERE id = ?", (handoff_id,)).fetchone()
+            if not h:
+                raise HTTPException(status_code=404, detail="Handoff request not found.")
+            now_str = now()
+            conn.execute(
+                """
+                UPDATE handoff_requests
+                SET status = 'resolved', resolved_at = ?, resolved_by = ?, staff_note = ?
+                WHERE id = ?
+                """,
+                (now_str, admin["email"], req.staff_note, handoff_id),
+            )
+            if h["call_id"]:
+                conn.execute("UPDATE calls SET follow_up_status = 'closed' WHERE id = ?", (h["call_id"],))
+            return dict(conn.execute("SELECT * FROM handoff_requests WHERE id = ?", (handoff_id,)).fetchone())
+
+    return await asyncio.to_thread(_resolve)
+
+
+@app.post("/api/admin/handoffs/{handoff_id}/priority")
+async def update_handoff_priority(handoff_id: int, req: HandoffPriorityRequest, admin: dict = Depends(require_admin)):
+    """Update priority level of a handoff request."""
+    def _prio():
+        with db() as conn:
+            h = conn.execute("SELECT * FROM handoff_requests WHERE id = ?", (handoff_id,)).fetchone()
+            if not h:
+                raise HTTPException(status_code=404, detail="Handoff request not found.")
+            conn.execute("UPDATE handoff_requests SET priority = ? WHERE id = ?", (req.priority, handoff_id))
+            return dict(conn.execute("SELECT * FROM handoff_requests WHERE id = ?", (handoff_id,)).fetchone())
+
+    return await asyncio.to_thread(_prio)
+
+
+@app.get("/api/calls/{session_id}/handoff-status")
+async def get_session_handoff_status(session_id: str):
+    """Check customer handoff status for the active call session."""
+    def _query():
+        with db() as conn:
+            h = conn.execute(
+                """
+                SELECT id, trigger_type, priority, status, assigned_to, created_at
+                FROM handoff_requests
+                WHERE session_id = ?
+                ORDER BY id DESC LIMIT 1
+                """,
+                (session_id,),
+            ).fetchone()
+            if not h:
+                return {"has_handoff": False, "status": "none"}
+            return {
+                "has_handoff": True,
+                "handoff_id": h["id"],
+                "trigger_type": h["trigger_type"],
+                "priority": h["priority"],
+                "status": h["status"],
+                "assigned_to": h["assigned_to"],
+                "created_at": h["created_at"],
+            }
+
+    return await asyncio.to_thread(_query)
+
+
+# =====================================================================
+# 20. Main Server Entrypoint
 # =====================================================================
 if __name__ == "__main__":
     import uvicorn

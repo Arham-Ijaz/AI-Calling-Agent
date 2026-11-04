@@ -2274,3 +2274,222 @@ button, input, select, textarea {
   50% { opacity: 0; }
 }
 
+/* =====================================================================
+   Phase 4 & 7: Orders, Handoffs, and Status Flow Styles
+   ===================================================================== */
+.order-status-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  padding: 0.25rem 0.65rem;
+  border-radius: 9999px;
+  font-size: 0.76rem;
+  font-weight: 600;
+  text-transform: capitalize;
+  letter-spacing: 0.02em;
+}
+
+.order-status-badge.status-pending_admin_confirmation {
+  background: rgba(245, 158, 11, 0.15);
+  color: #d97706;
+  border: 1px solid rgba(245, 158, 11, 0.3);
+}
+
+.order-status-badge.status-confirmed {
+  background: rgba(59, 130, 246, 0.15);
+  color: #2563eb;
+  border: 1px solid rgba(59, 130, 246, 0.3);
+}
+
+.order-status-badge.status-completed {
+  background: rgba(16, 185, 129, 0.15);
+  color: #059669;
+  border: 1px solid rgba(16, 185, 129, 0.3);
+}
+
+.order-status-badge.status-cancel_requested {
+  background: rgba(234, 88, 12, 0.15);
+  color: #ea580c;
+  border: 1px solid rgba(234, 88, 12, 0.3);
+  animation: pulse-amber 1.8s infinite;
+}
+
+.order-status-badge.status-cancelled {
+  background: rgba(107, 114, 128, 0.15);
+  color: #4b5563;
+  border: 1px solid rgba(107, 114, 128, 0.3);
+}
+
+.order-status-badge.status-rejected {
+  background: rgba(239, 68, 68, 0.15);
+  color: #dc2626;
+  border: 1px solid rgba(239, 68, 68, 0.3);
+}
+
+.conflict-warning-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+  padding: 0.2rem 0.5rem;
+  border-radius: 6px;
+  background: rgba(239, 68, 68, 0.15);
+  border: 1px solid rgba(239, 68, 68, 0.4);
+  color: #dc2626;
+  font-size: 0.72rem;
+  font-weight: 600;
+  margin-top: 0.25rem;
+}
+
+.admin-action-box {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 1.25rem;
+  margin-bottom: 1.5rem;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.05);
+}
+
+.admin-action-box.highlight-box {
+  border-color: rgba(245, 158, 11, 0.5);
+  background: linear-gradient(to right bottom, var(--surface), rgba(245, 158, 11, 0.03));
+}
+
+.admin-action-box.urgent-box {
+  border-color: rgba(239, 68, 68, 0.5);
+  background: linear-gradient(to right bottom, var(--surface), rgba(239, 68, 68, 0.04));
+}
+
+.action-box-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 1rem;
+}
+
+.action-box-title {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  font-size: 1.1rem;
+  font-weight: 700;
+  margin: 0;
+}
+
+.count-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0.15rem 0.55rem;
+  border-radius: 9999px;
+  font-size: 0.75rem;
+  font-weight: 700;
+  color: #fff;
+  background: var(--brand);
+}
+
+.count-badge.badge-urgent {
+  background: #dc2626;
+  animation: pulse 1.2s infinite;
+}
+
+.count-badge.badge-pending {
+  background: #d97706;
+}
+
+.handoff-card-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
+  gap: 1rem;
+}
+
+.handoff-card {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 1rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.6rem;
+}
+
+.handoff-card.urgent-highlight {
+  border: 2px solid #ef4444;
+  box-shadow: 0 0 10px rgba(239, 68, 68, 0.2);
+}
+
+.handoff-priority-pill {
+  padding: 0.15rem 0.5rem;
+  border-radius: 4px;
+  font-size: 0.72rem;
+  font-weight: 700;
+  text-transform: uppercase;
+}
+
+.handoff-priority-pill.urgent { background: #fee2e2; color: #991b1b; }
+.handoff-priority-pill.high { background: #ffedd5; color: #9a3412; }
+.handoff-priority-pill.normal { background: #e0e7ff; color: #3730a3; }
+
+.audit-timeline {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+  position: relative;
+  padding-left: 1rem;
+  border-left: 2px solid var(--border);
+}
+
+.audit-event-item {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+  font-size: 0.85rem;
+}
+
+.audit-event-item::before {
+  content: "";
+  position: absolute;
+  left: calc(-1rem - 5px);
+  top: 4px;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--brand);
+}
+
+.toast-notification-container {
+  position: fixed;
+  bottom: 2rem;
+  right: 2rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+  z-index: 9999;
+  pointer-events: none;
+}
+
+.notification-toast {
+  pointer-events: auto;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-left: 4px solid var(--brand);
+  border-radius: 8px;
+  padding: 0.85rem 1.25rem;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
+  font-size: 0.88rem;
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  animation: slideInRight 0.3s ease-out;
+}
+
+.notification-toast.urgent {
+  border-left-color: #dc2626;
+}
+
+@keyframes slideInRight {
+  from { transform: translateX(100%); opacity: 0; }
+  to { transform: translateX(0); opacity: 1; }
+}
+
+

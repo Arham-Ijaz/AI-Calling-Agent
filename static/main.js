@@ -279,6 +279,7 @@ function navigateTo(page) {
   if (page === "logs" && typeof loadCallLogs === "function") loadCallLogs();
   if (page === "faqs" && typeof loadFAQs === "function") loadFAQs();
   if (page === "products" && typeof loadProducts === "function") loadProducts();
+  if (page === "orders" && typeof loadMyOrders === "function") loadMyOrders();
   if (page === "admin" && typeof loadAdminData === "function") loadAdminData();
   if (page === "settings") refreshSettingsPage();
 }
@@ -2255,8 +2256,145 @@ document.addEventListener("DOMContentLoaded", () => {
     });
   }
 
+  // Customer Orders controls (Phase 4)
+  on("btnRefreshMyOrders", "click", loadMyOrders);
+  on("customerCancelOrderModalClose", "click", closeCustomerCancelModal);
+  on("customerCancelOrderModalCancel", "click", closeCustomerCancelModal);
+  on("btnConfirmCustomerCancelOrder", "click", handleConfirmCustomerCancel);
+
   // Check key status only if admin
   if (typeof authState !== "undefined" && authState && authState.isAdmin) {
     refreshKeyStatus();
   }
 });
+
+// =====================================================================
+// Phase 4: Customer "My Orders" Management
+// =====================================================================
+async function loadMyOrders() {
+  const tbody = $("myOrdersTableBody");
+  const counter = $("myOrdersCount");
+  if (!tbody) return;
+
+  if (typeof authState !== "undefined" && !authState.user) {
+    tbody.innerHTML = `<tr><td colspan="9" class="loading-row">Please <a href="#" onclick="openAuthModal('login');return false;">Sign In</a> to view your personal orders.</td></tr>`;
+    if (counter) counter.textContent = "0 orders";
+    return;
+  }
+
+  tbody.innerHTML = `<tr><td colspan="9" class="loading-row">Loading your orders…</td></tr>`;
+
+  try {
+    const res = await fetch("/api/orders/mine", { credentials: "same-origin" });
+    if (!res.ok) {
+      if (res.status === 401) {
+        tbody.innerHTML = `<tr><td colspan="9" class="loading-row">Please sign in to view your orders.</td></tr>`;
+        return;
+      }
+      throw new Error(`HTTP ${res.status}`);
+    }
+    const orders = await res.json();
+    if (counter) counter.textContent = `${orders.length} order${orders.length === 1 ? "" : "s"}`;
+
+    if (!orders || orders.length === 0) {
+      tbody.innerHTML = `<tr><td colspan="9" class="loading-row" style="color:var(--text-muted)">You have not placed any orders yet. Speak with our AI agent to place an order or schedule a booking!</td></tr>`;
+      return;
+    }
+
+    tbody.innerHTML = orders.map((o) => {
+      const isLocked = Boolean(o.is_locked) || ["cancelled", "rejected", "completed"].includes(o.status);
+      const canCancel = !isLocked && ["pending_admin_confirmation", "confirmed"].includes(o.status);
+
+      let statusLabel = o.status.replace(/_/g, " ");
+      if (o.status === "pending_admin_confirmation") statusLabel = "Pending Confirmation";
+
+      let actionHtml = `<span class="text-muted" style="font-size:0.78rem;">No actions</span>`;
+      if (canCancel) {
+        actionHtml = `<button class="btn btn-sm btn-outline-danger btn-cancel-order" data-order-id="${o.id}" data-order-num="${escapeHtml(o.order_number)}">Request Cancel</button>`;
+      } else if (o.status === "cancel_requested") {
+        actionHtml = `<span class="text-muted" style="font-size:0.78rem; color:var(--amber);">Cancel Pending</span>`;
+      } else if (isLocked) {
+        actionHtml = `<span class="text-muted" style="font-size:0.78rem;">Locked 🔒</span>`;
+      }
+
+      const adminNote = o.admin_note ? `<span title="${escapeHtml(o.admin_note)}" style="color:var(--text);font-style:italic;">"${escapeHtml(o.admin_note.slice(0, 35))}${o.admin_note.length > 35 ? '…' : ''}"</span>` : `<span class="text-muted">—</span>`;
+      const schedTime = o.preferred_datetime ? escapeHtml(o.preferred_datetime) : `<span class="text-muted">—</span>`;
+
+      return `
+        <tr>
+          <td><strong class="mono">${escapeHtml(o.order_number)}</strong></td>
+          <td><strong>${escapeHtml(o.item_name_snapshot || 'Item')}</strong></td>
+          <td><span class="role-badge ${o.item_type === 'service' ? 'admin' : 'member'}">${escapeHtml(o.item_type || 'product')}</span></td>
+          <td>${o.quantity}</td>
+          <td><strong>PKR ${(o.total_pkr || 0).toLocaleString()}</strong></td>
+          <td>${schedTime}</td>
+          <td><span class="order-status-badge status-${escapeHtml(o.status)}">${escapeHtml(statusLabel)}</span></td>
+          <td>${adminNote}</td>
+          <td>${actionHtml}</td>
+        </tr>
+      `;
+    }).join("");
+
+    // Attach cancel click handlers
+    tbody.querySelectorAll(".btn-cancel-order").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        openCustomerCancelModal(btn.dataset.orderId, btn.dataset.orderNum);
+      });
+    });
+
+  } catch (err) {
+    console.error("Failed to load customer orders:", err);
+    tbody.innerHTML = `<tr><td colspan="9" class="loading-row" style="color:var(--red)">Failed to load orders: ${err.message}</td></tr>`;
+  }
+}
+
+function openCustomerCancelModal(orderId, orderNum) {
+  const modal = $("customerCancelOrderModal");
+  const hiddenId = $("customerCancelOrderId");
+  const desc = $("customerCancelOrderDesc");
+  const reasonInput = $("customerCancelReasonInput");
+  const err = $("customerCancelError");
+
+  if (!modal || !hiddenId) return;
+  hiddenId.value = orderId;
+  if (desc) desc.textContent = `Are you sure you want to request cancellation for order #${orderNum}? An administrator will review your request.`;
+  if (reasonInput) reasonInput.value = "";
+  if (err) { err.textContent = ""; err.classList.add("hidden"); }
+  modal.classList.remove("hidden");
+}
+
+function closeCustomerCancelModal() {
+  const modal = $("customerCancelOrderModal");
+  if (modal) modal.classList.add("hidden");
+}
+
+async function handleConfirmCustomerCancel() {
+  const orderId = $("customerCancelOrderId")?.value;
+  const reason = $("customerCancelReasonInput")?.value?.trim() || "";
+  const err = $("customerCancelError");
+
+  if (!orderId) return;
+
+  try {
+    const res = await fetch(`/api/orders/${orderId}/cancel-request`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ reason }),
+      credentials: "same-origin",
+    });
+
+    if (!res.ok) {
+      const data = await res.json().catch(() => ({}));
+      throw new Error(data.detail || `Server error (${res.status})`);
+    }
+
+    closeCustomerCancelModal();
+    loadMyOrders();
+    alert("Cancellation request submitted successfully. Administrator will review it.");
+  } catch (ex) {
+    if (err) {
+      err.textContent = ex.message;
+      err.classList.remove("hidden");
+    }
+  }
+}

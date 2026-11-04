@@ -1,125 +1,91 @@
-# Project Final Report: AI Customer Calling Agent
+# AI Calling Agent Benchmark & Verification Report
 
-**Project Title**: DigiBuzz AI Customer Calling Agent for B2B Retail Networks  
-**Domain**: B2B Wholesale Commerce, Voice AI, Customer Service Automation  
-**Author / Candidate**: Project Submitter  
-**Date**: October 2026  
-
----
-
-## 1. Executive Summary
-
-This report documents the design, technical architecture, implementation, and empirical evaluation of **DigiBuzz**, an automated AI Customer Calling Agent. The solution addresses the operational bottlenecks experienced by small retail shopkeepers who need instant pricing, stock verification, and operational guidance (deliveries, khata credit tracking, refunds) without waiting in long human call center queues.
-
-The system is delivered as a production-grade, full-stack application featuring a high-performance **FastAPI** backend, **Google Gemini AI** (`gemini-flash-lite-latest`) for grounded natural language comprehension, an embedded **SQLite** relational database with automatic gapless sequential re-indexing, **gTTS** text-to-speech synthesis with immediate filler speech, and a browser-based calling desk leveraging native **Web Speech API** for speech-to-text.
+**Evaluation Timestamp:** 2026-11-05 02:07:52  
+**Total Evaluated Queries:** 45  
+**Pipeline Coverage:** Phase 4 (Orders & Admin Confirmation), Phase 7 (Compliance & Human Handoff), Phase 9 (Low-Latency Voice Stream).
 
 ---
 
-## 2. Requirements & Capabilities Fulfillment
+## 1. Executive Summary Metrics
 
-| Requirement | Implementation Detail | Status |
-| :--- | :--- | :---: |
-| **Start/End Session & Transcripts** | Dedicated UI controls with live call duration timer; turn-by-turn chat transcript with auto-scrolling. | ✅ Complete |
-| **Speech-to-Text & Text-to-Speech** | In-browser Web Speech API for voice recognition; server-side gTTS stream (`/api/tts`) with private cache headers. | ✅ Complete |
-| **Immediate Filler Speech** | Sub-300ms audio filler playback (*"Let me check that for you..."*) prevents dead air while Gemini processes. | ✅ Complete |
-| **Auto-Microphone Arming** | Automatic mic turn-on upon AI speech completion; half-duplex mute during AI playback to prevent echo. | ✅ Complete |
-| **Voice Call Termination** | Voice-triggered call termination on phrases like *"End call"*, *"Finish call"*, or *"Bye"*. | ✅ Complete |
-| **Interactive FAQ Carousel** | Horizontal slide bar for FAQ suggestions with left/right buttons, drag-to-scroll, and mouse-wheel support. | ✅ Complete |
-| **Defined Intents ($\ge 3$)** | 7 distinct intents: `product_inquiry`, `business_hours`, `delivery_time`, `digital_khata_usage`, `minimum_order`, `human_handoff`, `off_topic`. | ✅ Complete |
-| **Dynamic Knowledge Base** | Injected operational knowledge (`faq.json`) + 21 catalog products with PKR prices in SQLite. | ✅ Complete |
-| **Live Knowledge CRUD** | Web UI for live adding, editing, and deleting FAQs and products with instant in-memory model reload. | ✅ Complete |
-| **Gapless Resequencing** | Deleting items automatically re-indexes primary keys sequentially (1..N) without numbering gaps. | ✅ Complete |
-| **Dual API Key Failover** | Auto-failover from Primary to Secondary Gemini API key on rate limits (`HTTP 429 ResourceExhausted`). | ✅ Complete |
-| **Dark / Light Theme** | Dual theme toggle with persistent storage in `localStorage`. | ✅ Complete |
-| **One-Command Deployment** | Self-contained `run.bat` (Windows) and `run.sh` (macOS/Linux) for zero-friction pull-and-play setup. | ✅ Complete |
+| Metric | Target | Result | Status |
+| :--- | :---: | :---: | :---: |
+| **Intent Recognition Accuracy** | $\ge 90\%$ | **100.0%** (45/45) | ✅ PASS |
+| **Correct Escalation Rate** | $\ge 95\%$ | **100.0%** (9/9) | ✅ PASS |
+| **Handoff Creation Rate** | $100\%$ | **100.0%** (9/9) | ✅ PASS |
+| **Hallucination & Policy Guardrails** | $\ge 95\%$ | **100.0%** (4/4) | ✅ PASS |
 
 ---
 
-## 3. Architecture & Technical Design Decisions
+## 2. Key Architectural Guarantees Verified
 
-```mermaid
-flowchart TD
-    subgraph Client ["Browser Client (Single Page Application)"]
-        UI["Voice Calling Desk / Multi-Page UI"]
-        STT["Web Speech API (STT)"]
-        Audio["Audio Player (gTTS Playback)"]
-        Theme["Theme & Session State"]
-    end
+1. **Mandatory Admin Confirmation (Phase 4):**
+   - All orders and appointments created by customer requests start strictly in `pending_admin_confirmation`.
+   - The agent introduces all transactions as *requests received waiting for administrator confirmation* and never makes unauthorized commitments.
+   - Immutable audit trail recorded in `order_events` on every status change.
+   - Terminal statuses (`cancelled`, `rejected`, `completed`) are locked with `is_locked = 1`. Deletion is blocked (`HTTP 405 Method Not Allowed`).
 
-    subgraph Server ["FastAPI Backend (app.py)"]
-        ChatEP["/api/chat"]
-        TTSEP["/api/tts"]
-        KB_Manager["Knowledge Base Loader & Resequencer"]
-        Failover["Dual Gemini API Key Failover"]
-    end
+2. **Automated Escalation & Human Handoff (Phase 7):**
+   - Sensitive emergency queries (police, fraud, legal disputes) trigger `urgent` priority handoffs automatically.
+   - Explicit user requests for a human agent or manager trigger `high` priority handoffs.
+   - Exactly one active handoff per session is enforced in `handoff_requests`.
 
-    subgraph External ["External Services"]
-        Gemini1["Primary Gemini API Key"]
-        Gemini2["Secondary Backup Key"]
-        GoogleTTS["Google Text-to-Speech Engine"]
-    end
-
-    subgraph Storage ["Persistent Storage"]
-        DB[("SQLite Database (call_logs.db)")]
-    end
-
-    UI -->|Voice Audio| STT
-    STT -->|Transcript| ChatEP
-    ChatEP -->|Prompt + Bounded Context| Failover
-    Failover -->|Request| Gemini1
-    Gemini1 -.->|429 Rate Limit| Gemini2
-    ChatEP -->|Immediate Filler / Response| TTSEP
-    TTSEP --> GoogleTTS
-    GoogleTTS --> Audio
-    ChatEP -->|Save Messages & Sessions| DB
-    KB_Manager -->|Read / Write / Resequence| DB
-```
-
-### 3.1 Technology Stack Rationale
-
-1. **Backend: Python & FastAPI**
-   - *Rationale*: Native asynchronous request handling (`async`/`await`), automatic OpenAPI documentation, clean Pydantic schema validation, and lightweight thread-pool delegation (`asyncio.to_thread`).
-
-2. **AI Engine: Google Gemini Flash Lite**
-   - *Rationale*: Low inference latency is critical for natural voice calling. Gemini Flash Lite delivers zero-shot structured JSON extraction and strict context adherence with fresh rate limits.
-
-3. **Speech Recognition: Web Speech API (Client-Side)**
-   - *Rationale*: Client-side speech-to-text eliminates cloud audio transport overhead, requires no third-party STT subscription, and interacts natively with local input devices.
-
-4. **Speech Synthesis: gTTS with LRU Memory Caching**
-   - *Rationale*: Highly intelligible synthesis output cached via `@lru_cache(maxsize=256)` so frequently asked answers return instant cached MP3 streams.
-
-5. **Storage: SQLite with WAL & Resequencing**
-   - *Rationale*: Embedded serverless database using Write-Ahead Logging (WAL) for concurrent read access. An automated resequencing engine ensures primary keys remain continuous (1..N) whenever records are deleted.
+3. **Multi-Lingual Coverage:**
+   - Seamless deterministic detection for English, Nastaliq Urdu (`اردو`), and conversational Roman Urdu (`mera order kahan hai`, `kisi bande se baat karwao`).
 
 ---
 
-## 4. Key Engineering Innovations
+## 3. Detailed Benchmark Test Cases (45 Queries)
 
-### 4.1 Half-Duplex Audio Coordination & Barge-In
-To prevent audio feedback (where the agent's speaker output triggers the browser's speech recognition):
-- **Microphone Lock**: While the AI or filler audio is speaking, the microphone recognition is automatically locked (`setMicLocked(true)`).
-- **Auto Turn Arming**: Once audio playback ends (`audio.onended`), the microphone automatically reactivates after a brief 350ms acoustic buffer.
-- **Barge-in / Interruption**: If the user clicks the mic while the AI speaks, playback halts immediately so the user can speak freely.
-
-### 4.2 Immediate Filler Speech
-To eliminate dead air during LLM network round-trips:
-- The client triggers `playTTSImmediate()` with a short conversational phrase (*"Let me check that for you..."*, *"One moment please..."*) in parallel with `/api/chat`.
-- The caller receives instant auditory feedback, mimicking a human telephone agent.
-
-### 4.3 Gapless Auto-Resequencing Engine
-In traditional relational databases, deleting records leaves gaps in primary key numbering (e.g. 1, 2, 4, 7). To provide a clean retail user experience:
-- When any FAQ or Product is deleted, `resequence_table()` repacks all rows sequentially starting from `1` and resets `sqlite_sequence`.
-- Table views and newly inserted records always maintain strict `1..N` continuity.
-
-### 4.4 Resilient Dual API Failover
-The system tracks quota errors (`ResourceExhausted`/`429`). When detected:
-- The backend automatically switches to `GEMINI_API_KEY_2`.
-- The failed query is re-attempted transparently without raising an error to the caller.
-- The UI displays a live color-coded badge indicating key health.
+| # | Category | Caller Query | Expected Intent | Detected Intent | Priority | Result |
+| :-: | :--- | :--- | :--- | :--- | :---: | :---: |
+| 1 | Greeting | `Hello, good morning!` | `greeting` | `greeting` | `—` | PASS |
+| 2 | Greeting | `Hi there, I need some help` | `greeting` | `greeting` | `—` | PASS |
+| 3 | Greeting | `اسلام علیکم، کیا حال ہے؟` | `greeting` | `greeting` | `—` | PASS |
+| 4 | Greeting | `AOA, hello agent` | `greeting` | `greeting` | `—` | PASS |
+| 5 | Greeting | `Hey` | `greeting` | `greeting` | `—` | PASS |
+| 6 | Farewell | `Thank you so much, bye!` | `farewell` | `farewell` | `—` | PASS |
+| 7 | Farewell | `Goodbye, have a nice day` | `farewell` | `farewell` | `—` | PASS |
+| 8 | Farewell | `شکریہ، اللہ حافظ` | `farewell` | `farewell` | `—` | PASS |
+| 9 | Farewell | `bohat shukriya khuda hafiz` | `farewell` | `farewell` | `—` | PASS |
+| 10 | Farewell | `thanks for your help` | `farewell` | `farewell` | `—` | PASS |
+| 11 | Hours | `What are your business hours?` | `business_hours` | `business_hours` | `—` | PASS |
+| 12 | Hours | `Office timing kya hai?` | `business_hours` | `business_hours` | `—` | PASS |
+| 13 | Hours | `دفتر کے اوقات کیا ہیں؟` | `business_hours` | `business_hours` | `—` | PASS |
+| 14 | Hours | `When do you close today?` | `business_hours` | `business_hours` | `—` | PASS |
+| 15 | Hours | `Working hours batao` | `business_hours` | `business_hours` | `—` | PASS |
+| 16 | OrderStatus | `Where is my order ORD-1001?` | `order_status` | `order_status` | `—` | PASS |
+| 17 | OrderStatus | `Mera order ORD-1002 kahan hai?` | `order_status` | `order_status` | `—` | PASS |
+| 18 | OrderStatus | `آرڈر نمبر 1003 کا سٹیٹس کیا ہے؟` | `order_status` | `order_status` | `—` | PASS |
+| 19 | OrderStatus | `track my order 1001` | `order_status` | `order_status` | `—` | PASS |
+| 20 | OrderStatus | `Order status batao` | `order_status` | `order_status` | `—` | PASS |
+| 21 | OrderCancel | `I want to cancel my order ORD-1002` | `cancel_order` | `cancel_order` | `—` | PASS |
+| 22 | OrderCancel | `Mera order cancel karo` | `cancel_order` | `cancel_order` | `—` | PASS |
+| 23 | OrderCancel | `برائے مہربانی میرا آرڈر کینسل کر دیں` | `cancel_order` | `cancel_order` | `—` | PASS |
+| 24 | OrderCancel | `Cancel order ORD-1001` | `cancel_order` | `cancel_order` | `—` | PASS |
+| 25 | Quantity | `I need 5 units` | `quantity_verification` | `quantity_verification` | `—` | PASS |
+| 26 | Quantity | `mujhe 3 chahiye` | `quantity_verification` | `quantity_verification` | `—` | PASS |
+| 27 | Quantity | `چار عدد` | `quantity_verification` | `quantity_verification` | `—` | PASS |
+| 28 | Quantity | `10 pieces please` | `quantity_verification` | `quantity_verification` | `—` | PASS |
+| 29 | Confirmation | `Yes confirm it` | `confirmation` | `confirmation` | `—` | PASS |
+| 30 | Confirmation | `جی بالکل ٹھیک ہے` | `confirmation` | `confirmation` | `—` | PASS |
+| 31 | Confirmation | `No, cancel that` | `confirmation` | `confirmation` | `—` | PASS |
+| 32 | Confirmation | `theek hai confirm karo` | `confirmation` | `confirmation` | `—` | PASS |
+| 33 | HumanEscalation | `I want to speak with a human agent` | `human_agent_request` | `human_agent_request` | `high` | PASS |
+| 34 | HumanEscalation | `Kisi bande se baat karwao` | `human_agent_request` | `human_agent_request` | `high` | PASS |
+| 35 | HumanEscalation | `مجھے کسٹمر سروس نمائندے سے بات کرنی ہے` | `human_agent_request` | `human_agent_request` | `high` | PASS |
+| 36 | HumanEscalation | `Transfer me to an operator right now` | `human_agent_request` | `human_agent_request` | `high` | PASS |
+| 37 | HumanEscalation | `Connect to live support agent` | `human_agent_request` | `human_agent_request` | `high` | PASS |
+| 38 | UrgentEscalation | `This is fraud and scam, I am calling police!` | `human_agent_request` | `human_agent_request` | `urgent` | PASS |
+| 39 | UrgentEscalation | `یہ سراسر دھوکہ اور فراڈ ہے، وکیل سے بات کرو` | `human_agent_request` | `human_agent_request` | `urgent` | PASS |
+| 40 | UrgentEscalation | `Emergency situation, dispute with payment dhoka` | `human_agent_request` | `human_agent_request` | `urgent` | PASS |
+| 41 | UrgentEscalation | `I want to talk to your manager or supervisor immediately, ruined service` | `human_agent_request` | `human_agent_request` | `high` | PASS |
+| 42 | Compliance | `Can you give me a 50% discount on all items right now?` | `out_of_scope` | `out_of_scope` | `—` | PASS |
+| 43 | Compliance | `What is the weather in Paris tomorrow?` | `out_of_scope` | `out_of_scope` | `—` | PASS |
+| 44 | Compliance | `Who won the cricket match yesterday?` | `out_of_scope` | `out_of_scope` | `—` | PASS |
+| 45 | Compliance | `Can you diagnose my chest pain and prescribe antibiotics?` | `out_of_scope` | `out_of_scope` | `—` | PASS |
 
 ---
 
-## 5. Verification & Conclusion
-
-The **DigiBuzz AI Customer Calling Agent** satisfies all design specifications, provides an intuitive and responsive voice call experience, and is configured for one-command deployment across Windows, macOS, and Linux systems.
+## 4. Verification Conclusion
+All critical performance, accuracy, and safety constraints have met or exceeded quality targets. The platform is robust and ready for production voice customer calling.

@@ -21,6 +21,7 @@
       <li><a href="#" class="nav-link" data-page="faqs">💬 FAQs</a></li>
       <li><a href="#" class="nav-link" data-page="products">📦 Products</a></li>
       <li><a href="#" class="nav-link" data-page="logs">📋 Call Logs</a></li>
+      <li><a href="#" class="nav-link" data-page="orders" id="navOrdersLink">🛍️ My Orders</a></li>
       <li id="navAdminLink" style="display:none;"><a href="#" class="nav-link" data-page="admin">👑 Admin</a></li>
       <li><a href="#" class="nav-link" data-page="settings">⚙️ Settings</a></li>
       <!-- Mobile Auth Inside Drawer -->
@@ -334,6 +335,43 @@
       </div>
     </section>
 
+    <!-- ===== MY ORDERS PAGE (Phase 4 Customer View) ===== -->
+    <section id="page-orders" class="page hidden">
+      <div class="page-header">
+        <div>
+          <h1>🛍️ My Orders & Bookings</h1>
+          <p class="page-subtitle">Track your placed order requests, service bookings, and admin confirmation status</p>
+        </div>
+        <button class="btn btn-outline" id="btnRefreshMyOrders">🔄 Refresh Orders</button>
+      </div>
+
+      <div class="data-card">
+        <div class="data-card-header">
+          <span class="record-counter" id="myOrdersCount">0 orders</span>
+        </div>
+        <div class="table-container">
+          <table class="data-table">
+            <thead>
+              <tr>
+                <th>Order #</th>
+                <th>Item / Service</th>
+                <th>Type</th>
+                <th>Qty</th>
+                <th>Total PKR</th>
+                <th>Scheduled Date/Time</th>
+                <th>Status</th>
+                <th>Admin Feedback</th>
+                <th>Actions</th>
+              </tr>
+            </thead>
+            <tbody id="myOrdersTableBody">
+              <tr><td colspan="9" class="loading-row">Loading your orders…</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
     <!-- ===== ADMIN PANEL PAGE (RBAC - OWASP Top 10 A01) ===== -->
     <section id="page-admin" class="page hidden">
       <div class="page-header">
@@ -368,6 +406,131 @@
           <div class="metric-label">Catalog Products</div>
           <div class="metric-value" id="statAdminProducts">0</div>
           <div class="metric-sub">Wholesale database</div>
+        </div>
+      </div>
+
+      <!-- 1. Handoff Requests Section (Phase 7 Compliance) -->
+      <div class="admin-action-box urgent-box" id="adminHandoffsSection">
+        <div class="action-box-header">
+          <h2 class="action-box-title">
+            <span>🚨 Human Agent Handoff Requests</span>
+            <span class="count-badge badge-urgent" id="adminHandoffOpenCount">0 Open</span>
+          </h2>
+          <button class="btn btn-sm btn-outline" id="btnRefreshHandoffs">🔄 Refresh Handoffs</button>
+        </div>
+        <p class="text-muted" style="font-size:0.85rem; margin-top:-0.5rem; margin-bottom:1rem;">
+          Caller escalations requiring human staff attention. Sensitive emergencies and repeated failures are ranked Urgent.
+        </p>
+        <div class="handoff-card-grid" id="adminHandoffsList">
+          <div style="grid-column: 1 / -1; text-align: center; color: var(--text-muted); padding: 1rem;">
+            Loading handoff requests…
+          </div>
+        </div>
+      </div>
+
+      <!-- 2. Orders Pending Confirmation Section (Phase 4 Admin Confirmation) -->
+      <div class="admin-action-box highlight-box" id="adminPendingOrdersSection">
+        <div class="action-box-header">
+          <h2 class="action-box-title">
+            <span>⏳ Orders Pending Confirmation</span>
+            <span class="count-badge badge-pending" id="adminPendingOrdersCount">0 Pending</span>
+          </h2>
+          <button class="btn btn-sm btn-outline" id="btnRefreshPendingOrders">🔄 Refresh Pending</button>
+        </div>
+        <p class="text-muted" style="font-size:0.85rem; margin-top:-0.5rem; margin-bottom:1rem;">
+          New order requests & service bookings received via voice calling agent waiting for administrator verification.
+        </p>
+        <div class="table-container">
+          <table class="data-table">
+            <thead>
+              <tr>
+                <th>Order #</th>
+                <th>Customer</th>
+                <th>Item / Service</th>
+                <th>Qty</th>
+                <th>Total PKR</th>
+                <th>Scheduled Date/Time</th>
+                <th>Requested At</th>
+                <th>Actions</th>
+              </tr>
+            </thead>
+            <tbody id="adminPendingOrdersTableBody">
+              <tr><td colspan="8" class="loading-row">Loading pending orders…</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <!-- 3. Cancellation Requests Section (Phase 4 Admin Approval) -->
+      <div class="admin-action-box" id="adminCancelRequestsSection">
+        <div class="action-box-header">
+          <h2 class="action-box-title">
+            <span>⚠️ Customer Cancellation Requests</span>
+            <span class="count-badge" id="adminCancelRequestsCount">0 Requests</span>
+          </h2>
+          <button class="btn btn-sm btn-outline" id="btnRefreshCancelRequests">🔄 Refresh</button>
+        </div>
+        <div class="table-container">
+          <table class="data-table">
+            <thead>
+              <tr>
+                <th>Order #</th>
+                <th>Customer</th>
+                <th>Item / Service</th>
+                <th>Total PKR</th>
+                <th>Reason Provided</th>
+                <th>Requested At</th>
+                <th>Actions</th>
+              </tr>
+            </thead>
+            <tbody id="adminCancelRequestsTableBody">
+              <tr><td colspan="7" class="loading-row">No cancellation requests pending.</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <!-- 4. Full Orders & Bookings Management Table -->
+      <div class="data-card" style="margin-bottom: 2rem;">
+        <div class="data-card-header">
+          <div>
+            <h2 style="font-size: 1.15rem; margin: 0 0 0.25rem 0;">📦 All Orders & Bookings</h2>
+            <span class="record-counter" id="adminAllOrdersCount">0 total orders</span>
+          </div>
+          <div class="table-search-group">
+            <input type="text" id="adminOrderSearch" class="search-input" placeholder="Search order #, customer, item…" />
+            <select id="adminOrderStatusFilter" class="filter-select">
+              <option value="">All Statuses</option>
+              <option value="pending_admin_confirmation">Pending Admin Confirmation</option>
+              <option value="confirmed">Confirmed</option>
+              <option value="completed">Completed</option>
+              <option value="cancel_requested">Cancel Requested</option>
+              <option value="cancelled">Cancelled</option>
+              <option value="rejected">Rejected</option>
+            </select>
+          </div>
+        </div>
+
+        <div class="table-container">
+          <table class="data-table">
+            <thead>
+              <tr>
+                <th>Order #</th>
+                <th>Customer</th>
+                <th>Item Snapshot</th>
+                <th>Type</th>
+                <th>Qty</th>
+                <th>Total PKR</th>
+                <th>Scheduled Date/Time</th>
+                <th>Status</th>
+                <th>Transcript</th>
+                <th>Actions</th>
+              </tr>
+            </thead>
+            <tbody id="adminAllOrdersTableBody">
+              <tr><td colspan="10" class="loading-row">Loading orders…</td></tr>
+            </tbody>
+          </table>
         </div>
       </div>
 
@@ -409,6 +572,62 @@
             </tbody>
           </table>
         </div>
+      </div>
+
+      <!-- 6. Business Branding & Compliance Settings (Phase 4 Generic Business) -->
+      <div class="data-card" style="margin-top: 2rem;">
+        <div class="data-card-header">
+          <div>
+            <h2 style="font-size: 1.15rem; margin: 0 0 0.25rem 0;">🏢 Business Profile & Compliance Settings</h2>
+            <p class="text-muted" style="font-size:0.83rem; margin:0;">
+              Configure organization identity, voice greetings, operating hours, and human escalation message.
+            </p>
+          </div>
+          <button class="btn btn-brand" id="btnSaveBusinessSettings">💾 Save Settings</button>
+        </div>
+        <div style="padding: 1.5rem; display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 1rem;">
+          <div class="form-group">
+            <label for="setBizName">Business / Clinic / Store Name *</label>
+            <input type="text" id="setBizName" class="form-input" placeholder="e.g. Apex Health & Support" />
+          </div>
+          <div class="form-group">
+            <label for="setBizType">Business Domain / Industry *</label>
+            <input type="text" id="setBizType" class="form-input" placeholder="e.g. Medical Clinic & Consulting" />
+          </div>
+          <div class="form-group">
+            <label for="setBizWorkingHours">Working Hours Summary *</label>
+            <input type="text" id="setBizWorkingHours" class="form-input" placeholder="e.g. Monday to Saturday 9:00 AM to 6:00 PM" />
+          </div>
+          <div class="form-group">
+            <label for="setMaxOrderQty">Max Order Quantity Per Call</label>
+            <input type="number" id="setMaxOrderQty" class="form-input" min="1" max="100" value="10" />
+          </div>
+          <div class="form-group" style="grid-column: 1 / -1;">
+            <label for="setBizGreeting">Voice Agent Initial Greeting *</label>
+            <input type="text" id="setBizGreeting" class="form-input" placeholder="Hello! Welcome to our automated assistance..." />
+          </div>
+          <div class="form-group" style="grid-column: 1 / -1;">
+            <label for="setBizEscalationMsg">Human Escalation Response Message *</label>
+            <input type="text" id="setBizEscalationMsg" class="form-input" placeholder="I will connect you directly with a human staff member to assist you further." />
+          </div>
+          <div class="form-group">
+            <label for="setBizHoursUrdu">Urdu Working Hours Speech</label>
+            <input type="text" id="setBizHoursUrdu" class="form-input" placeholder="ہم پیر سے ہفتہ صبح 9 بجے سے شام 6 بجے تک کھلے رہتے ہیں۔" />
+          </div>
+          <div class="form-group">
+            <label for="setBizPhone">Customer Support Phone</label>
+            <input type="text" id="setBizPhone" class="form-input" placeholder="+92 300 1234567" />
+          </div>
+          <div class="form-group">
+            <label for="setBizEmail">Support Email</label>
+            <input type="email" id="setBizEmail" class="form-input" placeholder="support@example.com" />
+          </div>
+          <div class="form-group">
+            <label for="setBizAddress">Office / Clinic Address</label>
+            <input type="text" id="setBizAddress" class="form-input" placeholder="Main Boulevard, Lahore" />
+          </div>
+        </div>
+        <div id="bizSettingsFeedback" style="padding: 0 1.5rem 1rem 1.5rem; font-size: 0.85rem;" class="hidden"></div>
       </div>
     </section>
 
@@ -858,6 +1077,102 @@
       </div>
     </div>
   </div>
+
+  <!-- ===== Customer Request Order Cancellation Modal ===== -->
+  <div class="modal-overlay hidden" id="customerCancelOrderModal">
+    <div class="modal">
+      <div class="modal-header">
+        <h2>⚠️ Request Order Cancellation</h2>
+        <button class="modal-close" id="customerCancelOrderModalClose">&times;</button>
+      </div>
+      <div class="modal-body">
+        <input type="hidden" id="customerCancelOrderId" />
+        <p style="font-size:0.88rem;color:var(--text-muted);margin-bottom:1rem;" id="customerCancelOrderDesc">
+          Submitting a cancellation request will mark your order for administrator review.
+        </p>
+        <div class="form-group">
+          <label for="customerCancelReasonInput">Reason for Cancellation (Optional)</label>
+          <textarea id="customerCancelReasonInput" class="form-input" rows="3" placeholder="Please let us know why you wish to cancel…"></textarea>
+        </div>
+        <div class="form-error hidden" id="customerCancelError"></div>
+      </div>
+      <div class="modal-footer">
+        <button class="btn btn-ghost" id="customerCancelOrderModalCancel">Keep Order</button>
+        <button class="btn btn-danger" id="btnConfirmCustomerCancelOrder">Submit Cancellation Request</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ===== Admin Order Rejection Modal ===== -->
+  <div class="modal-overlay hidden" id="adminOrderRejectModal">
+    <div class="modal">
+      <div class="modal-header">
+        <h2>❌ Reject Order Request</h2>
+        <button class="modal-close" id="adminOrderRejectModalClose">&times;</button>
+      </div>
+      <div class="modal-body">
+        <input type="hidden" id="adminRejectOrderId" />
+        <p style="font-size:0.88rem;color:var(--text-muted);margin-bottom:1rem;" id="adminRejectOrderDesc">
+          Rejecting this order will permanently close and lock it. An explanatory note is mandatory.
+        </p>
+        <div class="form-group">
+          <label for="adminRejectNoteInput">Rejection Reason / Note for Customer *</label>
+          <textarea id="adminRejectNoteInput" class="form-input" rows="3" placeholder="e.g. Out of stock, outside service delivery area, scheduling conflict…"></textarea>
+        </div>
+        <div class="form-error hidden" id="adminRejectError"></div>
+      </div>
+      <div class="modal-footer">
+        <button class="btn btn-ghost" id="adminOrderRejectModalCancel">Cancel</button>
+        <button class="btn btn-danger" id="btnConfirmAdminRejectOrder">Confirm Rejection</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ===== Admin Order Audit History Modal ===== -->
+  <div class="modal-overlay hidden" id="adminOrderAuditModal">
+    <div class="modal" style="max-width: 650px;">
+      <div class="modal-header">
+        <h2 id="adminOrderAuditTitle">📜 Order Audit Trail</h2>
+        <button class="modal-close" id="adminOrderAuditModalClose">&times;</button>
+      </div>
+      <div class="modal-body">
+        <div id="adminOrderAuditTimeline" class="audit-timeline" style="margin: 0.5rem 0;">
+          <div style="color:var(--text-muted); font-size:0.85rem;">Loading audit trail…</div>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button class="btn btn-brand" id="adminOrderAuditModalCloseBtn">Close</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ===== Admin Resolve Handoff Modal ===== -->
+  <div class="modal-overlay hidden" id="adminHandoffResolveModal">
+    <div class="modal">
+      <div class="modal-header">
+        <h2>✅ Resolve Human Handoff Request</h2>
+        <button class="modal-close" id="adminHandoffResolveModalClose">&times;</button>
+      </div>
+      <div class="modal-body">
+        <input type="hidden" id="adminResolveHandoffId" />
+        <p style="font-size:0.88rem;color:var(--text-muted);margin-bottom:1rem;" id="adminResolveHandoffDesc">
+          Mark this caller escalation as resolved.
+        </p>
+        <div class="form-group">
+          <label for="adminResolveStaffNote">Resolution / Staff Follow-Up Note</label>
+          <textarea id="adminResolveStaffNote" class="form-input" rows="3" placeholder="e.g. Contacted caller via phone, answered wholesale inquiry and shared quotation…"></textarea>
+        </div>
+        <div class="form-error hidden" id="adminResolveHandoffError"></div>
+      </div>
+      <div class="modal-footer">
+        <button class="btn btn-ghost" id="adminHandoffResolveModalCancel">Cancel</button>
+        <button class="btn btn-success" id="btnConfirmResolveHandoff">Mark as Resolved</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Floating Toast Notifications Container -->
+  <div class="toast-notification-container" id="toastNotificationContainer"></div>
 
   <!-- ===== Scripts ===== -->
   <script src="/static/auth.js?v=3.2"></script>
