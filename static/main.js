@@ -836,6 +836,7 @@ class AudioStreamPlayer {
     this.isPlaying = false;
     this.onPlaybackStart = null;
     this.onPlaybackComplete = null;
+    this._completeResolvers = [];
   }
 
   ensureContext() {
@@ -895,11 +896,27 @@ class AudioStreamPlayer {
           if (typeof this.onPlaybackComplete === "function") {
             this.onPlaybackComplete();
           }
+          const resolvers = this._completeResolvers.slice(0);
+          this._completeResolvers = [];
+          resolvers.forEach((r) => {
+            try { r(); } catch (_) {}
+          });
         }
       };
     } catch (err) {
       console.warn("AudioBuffer decode error:", err);
     }
+  }
+
+  waitForCompletion() {
+    if (!this.isPlaying && this.totalFinished >= this.totalQueued) {
+      return Promise.resolve();
+    }
+    return new Promise((resolve) => {
+      this._completeResolvers.push(resolve);
+      // Safety timeout in case of unexpected context hang
+      setTimeout(resolve, 10000);
+    });
   }
 
   stop() {
@@ -914,6 +931,11 @@ class AudioStreamPlayer {
     this.totalQueued = 0;
     this.totalFinished = 0;
     this.isPlaying = false;
+    const resolvers = this._completeResolvers.slice(0);
+    this._completeResolvers = [];
+    resolvers.forEach((r) => {
+      try { r(); } catch (_) {}
+    });
   }
 }
 
@@ -996,8 +1018,6 @@ class SentenceSpeechQueue {
 
     this.isProcessing = true;
     const item = this.queue.shift();
-    const isFirst = (item.idx === 0);
-    const isUrdu = ARABIC_SCRIPT_REGEX.test(item.text);
 
     // Record agent sentence for anti-echo filtering
     recordAgentSentence(item.text);
@@ -1005,37 +1025,7 @@ class SentenceSpeechQueue {
     // Halt any active filler cleanly the instant the first real sentence arrives
     stopFillerAudio();
 
-    // Browser speechSynthesis for first sentence if voice for that language exists
-    const canUseBrowserSpeech = isFirst && (
-      (!isUrdu && this.localEnVoice) || (isUrdu && this.localUrVoice)
-    );
-
-    if (canUseBrowserSpeech && window.speechSynthesis) {
-      try {
-        if (this.queue.length > 0) {
-          this.prefetch(this.queue[0].text);
-        }
-        onAgentSpeechStart();
-        await new Promise((resolve) => {
-          const utter = new SpeechSynthesisUtterance(item.text);
-          utter.voice = isUrdu ? this.localUrVoice : this.localEnVoice;
-          utter.lang = isUrdu ? "ur-PK" : "en-US";
-          utter.rate = 1.05;
-          utter.onend = resolve;
-          utter.onerror = resolve;
-          window.speechSynthesis.speak(utter);
-        });
-        if (this.queue.length === 0 && (!this.audioPlayer || !this.audioPlayer.isPlaying)) {
-          onAgentSpeechEnd();
-        }
-        this.processNext();
-        return;
-      } catch (err) {
-        console.warn("speechSynthesis error, using edge-tts:", err);
-      }
-    }
-
-    // Neural audio via edge-tts & Web Audio API
+    // Neural audio via edge-tts & Web Audio API (Consistent human studio voice for all sentences)
     let buf = this.prefetchCache.get(item.text);
     if (!buf) {
       try {
@@ -1066,8 +1056,11 @@ class SentenceSpeechQueue {
 }
 
 // =====================================================================
-// Phase 9: Filler / Handler Phrases System
+// Phase 9: Filler / Handler Phrases System (Unified Neural Studio Voice)
 // =====================================================================
+const neuralFillerAudioCache = new Map();
+let currentFillerSource = null;
+
 const fillerState = {
   data: null,
   lastFiller: "",
@@ -1083,9 +1076,40 @@ async function loadFillerPhrases() {
     const res = await fetch("/api/fillers");
     if (res.ok) {
       fillerState.data = await res.json();
+      warmupNeuralFillerAudios();
     }
   } catch (e) {
     console.warn("Could not load /api/fillers:", e);
+  }
+}
+
+async function warmupNeuralFillerAudios() {
+  const commonPhrases = [
+    "Sure, one moment.",
+    "Okay, let me check.",
+    "Just a second.",
+    "Let me check your order status.",
+    "Let me look that up for you.",
+    "Okay, let me note that down.",
+    "Thanks for waiting, almost there.",
+    "جی ایک سیکنڈ",
+    "جی میں دیکھتی ہوں",
+    "ایک لمحہ دیجیے",
+    "Jee, aik second.",
+    "Jee, main check karti hoon.",
+  ];
+  for (const phrase of commonPhrases) {
+    if (neuralFillerAudioCache.has(phrase)) continue;
+    fetch("/api/tts", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text: phrase }),
+    })
+      .then((r) => r.ok ? r.arrayBuffer() : null)
+      .then((buf) => {
+        if (buf) neuralFillerAudioCache.set(phrase, buf);
+      })
+      .catch(() => {});
   }
 }
 
@@ -1139,6 +1163,13 @@ function clearFillerTimers() {
 function stopFillerAudio() {
   clearFillerTimers();
   cancelInstantFiller();
+  if (currentFillerSource) {
+    try {
+      currentFillerSource.stop();
+      currentFillerSource.disconnect();
+    } catch (_) {}
+    currentFillerSource = null;
+  }
   if (state.currentAudio && state.fillerPlaying) {
     try { state.currentAudio.pause(); } catch (_) {}
     state.currentAudio = null;
@@ -1146,54 +1177,74 @@ function stopFillerAudio() {
   }
 }
 
-function speakInstantFiller(phrase) {
+async function speakInstantFiller(phrase) {
   if (!state.isVoiceEnabled || !phrase) return;
   recordAgentSentence(phrase);
-  if (typeof window !== "undefined" && window.speechSynthesis) {
+
+  let arrayBuf = neuralFillerAudioCache.get(phrase);
+  if (!arrayBuf) {
     try {
-      window.speechSynthesis.cancel();
-      const utter = new SpeechSynthesisUtterance(phrase);
-      const isUrdu = ARABIC_SCRIPT_REGEX.test(phrase);
-      if (isUrdu && state.speechQueue && state.speechQueue.localUrVoice) {
-        utter.voice = state.speechQueue.localUrVoice;
-      } else if (!isUrdu && state.speechQueue && state.speechQueue.localEnVoice) {
-        utter.voice = state.speechQueue.localEnVoice;
+      const res = await fetch("/api/tts", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ text: phrase }),
+      });
+      if (res.ok) {
+        arrayBuf = await res.arrayBuffer();
+        neuralFillerAudioCache.set(phrase, arrayBuf);
       }
-      utter.lang = isUrdu ? "ur-PK" : "en-US";
-      utter.rate = 1.05;
-      utter.pitch = 1.0;
-      state.isSpeakingFiller = true;
-      state.fillerPlaying = true;
-      onAgentSpeechStart();
-      utter.onend = () => {
-        state.isSpeakingFiller = false;
-        state.fillerPlaying = false;
-        if (!state.speechQueue || (state.speechQueue.queue.length === 0 && (!state.audioPlayer || !state.audioPlayer.isPlaying))) {
-          onAgentSpeechEnd();
-        }
-      };
-      utter.onerror = () => {
-        state.isSpeakingFiller = false;
-        state.fillerPlaying = false;
-        if (!state.speechQueue || (state.speechQueue.queue.length === 0 && (!state.audioPlayer || !state.audioPlayer.isPlaying))) {
-          onAgentSpeechEnd();
-        }
-      };
-      window.speechSynthesis.speak(utter);
     } catch (e) {
-      console.warn("SpeechSynthesis filler error:", e);
+      console.warn("Filler TTS fetch error:", e);
+      return;
     }
+  }
+
+  if (!arrayBuf || fillerState.firstSentenceArrived) return;
+
+  const ctx = state.audioPlayer ? state.audioPlayer.ensureContext() : null;
+  if (!ctx) return;
+
+  try {
+    const audioBuf = await ctx.decodeAudioData(arrayBuf.slice(0));
+    if (fillerState.firstSentenceArrived) return;
+
+    stopFillerAudio();
+    const source = ctx.createBufferSource();
+    source.buffer = audioBuf;
+    source.connect(ctx.destination);
+    currentFillerSource = source;
+
+    state.isSpeakingFiller = true;
+    state.fillerPlaying = true;
+    onAgentSpeechStart();
+
+    source.onended = () => {
+      if (currentFillerSource === source) {
+        currentFillerSource = null;
+      }
+      state.isSpeakingFiller = false;
+      state.fillerPlaying = false;
+      if (!state.speechQueue || (state.speechQueue.queue.length === 0 && (!state.audioPlayer || !state.audioPlayer.isPlaying))) {
+        onAgentSpeechEnd();
+      }
+    };
+
+    source.start(0);
+  } catch (err) {
+    console.warn("Filler decode/play error:", err);
   }
 }
 
 function cancelInstantFiller() {
-  if (typeof window !== "undefined" && window.speechSynthesis && state.isSpeakingFiller) {
+  if (currentFillerSource) {
     try {
-      window.speechSynthesis.cancel();
+      currentFillerSource.stop();
+      currentFillerSource.disconnect();
     } catch (_) {}
-    state.isSpeakingFiller = false;
-    state.fillerPlaying = false;
+    currentFillerSource = null;
   }
+  state.isSpeakingFiller = false;
+  state.fillerPlaying = false;
 }
 
 function bargeIn() {
@@ -1224,7 +1275,7 @@ function bargeIn() {
 }
 
 // Global audio playback & streaming methods
-async function playAudio(text) {
+async function playAudio(text, waitForCompletion = false) {
   if (!state.isVoiceEnabled || !text) return;
   recordAgentSentence(text);
   stopAudio();
@@ -1244,18 +1295,24 @@ async function playAudio(text) {
     const arrayBuffer = await res.arrayBuffer();
     if (state.audioPlayer) {
       await state.audioPlayer.queueAudio(arrayBuffer);
+      if (waitForCompletion) {
+        await state.audioPlayer.waitForCompletion();
+      }
     } else {
       const blob = new Blob([arrayBuffer], { type: "audio/mpeg" });
       const url = URL.createObjectURL(blob);
       state.currentAudio = new Audio(url);
-      const cleanup = () => {
-        URL.revokeObjectURL(url);
-        if (state.currentAudio) state.currentAudio = null;
-        onAgentSpeechEnd();
-      };
-      state.currentAudio.onended = cleanup;
-      state.currentAudio.onerror = cleanup;
-      await state.currentAudio.play();
+      await new Promise((resolve) => {
+        const cleanup = () => {
+          URL.revokeObjectURL(url);
+          if (state.currentAudio) state.currentAudio = null;
+          onAgentSpeechEnd();
+          resolve();
+        };
+        state.currentAudio.onended = cleanup;
+        state.currentAudio.onerror = cleanup;
+        state.currentAudio.play().catch(() => resolve());
+      });
     }
   } catch (err) {
     console.warn("playAudio error:", err);
@@ -1443,7 +1500,7 @@ async function ensureAiWebSocket() {
 // Detect spoken intent to end the call
 function isEndCallPhrase(text) {
   if (!text) return false;
-  const clean = text.toLowerCase().trim().replace(/[.,!?;:]/g, "");
+  const clean = text.toLowerCase().trim().replace(/[.,!?;:۔؟]/g, "");
   const endPhrases = [
     "end call",
     "end the call",
@@ -1455,6 +1512,7 @@ function isEndCallPhrase(text) {
     "disconnect call",
     "bye",
     "goodbye",
+    "good bye",
     "bye bye",
     "call cut",
     "cut the call",
@@ -1462,6 +1520,16 @@ function isEndCallPhrase(text) {
     "end conversation",
     "allah hafiz",
     "khuda hafiz",
+    "alwida",
+    "shukriya bye",
+    "thank you bye",
+    "thanks bye",
+    "اللہ حافظ",
+    "خدا حافظ",
+    "الوداع",
+    "کال بند کرو",
+    "کال ختم کرو",
+    "فون رکھو",
   ];
   return endPhrases.some((phrase) => clean === phrase || clean.startsWith(phrase + " ") || clean.endsWith(" " + phrase));
 }
@@ -1496,11 +1564,15 @@ async function sendMessage(text) {
 
   // Check if caller wants to finish the call via voice command
   if (isEndCallPhrase(text)) {
-    const farewell = "Thank you for calling DigiBuzz Support. Have a wonderful day! Goodbye.";
+    const isUrdu = ARABIC_SCRIPT_REGEX.test(text) || detectInputLanguage(text) !== "en";
+    const farewell = isUrdu
+      ? "کال کرنے کا بہت شکریہ۔ اپنا خیال رکھیے گا، اللہ حافظ!"
+      : "Thank you for calling DigiBuzz Support. Have a wonderful day ahead! Goodbye.";
     addBotMessage(farewell);
     
     if (state.isVoiceEnabled) {
-      await playAudio(farewell);
+      // Explicitly wait until the goodbye audio finishes speaking before tearing down call!
+      await playAudio(farewell, true);
     }
     endCall();
     return;
@@ -1637,6 +1709,29 @@ async function sendStreamingMessage(text) {
         metaData.intent || "general_inquiry",
         metaData.outcome || "Resolved"
       );
+
+      // If backend detected farewell intent or caller spoke goodbye, finish speaking then end call
+      if (metaData.intent === "farewell" || isEndCallPhrase(text)) {
+        const finishAndEnd = () => {
+          setTimeout(() => {
+            if (state.isOnCall) endCall();
+          }, 500);
+        };
+        if (state.speechQueue && state.speechQueue.isProcessing) {
+          state.speechQueue.onQueueEmpty = () => {
+            if (state.audioPlayer && state.audioPlayer.isPlaying) {
+              state.audioPlayer.onPlaybackComplete = finishAndEnd;
+            } else {
+              finishAndEnd();
+            }
+          };
+        } else if (state.audioPlayer && state.audioPlayer.isPlaying) {
+          state.audioPlayer.onPlaybackComplete = finishAndEnd;
+        } else {
+          finishAndEnd();
+        }
+        return;
+      }
     }
 
     // Wait until speech queue finishes before transitioning out of speaking
@@ -1679,10 +1774,19 @@ async function fallbackHttpChat(text) {
       addBotMessage(data.reply);
     }
     recordClientCallTurn(state.sessionId, text, data.reply, data.intent, data.outcome);
+    const isFarewell = isEndCallPhrase(text) || data.intent === "farewell";
     if (state.isVoiceEnabled) {
-      await playAudio(data.speech || data.reply);
+      await playAudio(data.speech || data.reply, isFarewell);
+      if (isFarewell) {
+        endCall();
+        return;
+      }
     } else {
       onAgentSpeechEnd();
+      if (isFarewell) {
+        endCall();
+        return;
+      }
     }
   } catch (e) {
     clearFillerTimers();
