@@ -1022,8 +1022,8 @@ class SentenceSpeechQueue {
     // Record agent sentence for anti-echo filtering
     recordAgentSentence(item.text);
 
-    // Halt any active filler cleanly the instant the first real sentence arrives
-    stopFillerAudio();
+    // Cancel any pending future filler timers without cutting off any currently playing speech
+    clearFillerTimers();
 
     // Neural audio via edge-tts & Web Audio API (Consistent human studio voice for all sentences)
     let buf = this.prefetchCache.get(item.text);
@@ -1163,22 +1163,13 @@ function clearFillerTimers() {
 function stopFillerAudio() {
   clearFillerTimers();
   cancelInstantFiller();
-  if (currentFillerSource) {
-    try {
-      currentFillerSource.stop();
-      currentFillerSource.disconnect();
-    } catch (_) {}
-    currentFillerSource = null;
-  }
-  if (state.currentAudio && state.fillerPlaying) {
-    try { state.currentAudio.pause(); } catch (_) {}
-    state.currentAudio = null;
-    state.fillerPlaying = false;
-  }
 }
 
 async function speakInstantFiller(phrase) {
   if (!state.isVoiceEnabled || !phrase) return;
+  // If first sentence already arrived before timer, do not play filler
+  if (fillerState.firstSentenceArrived) return;
+
   recordAgentSentence(phrase);
 
   let arrayBuf = neuralFillerAudioCache.get(phrase);
@@ -1199,50 +1190,19 @@ async function speakInstantFiller(phrase) {
     }
   }
 
+  // Ensure first sentence did not arrive while fetching
   if (!arrayBuf || fillerState.firstSentenceArrived) return;
 
-  const ctx = state.audioPlayer ? state.audioPlayer.ensureContext() : null;
-  if (!ctx) return;
-
-  try {
-    const audioBuf = await ctx.decodeAudioData(arrayBuf.slice(0));
-    if (fillerState.firstSentenceArrived) return;
-
-    stopFillerAudio();
-    const source = ctx.createBufferSource();
-    source.buffer = audioBuf;
-    source.connect(ctx.destination);
-    currentFillerSource = source;
-
+  // Queue filler audio directly through audioPlayer so it plays fully to completion
+  // without being chopped off when the real sentence arrives
+  if (state.audioPlayer) {
     state.isSpeakingFiller = true;
     state.fillerPlaying = true;
-    onAgentSpeechStart();
-
-    source.onended = () => {
-      if (currentFillerSource === source) {
-        currentFillerSource = null;
-      }
-      state.isSpeakingFiller = false;
-      state.fillerPlaying = false;
-      if (!state.speechQueue || (state.speechQueue.queue.length === 0 && (!state.audioPlayer || !state.audioPlayer.isPlaying))) {
-        onAgentSpeechEnd();
-      }
-    };
-
-    source.start(0);
-  } catch (err) {
-    console.warn("Filler decode/play error:", err);
+    await state.audioPlayer.queueAudio(arrayBuf);
   }
 }
 
 function cancelInstantFiller() {
-  if (currentFillerSource) {
-    try {
-      currentFillerSource.stop();
-      currentFillerSource.disconnect();
-    } catch (_) {}
-    currentFillerSource = null;
-  }
   state.isSpeakingFiller = false;
   state.fillerPlaying = false;
 }
@@ -1674,11 +1634,10 @@ async function sendStreamingMessage(text) {
         try {
           const event = JSON.parse(jsonStr);
           if (event.type === "sentence") {
-            // First sentence arrived! Halt all fillers cleanly
+            // First sentence arrived! Halt all pending filler timers
             if (!fillerState.firstSentenceArrived) {
               fillerState.firstSentenceArrived = true;
               clearFillerTimers();
-              stopFillerAudio();
             }
 
             fullTextAccumulator += (fullTextAccumulator ? " " : "") + event.text;
@@ -1699,7 +1658,6 @@ async function sendStreamingMessage(text) {
     }
 
     clearFillerTimers();
-    stopFillerAudio();
 
     if (metaData) {
       recordClientCallTurn(
