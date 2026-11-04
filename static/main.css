@@ -2205,3 +2205,23 @@ button, input, select, textarea {
     text-align: left;
   }
 }
+
+/* Real-Time AI Streaming Typography & Cursor */
+.message-row.bot.streaming .message-bubble {
+  position: relative;
+  min-height: 2.2rem;
+}
+
+.streaming-cursor {
+  display: inline-block;
+  color: var(--brand);
+  font-weight: bold;
+  animation: streamBlink 0.8s infinite;
+  margin-left: 2px;
+}
+
+@keyframes streamBlink {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0; }
+}
+

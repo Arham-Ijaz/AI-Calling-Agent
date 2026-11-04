@@ -37,9 +37,20 @@ from functools import lru_cache
 from pathlib import Path
 
 import bcrypt
+import edge_tts
 import jwt
 from dotenv import load_dotenv
-from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response, status
+from fastapi import (
+    Depends,
+    FastAPI,
+    HTTPException,
+    Query,
+    Request,
+    Response,
+    WebSocket,
+    WebSocketDisconnect,
+    status,
+)
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from gtts import gTTS
@@ -874,14 +885,40 @@ def _build_error_response(exc: Exception) -> dict:
 
 
 # =====================================================================
-# 7. Text-to-Speech (gTTS)
+# 7. Text-to-Speech (edge-tts with gTTS fallback)
 # =====================================================================
+DEFAULT_ENGLISH_VOICE = os.getenv("EDGE_TTS_VOICE_EN", "en-US-JennyNeural")
+DEFAULT_URDU_VOICE = os.getenv("EDGE_TTS_VOICE_UR", "ur-PK-UzmaNeural")
+
+
 @lru_cache(maxsize=256)
 def synthesize(text: str, lang: str) -> bytes:
     """Synthesize text into MP3 audio using gTTS with memory caching."""
     buffer = io.BytesIO()
     gTTS(text=text, lang=lang).write_to_fp(buffer)
     return buffer.getvalue()
+
+
+async def synthesize_edge_tts(text: str, voice: str | None = None) -> bytes:
+    """Synthesize text into natural neural MP3 audio using edge-tts with automatic fallback."""
+    clean_text = text.strip()
+    if not clean_text:
+        return b""
+    selected_voice = voice or (DEFAULT_URDU_VOICE if ARABIC_SCRIPT.search(clean_text) else DEFAULT_ENGLISH_VOICE)
+    try:
+        communicate = edge_tts.Communicate(clean_text, selected_voice)
+        audio_chunks: list[bytes] = []
+        async for chunk in communicate.stream():
+            if chunk["type"] == "audio":
+                audio_chunks.append(chunk["data"])
+        if audio_chunks:
+            return b"".join(audio_chunks)
+    except Exception as exc:
+        log.warning("edge-tts synthesis warning (%r), falling back to gTTS.", exc)
+
+    # Reliable fallback to local gTTS
+    lang = "ur" if ARABIC_SCRIPT.search(clean_text) else "en"
+    return await asyncio.to_thread(synthesize, clean_text, lang)
 
 
 # =====================================================================
@@ -1578,8 +1615,286 @@ async def get_key_status(admin: dict = Depends(require_admin)):
 
 
 # =====================================================================
-# 14. Voice Agent & Chat Endpoints
+# 14. Voice Agent & Real-Time Streaming WebSocket Endpoints
 # =====================================================================
+SENTENCE_TERMINATORS = re.compile(r"([.!?\n]+|\;\s*|\:\s*)")
+CLAUSE_TERMINATORS = re.compile(r"(\,\s+|\s+-\s+)")
+
+
+def build_voice_system_instruction(user_id: int | None = None) -> str:
+    """Build concise, conversational instructions tailored for low-latency live voice calls."""
+    faq_ctx = load_faqs_context(user_id)
+    product_ctx = load_products_context(user_id)
+    return f"""
+You are the DigiBuzz AI Calling Agent, speaking live with a customer over an active voice call.
+
+KNOWLEDGE BASE:
+1. Operational FAQs (policies, delivery, payments):
+{faq_ctx}
+
+2. Product Catalog (wholesale products):
+{product_ctx}
+
+CRITICAL RULES FOR LIVE VOICE CALL:
+1. BRANDING: You are "DigiBuzz AI Calling Agent". Speak professionally, warmly, and helpfully.
+2. ACCURACY: Answer using ONLY the FAQ knowledge base and Product Catalog above. State exact product names, specifications, stock status, and wholesale prices in PKR.
+3. SPOKEN VOICE FORMAT:
+   - Speak in clear, natural, conversational sentences suitable for live Text-to-Speech audio.
+   - Do NOT use markdown asterisks (*), hashtags (#), bullet points (-), emojis, or JSON formatting.
+   - Keep answers concise and direct: maximum 1 to 3 short sentences so the caller can listen easily.
+4. LANGUAGE:
+   - Speak in English by default.
+   - If the caller speaks or types in Urdu or Roman Urdu, respond politely in clear Urdu or English.
+5. ESCALATION: If the caller asks for an unlisted product, unknown policy, or asks for a human agent, state: "I am transferring your call to a dedicated Human Support Agent. Please hold on."
+6. OFF-TOPIC: If the user asks something completely outside DigiBuzz products, wholesale orders, or policies, politely decline: "I am sorry, I can only assist you with DigiBuzz products, wholesale orders, and store services."
+"""
+
+
+async def stream_gemini_voice_tokens(session_id: str, user_text: str, user_id: int | None = None):
+    """Asynchronously stream text tokens from Gemini with automatic dual-key failover."""
+    async def _stream_once():
+        if NEW_GENAI_AVAILABLE:
+            if not key_manager.client:
+                if key_manager.key1 or key_manager.key2:
+                    key_manager._configure_active()
+                if not key_manager.client:
+                    raise RuntimeError("GEMINI_API_KEY is not configured.")
+
+            contents: list[types.Content] = []
+            for turn in SESSIONS.get(session_id, []):
+                role = "user" if turn.get("role") == "user" else "model"
+                parts = turn.get("parts", [""])
+                part_text = parts[0] if isinstance(parts, list) and parts else str(parts)
+                contents.append(types.Content(role=role, parts=[types.Part.from_text(text=part_text)]))
+
+            contents.append(types.Content(role="user", parts=[types.Part.from_text(text=user_text)]))
+
+            config = types.GenerateContentConfig(
+                system_instruction=build_voice_system_instruction(user_id),
+                temperature=0.2,
+                max_output_tokens=350,
+            )
+
+            try:
+                stream = await key_manager.client.aio.models.generate_content_stream(
+                    model=MODEL_NAME,
+                    contents=contents,
+                    config=config,
+                )
+                async for chunk in stream:
+                    if chunk.text:
+                        yield chunk.text
+            except RuntimeError as r_err:
+                if "Event loop" in str(r_err):
+                    key_manager._configure_active()
+                    stream = await key_manager.client.aio.models.generate_content_stream(
+                        model=MODEL_NAME,
+                        contents=contents,
+                        config=config,
+                    )
+                    async for chunk in stream:
+                        if chunk.text:
+                            yield chunk.text
+                else:
+                    raise
+        else:
+            model = get_legacy_model(user_id)
+            contents = SESSIONS.get(session_id, []) + [{"role": "user", "parts": [user_text]}]
+            response = await model.generate_content_async(contents, stream=True)
+            async for chunk in response:
+                if chunk.text:
+                    yield chunk.text
+
+    try:
+        async for token in _stream_once():
+            yield token
+    except Exception as exc:
+        if key_manager.is_quota_error(exc) and key_manager.mark_exhausted_and_switch():
+            log.warning("Gemini primary key exhausted during streaming; switched to fallback.")
+            try:
+                async for token in _stream_once():
+                    yield token
+            except Exception as e2:
+                log.error("Fallback Gemini stream error: %r", e2)
+                yield FALLBACK_SPEECH
+        else:
+            log.error("Gemini voice stream error: %r", exc)
+            yield FALLBACK_SPEECH
+
+
+@app.websocket("/ws/ai-call")
+@app.websocket("/ws/call")
+async def websocket_ai_call_endpoint(websocket: WebSocket):
+    """Ultra-low latency real-time voice streaming WebSocket endpoint."""
+    await websocket.accept()
+
+    # Extract authenticated user context if cookie or token present
+    opt_user = None
+    token = websocket.cookies.get(COOKIE_NAME)
+    if not token and "token" in websocket.query_params:
+        token = websocket.query_params["token"]
+    if token:
+        payload = decode_access_token(token)
+        if payload and payload.get("sub"):
+            with db() as conn:
+                row = conn.execute(
+                    "SELECT id, email, full_name, role, is_active FROM users WHERE id = ?",
+                    (payload["sub"],),
+                ).fetchone()
+                if row and row["is_active"]:
+                    opt_user = dict(row)
+    user_id = opt_user["id"] if opt_user else None
+
+    # Track active streaming task to support graceful client interruption
+    active_stream_task: asyncio.Task | None = None
+
+    async def _handle_message(session_id: str, user_text: str):
+        full_text = ""
+        buffer = ""
+
+        try:
+            # 1. Inform client that generation has begun
+            await websocket.send_text(json.dumps({
+                "type": "start",
+                "session_id": session_id,
+                "user_text": user_text,
+            }))
+            await websocket.send_text(json.dumps({"type": "audio_start"}))
+
+            # 2. Stream tokens from Gemini and convert sentences to audio in real-time
+            async for token in stream_gemini_voice_tokens(session_id, user_text, user_id):
+                full_text += token
+                buffer += token
+
+                # Send text token immediately to update the client's chat UI
+                await websocket.send_text(json.dumps({
+                    "type": "text_delta",
+                    "delta": token,
+                }))
+
+                # Check for sentence completion (terminal punctuation)
+                m_term = SENTENCE_TERMINATORS.search(buffer)
+                if m_term:
+                    end_idx = m_term.end()
+                    sentence = buffer[:end_idx].strip()
+                    buffer = buffer[end_idx:]
+                    if len(sentence) >= 4:
+                        audio_data = await synthesize_edge_tts(sentence)
+                        if audio_data:
+                            await websocket.send_bytes(audio_data)
+                elif len(buffer) >= 45:
+                    # Check for natural clause pause
+                    m_clause = CLAUSE_TERMINATORS.search(buffer)
+                    if m_clause:
+                        end_idx = m_clause.end()
+                        clause = buffer[:end_idx].strip()
+                        buffer = buffer[end_idx:]
+                        if len(clause) >= 8:
+                            audio_data = await synthesize_edge_tts(clause)
+                            if audio_data:
+                                await websocket.send_bytes(audio_data)
+
+            # 3. Flush any remaining text in buffer to audio
+            tail = buffer.strip()
+            if tail:
+                audio_data = await synthesize_edge_tts(tail)
+                if audio_data:
+                    await websocket.send_bytes(audio_data)
+
+            # 4. Notify client that all audio chunks have been sent
+            await websocket.send_text(json.dumps({"type": "audio_end"}))
+
+            # 5. Determine intent & outcome
+            clean_reply = full_text.strip() or "Thank you for reaching DigiBuzz. How may I assist you?"
+            lower_r = clean_reply.lower()
+            outcome = "Escalated" if ("human" in lower_r or "transfer" in lower_r or "escalat" in lower_r) else "Resolved"
+            intent = "general_inquiry"
+            if any(w in lower_r for w in ("price", "pkr", "cost", "wholesale", "rate")):
+                intent = "price_check"
+            elif any(w in lower_r for w in ("stock", "available", "units", "quantity")):
+                intent = "stock_inquiry"
+            elif any(w in lower_r for w in ("return", "refund", "warranty", "policy", "delivery")):
+                intent = "policy_inquiry"
+            elif outcome == "Escalated":
+                intent = "human_handoff"
+
+            # 6. Persist to memory and SQLite database
+            remember(session_id, user_text, clean_reply)
+            try:
+                await asyncio.to_thread(
+                    save_message,
+                    session_id,
+                    user_text,
+                    {"reply": clean_reply, "intent": intent, "outcome": outcome},
+                    user_id,
+                )
+            except Exception as e_save:
+                log.error("Failed to save stream call message: %r", e_save)
+
+            # 7. Notify client that turn is complete
+            await websocket.send_text(json.dumps({
+                "type": "done",
+                "session_id": session_id,
+                "reply": clean_reply,
+                "intent": intent,
+                "outcome": outcome,
+                "user_text": user_text,
+            }))
+
+        except asyncio.CancelledError:
+            log.info("Voice streaming cancelled by user interruption.")
+            raise
+        except Exception as exc:
+            log.error("Error during voice stream processing: %r", exc)
+            try:
+                await websocket.send_text(json.dumps({
+                    "type": "error",
+                    "message": "Sorry, I encountered an error during audio streaming. Please try again.",
+                }))
+            except Exception:
+                pass
+
+    try:
+        while True:
+            raw_msg = await websocket.receive_text()
+            try:
+                data = json.loads(raw_msg)
+            except Exception:
+                continue
+
+            msg_type = data.get("type", "message")
+
+            if msg_type == "ping":
+                await websocket.send_text(json.dumps({"type": "pong"}))
+                continue
+
+            if msg_type == "interrupt":
+                if active_stream_task and not active_stream_task.done():
+                    active_stream_task.cancel()
+                continue
+
+            if msg_type in ("message", "user_message"):
+                # Cancel any ongoing output before starting a new turn
+                if active_stream_task and not active_stream_task.done():
+                    active_stream_task.cancel()
+
+                session_id = data.get("session_id") or f"sess_{int(datetime.now().timestamp())}"
+                user_text = (data.get("text") or "").strip()
+                if not user_text:
+                    continue
+
+                active_stream_task = asyncio.create_task(_handle_message(session_id, user_text))
+
+    except WebSocketDisconnect:
+        if active_stream_task and not active_stream_task.done():
+            active_stream_task.cancel()
+        log.info("Client disconnected from voice streaming WebSocket.")
+    except Exception as exc:
+        if active_stream_task and not active_stream_task.done():
+            active_stream_task.cancel()
+        log.warning("WebSocket exception: %r", exc)
+
+
 @app.post("/api/chat")
 async def chat_endpoint(req: ChatRequest, request: Request):
     """Process a user message with Gemini AI and log to user account if authenticated."""
@@ -1603,10 +1918,9 @@ async def chat_endpoint(req: ChatRequest, request: Request):
 
 @app.post("/api/tts")
 async def tts_endpoint(req: TTSRequest):
-    """Convert text to spoken MP3 audio via gTTS."""
-    lang = "ur" if ARABIC_SCRIPT.search(req.text) else "en"
+    """Convert text to spoken MP3 audio via edge-tts (with gTTS fallback)."""
     try:
-        audio = await asyncio.to_thread(synthesize, req.text.strip(), lang)
+        audio = await synthesize_edge_tts(req.text.strip())
     except Exception as exc:
         log.error("TTS failure: %r", exc)
         raise HTTPException(status_code=502, detail="Text-to-speech is unavailable.")

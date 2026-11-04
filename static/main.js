@@ -16,6 +16,11 @@ const state = {
   recognition: null,
   isListening: false,
   micPermissionRequested: false,
+  ws: null,
+  audioPlayer: null,
+  currentBotBubble: null,
+  currentStreamText: "",
+  activeUserText: "",
 };
 
 // ---- Filler phrases spoken immediately while Gemini processes ----
@@ -131,6 +136,17 @@ function generateSessionId() {
 function initSession() {
   state.sessionId = generateSessionId();
   state.messageCount = 0;
+  if (!state.audioPlayer) {
+    state.audioPlayer = new AudioStreamPlayer();
+    state.audioPlayer.onPlaybackStart = () => {
+      setMicLocked(true);
+    };
+    state.audioPlayer.onPlaybackComplete = () => {
+      setMicLocked(false);
+      setBusy(false);
+      autoStartListening();
+    };
+  }
   updateSessionDisplay();
 }
 
@@ -197,6 +213,11 @@ async function startCall() {
   if (state.isOnCall) return;
   state.isOnCall = true;
 
+  // Ensure AudioContext is initialized and unlocked during user gesture
+  if (state.audioPlayer) {
+    state.audioPlayer.ensureContext();
+  }
+
   setStatus("active", "Connected — DigiBuzz AI Calling Agent");
   setInputEnabled(true);
 
@@ -209,6 +230,9 @@ async function startCall() {
 
   setText("sideStatus", "Active");
   setText("settingsCallStatus", "Active");
+
+  // Establish low-latency WebSocket connection
+  initAiWebSocket();
 
   // Request browser microphone permission right on call start if not done yet
   await requestMicPermission();
@@ -248,6 +272,17 @@ function endCall() {
   // Turn off mic if active
   if (state.recognition && state.isListening) {
     try { state.recognition.stop(); } catch (_) {}
+  }
+
+  // Gracefully close WebSocket and interrupt any ongoing backend stream
+  if (state.ws) {
+    try {
+      if (state.ws.readyState === WebSocket.OPEN) {
+        state.ws.send(JSON.stringify({ type: "interrupt" }));
+      }
+      state.ws.close();
+    } catch (_) {}
+    state.ws = null;
   }
 
   setStatus("idle", "Call ended");
@@ -322,6 +357,31 @@ function addBotMessage(text) {
   scrollChatToBottom();
 }
 
+function createStreamingBotMessage() {
+  hidePlaceholder();
+  const row = document.createElement("div");
+  row.className = "message-row bot streaming";
+  row.innerHTML = `
+    <div class="message-avatar">🤖</div>
+    <div>
+      <div class="message-bubble"><span class="streaming-cursor">▌</span></div>
+      <div class="message-meta">${formatTime()}</div>
+    </div>`;
+  const win = $("chatWindow");
+  if (win) win.appendChild(row);
+  scrollChatToBottom();
+  return row;
+}
+
+function updateStreamingBotMessage(row, text) {
+  if (!row) return;
+  const bubble = row.querySelector(".message-bubble");
+  if (bubble) {
+    bubble.innerHTML = `${escapeHtml(text)}<span class="streaming-cursor">▌</span>`;
+  }
+  scrollChatToBottom();
+}
+
 function addSystemMessage(text) {
   const el = document.createElement("div");
   el.style.cssText = "text-align:center;color:var(--text-muted);font-size:.8rem;padding:.5rem 1rem;";
@@ -362,64 +422,271 @@ function setBusy(busy) {
 }
 
 // =====================================================================
-// Filler Speech + Send Message
+// Web Audio API — Real-time Gapless Stream Queue Player
 // =====================================================================
-function pickFiller() {
-  return FILLER_PHRASES[Math.floor(Math.random() * FILLER_PHRASES.length)];
-}
-
-async function playTTSImmediate(text) {
-  if (!state.isVoiceEnabled) return;
-  try {
-    const res = await fetch("/api/tts", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ text }),
-    });
-    if (!res.ok) return;
-    const blob = await res.blob();
-    const url = URL.createObjectURL(blob);
-    stopAudio();
-    state.currentAudio = new Audio(url);
-    state.fillerPlaying = true;
-    state.currentAudio.onended = () => { state.fillerPlaying = false; URL.revokeObjectURL(url); };
-    state.currentAudio.play().catch(() => {});
-  } catch (_) { /* TTS is non-critical */ }
-}
-
-async function playAudio(text) {
-  if (!state.isVoiceEnabled) return;
-  // Wait for filler to finish (max 3s)
-  if (state.fillerPlaying) {
-    await new Promise((resolve) => {
-      const check = setInterval(() => {
-        if (!state.fillerPlaying) { clearInterval(check); resolve(); }
-      }, 100);
-      setTimeout(() => { clearInterval(check); resolve(); }, 3000);
-    });
+class AudioStreamPlayer {
+  constructor() {
+    this.audioCtx = null;
+    this.activeSources = [];
+    this.nextStartTime = 0;
+    this.totalQueued = 0;
+    this.totalFinished = 0;
+    this.isPlaying = false;
+    this.onPlaybackStart = null;
+    this.onPlaybackComplete = null;
   }
+
+  ensureContext() {
+    if (!this.audioCtx) {
+      const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+      if (AudioContextClass) {
+        this.audioCtx = new AudioContextClass();
+      }
+    }
+    if (this.audioCtx && this.audioCtx.state === "suspended") {
+      this.audioCtx.resume().catch(() => {});
+    }
+    return this.audioCtx;
+  }
+
+  async queueAudio(arrayBuffer) {
+    const ctx = this.ensureContext();
+    if (!ctx || !arrayBuffer || arrayBuffer.byteLength === 0) return;
+    try {
+      const bufferCopy = arrayBuffer.slice(0);
+      const audioBuffer = await ctx.decodeAudioData(bufferCopy);
+      this.totalQueued++;
+
+      if (!this.isPlaying) {
+        this.isPlaying = true;
+        if (typeof this.onPlaybackStart === "function") {
+          this.onPlaybackStart();
+        }
+      }
+
+      const source = ctx.createBufferSource();
+      source.buffer = audioBuffer;
+      source.connect(ctx.destination);
+
+      const now = ctx.currentTime;
+      if (this.nextStartTime < now) {
+        this.nextStartTime = now + 0.03;
+      }
+      const playAt = this.nextStartTime;
+      this.nextStartTime += audioBuffer.duration;
+
+      source.start(playAt);
+      this.activeSources.push(source);
+
+      source.onended = () => {
+        this.totalFinished++;
+        const idx = this.activeSources.indexOf(source);
+        if (idx !== -1) this.activeSources.splice(idx, 1);
+        if (this.totalFinished >= this.totalQueued) {
+          this.isPlaying = false;
+          this.nextStartTime = 0;
+          if (typeof this.onPlaybackComplete === "function") {
+            this.onPlaybackComplete();
+          }
+        }
+      };
+    } catch (err) {
+      console.warn("AudioBuffer decode error:", err);
+    }
+  }
+
+  stop() {
+    this.activeSources.forEach((src) => {
+      try {
+        src.stop();
+        src.disconnect();
+      } catch (_) {}
+    });
+    this.activeSources = [];
+    this.nextStartTime = 0;
+    this.totalQueued = 0;
+    this.totalFinished = 0;
+    this.isPlaying = false;
+  }
+}
+
+// Global audio playback & streaming methods
+async function playAudio(text) {
+  if (!state.isVoiceEnabled || !text) return;
+  stopAudio();
+  setMicLocked(true);
+
   try {
     const res = await fetch("/api/tts", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ text }),
     });
-    if (!res.ok) return;
-    const blob = await res.blob();
-    const url = URL.createObjectURL(blob);
-    stopAudio();
-    state.currentAudio = new Audio(url);
-    state.currentAudio.onended = () => URL.revokeObjectURL(url);
-    state.currentAudio.play().catch(() => {});
-  } catch (_) { /* TTS is non-critical */ }
+    if (!res.ok) {
+      setMicLocked(false);
+      autoStartListening();
+      return;
+    }
+
+    const arrayBuffer = await res.arrayBuffer();
+    if (state.audioPlayer) {
+      await state.audioPlayer.queueAudio(arrayBuffer);
+    } else {
+      const blob = new Blob([arrayBuffer], { type: "audio/mpeg" });
+      const url = URL.createObjectURL(blob);
+      state.currentAudio = new Audio(url);
+      const cleanup = () => {
+        URL.revokeObjectURL(url);
+        if (state.currentAudio) state.currentAudio = null;
+        setMicLocked(false);
+        autoStartListening();
+      };
+      state.currentAudio.onended = cleanup;
+      state.currentAudio.onerror = cleanup;
+      await state.currentAudio.play();
+    }
+  } catch (err) {
+    console.warn("playAudio error:", err);
+    setMicLocked(false);
+    autoStartListening();
+  }
 }
 
 function stopAudio() {
+  if (state.audioPlayer) {
+    state.audioPlayer.stop();
+  }
   if (state.currentAudio) {
-    state.currentAudio.pause();
+    try {
+      state.currentAudio.pause();
+    } catch (_) {}
     state.currentAudio = null;
   }
   state.fillerPlaying = false;
+  setMicLocked(false);
+}
+
+// =====================================================================
+// WebSocket Ultra-Low Latency Streaming Connection
+// =====================================================================
+function initAiWebSocket() {
+  if (state.ws && (state.ws.readyState === WebSocket.OPEN || state.ws.readyState === WebSocket.CONNECTING)) {
+    return state.ws;
+  }
+
+  const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+  const wsUrl = `${protocol}//${window.location.host}/ws/ai-call`;
+
+  try {
+    const ws = new WebSocket(wsUrl);
+    ws.binaryType = "arraybuffer";
+
+    ws.onopen = () => {
+      console.log("WebSocket connected to ultra-low latency endpoint /ws/ai-call");
+    };
+
+    ws.onmessage = async (event) => {
+      // 1. Incoming binary audio stream chunks from edge-tts
+      if (event.data instanceof ArrayBuffer) {
+        if (state.isVoiceEnabled && state.audioPlayer) {
+          setMicLocked(true);
+          await state.audioPlayer.queueAudio(event.data);
+        }
+        return;
+      }
+
+      // 2. Incoming JSON text events & stream progress
+      try {
+        const data = JSON.parse(event.data);
+        switch (data.type) {
+          case "start":
+            setBusy(true);
+            setMicLocked(true);
+            state.currentStreamText = "";
+            state.currentBotBubble = createStreamingBotMessage();
+            break;
+
+          case "audio_start":
+            setMicLocked(true);
+            break;
+
+          case "text_delta":
+            if (data.delta) {
+              state.currentStreamText += data.delta;
+              updateStreamingBotMessage(state.currentBotBubble, state.currentStreamText);
+            }
+            break;
+
+          case "audio_end":
+            // Server completed audio chunk generation
+            if (!state.isVoiceEnabled || (state.audioPlayer && !state.audioPlayer.isPlaying)) {
+              setBusy(false);
+              setMicLocked(false);
+              autoStartListening();
+            }
+            break;
+
+          case "done":
+            const finalReply = data.reply || state.currentStreamText;
+            if (state.currentBotBubble) {
+              updateStreamingBotMessage(state.currentBotBubble, finalReply);
+              state.currentBotBubble.classList.remove("streaming");
+              const cursor = state.currentBotBubble.querySelector(".streaming-cursor");
+              if (cursor) cursor.remove();
+            } else {
+              addBotMessage(finalReply);
+            }
+            recordClientCallTurn(
+              state.sessionId,
+              data.user_text || state.activeUserText,
+              finalReply,
+              data.intent,
+              data.outcome
+            );
+            state.currentBotBubble = null;
+            state.currentStreamText = "";
+            state.activeUserText = "";
+
+            if (!state.isVoiceEnabled || (state.audioPlayer && !state.audioPlayer.isPlaying)) {
+              setBusy(false);
+              setMicLocked(false);
+              autoStartListening();
+            }
+            break;
+
+          case "interrupted":
+            stopAudio();
+            setBusy(false);
+            setMicLocked(false);
+            break;
+
+          case "error":
+            setBusy(false);
+            setMicLocked(false);
+            addBotMessage(data.message || "An error occurred during audio generation.");
+            autoStartListening();
+            break;
+        }
+      } catch (err) {
+        console.error("WebSocket message parse error:", err);
+      }
+    };
+
+    ws.onclose = () => {
+      console.log("WebSocket connection closed.");
+      state.ws = null;
+    };
+
+    ws.onerror = (err) => {
+      console.warn("WebSocket error:", err);
+    };
+
+    state.ws = ws;
+    return ws;
+  } catch (e) {
+    console.warn("Could not initialize WebSocket:", e);
+    return null;
+  }
 }
 
 // Detect spoken intent to end the call
@@ -454,6 +721,13 @@ async function sendMessage(text) {
 
   $("chatInput").value = "";
   addUserMessage(text);
+  state.activeUserText = text;
+
+  // Interrupt any existing audio playback immediately
+  stopAudio();
+  if (state.ws && state.ws.readyState === WebSocket.OPEN) {
+    state.ws.send(JSON.stringify({ type: "interrupt" }));
+  }
 
   // Check if caller wants to finish the call via voice command
   if (isEndCallPhrase(text)) {
@@ -461,17 +735,15 @@ async function sendMessage(text) {
     const farewell = "Thank you for calling DigiBuzz Support. Have a wonderful day! Goodbye.";
     addBotMessage(farewell);
     
-    // Play polite farewell message and automatically hang up call when audio completes
     if (state.isVoiceEnabled) {
-      await playAudio(farewell);
-      // Wait for audio to finish then end call
-      if (state.currentAudio) {
-        state.currentAudio.onended = () => {
+      if (state.audioPlayer) {
+        state.audioPlayer.onPlaybackComplete = () => {
           setBusy(false);
           endCall();
         };
-        return;
       }
+      await playAudio(farewell);
+      return;
     }
     setBusy(false);
     endCall();
@@ -479,13 +751,22 @@ async function sendMessage(text) {
   }
 
   setBusy(true);
+  setMicLocked(true);
 
-  // Play filler immediately — do not await (fire-and-forget)
-  playTTSImmediate(pickFiller());
+  // 1. Ultra-low latency streaming over WebSocket
+  if (state.ws && state.ws.readyState === WebSocket.OPEN) {
+    if (state.audioPlayer) {
+      state.audioPlayer.ensureContext();
+    }
+    state.ws.send(JSON.stringify({
+      type: "message",
+      session_id: state.sessionId,
+      text: text,
+    }));
+    return;
+  }
 
-  // Small delay so filler starts before API call
-  await sleep(800);
-
+  // 2. Fallback to HTTP POST if WebSocket connection is not open
   try {
     const res = await fetch("/api/chat", {
       method: "POST",
@@ -503,9 +784,10 @@ async function sendMessage(text) {
     setBusy(false);
     addBotMessage(data.reply);
     recordClientCallTurn(state.sessionId, text, data.reply, data.intent, data.outcome);
-    playAudio(data.speech || data.reply);
+    await playAudio(data.speech || data.reply);
   } catch (err) {
     setBusy(false);
+    setMicLocked(false);
     addBotMessage("Sorry, I encountered an error. Please try again.");
     console.error("Chat error:", err);
   }
@@ -655,6 +937,9 @@ function initSpeechRecognition() {
     $("btnMic").title = "Listening to you…";
     // If agent was playing audio, mute/stop it immediately so mic doesn't catch AI voice
     stopAudio();
+    if (state.ws && state.ws.readyState === WebSocket.OPEN) {
+      state.ws.send(JSON.stringify({ type: "interrupt" }));
+    }
   };
 
   recog.onend = () => {
@@ -686,8 +971,9 @@ function initSpeechRecognition() {
       recog.stop();
     } else {
       // Never allow mic while AI agent is speaking
-      if (state.currentAudio) {
-        stopAudio();
+      stopAudio();
+      if (state.ws && state.ws.readyState === WebSocket.OPEN) {
+        state.ws.send(JSON.stringify({ type: "interrupt" }));
       }
       try {
         recog.start();
@@ -717,117 +1003,18 @@ function setMicLocked(locked) {
 // Automatically turn ON microphone when the AI agent completes speaking
 function autoStartListening() {
   if (!state.isOnCall || state.isBusy || !state.recognition) return;
+  if (state.audioPlayer && state.audioPlayer.isPlaying) return;
   
-  // Brief delay (350ms) to ensure speakers have completely released the audio buffer
+  // Brief delay (300ms) to ensure speakers have completely released the audio buffer
   setTimeout(() => {
     if (!state.isOnCall || state.isBusy || state.currentAudio || state.isListening) return;
+    if (state.audioPlayer && state.audioPlayer.isPlaying) return;
     try {
       state.recognition.start();
     } catch (e) {
-      // If already started or browser blocked auto-start, ignore cleanly
       console.log("Auto-mic start attempt:", e.message || e);
     }
-  }, 350);
-}
-
-// =====================================================================
-// Filler Speech + Audio Playback Helpers
-// =====================================================================
-function pickFiller() {
-  return FILLER_PHRASES[Math.floor(Math.random() * FILLER_PHRASES.length)];
-}
-
-async function playTTSImmediate(text) {
-  if (!state.isVoiceEnabled) return;
-  try {
-    const res = await fetch("/api/tts", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ text }),
-    });
-    if (!res.ok) return;
-    const blob = await res.blob();
-    const url = URL.createObjectURL(blob);
-    stopAudio();
-
-    // Lock mic while filler speaks
-    setMicLocked(true);
-
-    state.currentAudio = new Audio(url);
-    state.fillerPlaying = true;
-    state.currentAudio.onended = () => {
-      state.fillerPlaying = false;
-      URL.revokeObjectURL(url);
-      setMicLocked(false);
-      // Don't autoStartListening here because the actual reply will speak right after
-    };
-    state.currentAudio.onerror = () => {
-      state.fillerPlaying = false;
-      URL.revokeObjectURL(url);
-      setMicLocked(false);
-    };
-    await state.currentAudio.play();
-  } catch (_) {
-    setMicLocked(false);
-  }
-}
-
-async function playAudio(text) {
-  if (!state.isVoiceEnabled) return;
-  
-  // Wait for filler to finish if one is currently playing
-  if (state.fillerPlaying) {
-    await new Promise((resolve) => {
-      const check = setInterval(() => {
-        if (!state.fillerPlaying) { clearInterval(check); resolve(); }
-      }, 100);
-      setTimeout(() => { clearInterval(check); resolve(); }, 3000);
-    });
-  }
-
-  try {
-    const res = await fetch("/api/tts", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ text }),
-    });
-    if (!res.ok) {
-      setMicLocked(false);
-      autoStartListening();
-      return;
-    }
-    const blob = await res.blob();
-    const url = URL.createObjectURL(blob);
-    stopAudio();
-
-    // Lock mic while agent speaks
-    setMicLocked(true);
-
-    state.currentAudio = new Audio(url);
-    const cleanup = () => {
-      URL.revokeObjectURL(url);
-      if (state.currentAudio) state.currentAudio = null;
-      setMicLocked(false);
-      // Auto-turn on mic right when AI finishes speaking its answer or greeting!
-      autoStartListening();
-    };
-
-    state.currentAudio.onended = cleanup;
-    state.currentAudio.onerror = cleanup;
-    await state.currentAudio.play();
-  } catch (_) {
-    setMicLocked(false);
-    autoStartListening();
-  }
-}
-
-function stopAudio() {
-  if (state.currentAudio) {
-    state.currentAudio.pause();
-    state.currentAudio = null;
-  }
-  state.fillerPlaying = false;
-  setMicLocked(false);
+  }, 300);
 }
 
 // =====================================================================
