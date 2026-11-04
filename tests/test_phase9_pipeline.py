@@ -1,6 +1,13 @@
+import os
+import sys
 import asyncio
 import json
 import time
+
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
+
 from fastapi.testclient import TestClient
 from app import app, db, check_instant_fast_path, synthesize_edge_tts, TTS_AUDIO_CACHE, CACHED_FAQ_ANSWERS
 

@@ -1,9 +1,9 @@
 @echo off
 setlocal
-title DigiBuzz AI Calling Agent
+title AI Calling Agent — Production Auto Launcher
 
 echo =======================================================
-echo    DigiBuzz AI Customer Calling Agent - Auto Launcher
+echo         AI Calling Agent — Production Auto Launcher
 echo =======================================================
 echo.
 
@@ -41,8 +41,8 @@ if not exist ".env" (
 )
 
 :: 3. Install / Verify dependencies from requirements.txt
-echo [INFO] Installing required dependencies from requirements.txt...
-echo (Please wait while dependencies are downloaded and verified...)
+echo [INFO] Verifying and installing required dependencies...
+echo (Please wait while dependencies are checked...)
 echo.
 %PY_CMD% -m pip install -r requirements.txt --disable-pip-version-check
 if %errorlevel% neq 0 (
@@ -73,8 +73,10 @@ if errorlevel 1 (
 
 :: 5. Launch Server
 echo =======================================================
-echo   Starting DigiBuzz AI Calling Agent...
-echo   Open in browser: http://127.0.0.1:8000
+echo   Starting AI Calling Agent Production Server...
+echo   Web Dashboard:   http://127.0.0.1:8000
+echo   WebSocket Voice: ws://127.0.0.1:8000/ws/ai-call
+echo   Telephony Voice: http://127.0.0.1:8000/api/telephony/voice
 echo   To stop server:  Press CTRL+C
 echo =======================================================
 echo.

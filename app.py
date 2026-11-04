@@ -4429,7 +4429,222 @@ async def get_session_handoff_status(session_id: str):
 
 
 # =====================================================================
-# 20. Main Server Entrypoint
+# 20. Telephony API Endpoints (Twilio / SIP / PSTN Webhooks & Outbound Calls)
+# =====================================================================
+TELEPHONY_PROVIDER = os.getenv("TELEPHONY_PROVIDER", "twilio").strip().lower()
+TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID", "").strip()
+TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN", "").strip()
+TWILIO_PHONE_NUMBER = os.getenv("TWILIO_PHONE_NUMBER", "").strip()
+TELEPHONY_WEBHOOK_URL = os.getenv("TELEPHONY_WEBHOOK_URL", "").strip().rstrip("/")
+TELEPHONY_DEFAULT_VOICE = os.getenv("TELEPHONY_DEFAULT_VOICE", "Polly.Aditi").strip()
+TELEPHONY_LANGUAGE = os.getenv("TELEPHONY_LANGUAGE", "en-US").strip()
+
+try:
+    from twilio.rest import Client as TwilioClient
+    TWILIO_SDK_AVAILABLE = True
+except ImportError:
+    TWILIO_SDK_AVAILABLE = False
+
+
+class OutboundCallRequest(BaseModel):
+    to_phone: str
+    message: str | None = None
+    customer_name: str | None = None
+
+
+@app.api_route("/api/telephony/voice", methods=["GET", "POST"])
+@app.api_route("/api/telephony/inbound", methods=["GET", "POST"])
+async def telephony_inbound_voice(request: Request):
+    """
+    Twilio Voice inbound webhook.
+    Generates TwiML XML with <Gather input="speech"> and dynamic business greeting.
+    """
+    params = dict(request.query_params)
+    if request.method == "POST":
+        try:
+            form = await request.form()
+            params.update(dict(form))
+        except Exception:
+            pass
+
+    call_sid = params.get("CallSid") or f"call_{int(time.time())}"
+    caller_phone = params.get("From", "Unknown")
+    session_id = f"tel_{call_sid}"
+
+    # Register call session in database
+    def _reg():
+        with db() as conn:
+            call_id = get_or_create_call(conn, session_id, user_id=None)
+            conn.execute("UPDATE calls SET status = 'in-progress' WHERE id = ?", (call_id,))
+    await asyncio.to_thread(_reg)
+
+    b_name = get_business_setting("business_name", "our business")
+    default_greet = f"Hello! Welcome to {b_name} automated telephone assistant. How may I assist you today?"
+    greeting = get_business_setting("greeting", default_greet)
+
+    gather_url = f"{TELEPHONY_WEBHOOK_URL}/api/telephony/gather" if TELEPHONY_WEBHOOK_URL else "/api/telephony/gather"
+
+    twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+    <Gather input="speech" action="{gather_url}" method="POST" speechTimeout="auto" language="{TELEPHONY_LANGUAGE}">
+        <Say voice="{TELEPHONY_DEFAULT_VOICE}" language="{TELEPHONY_LANGUAGE}">{greeting}</Say>
+    </Gather>
+    <Say voice="{TELEPHONY_DEFAULT_VOICE}" language="{TELEPHONY_LANGUAGE}">We did not receive any input. Please call back soon. Goodbye!</Say>
+    <Hangup/>
+</Response>"""
+    return Response(content=twiml, media_type="application/xml")
+
+
+@app.post("/api/telephony/gather")
+async def telephony_gather_webhook(request: Request):
+    """
+    Twilio Voice gather webhook: processes caller speech from telephone network,
+    queries fast-path / AI reasoning, and returns responsive TwiML.
+    """
+    form_data = await request.form()
+    params = dict(form_data)
+    call_sid = params.get("CallSid") or f"call_{int(time.time())}"
+    speech_result = (params.get("SpeechResult") or "").strip()
+    session_id = f"tel_{call_sid}"
+
+    gather_url = f"{TELEPHONY_WEBHOOK_URL}/api/telephony/gather" if TELEPHONY_WEBHOOK_URL else "/api/telephony/gather"
+
+    if not speech_result:
+        twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+    <Gather input="speech" action="{gather_url}" method="POST" speechTimeout="auto" language="{TELEPHONY_LANGUAGE}">
+        <Say voice="{TELEPHONY_DEFAULT_VOICE}" language="{TELEPHONY_LANGUAGE}">I could not hear your response clearly. Please say your question or order request.</Say>
+    </Gather>
+    <Say voice="{TELEPHONY_DEFAULT_VOICE}">Thank you for calling. Goodbye!</Say>
+    <Hangup/>
+</Response>"""
+        return Response(content=twiml, media_type="application/xml")
+
+    # Fast-path check or LLM response
+    fast_match = check_instant_fast_path(speech_result, session_id, user_id=None)
+    if fast_match:
+        reply = fast_match["reply"]
+        intent = fast_match.get("intent", "general_inquiry")
+        outcome = fast_match.get("outcome", "Resolved")
+        needs_handoff = fast_match.get("needs_handoff", False)
+    else:
+        result = await ask_gemini(session_id, speech_result, user_id=None)
+        reply = result["reply"]
+        intent = result["intent"]
+        outcome = result["outcome"]
+        needs_handoff = outcome == "Escalated"
+
+    remember(session_id, speech_result, reply)
+    await asyncio.to_thread(save_message, session_id, speech_result, {"reply": reply, "intent": intent, "outcome": outcome}, None)
+
+    support_phone = get_business_setting("support_phone", "+923001234567")
+
+    if needs_handoff:
+        twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+    <Say voice="{TELEPHONY_DEFAULT_VOICE}">{reply}</Say>
+    <Dial timeout="20">{support_phone}</Dial>
+</Response>"""
+    elif intent == "farewell":
+        twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+    <Say voice="{TELEPHONY_DEFAULT_VOICE}">{reply}</Say>
+    <Hangup/>
+</Response>"""
+    else:
+        twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+    <Gather input="speech" action="{gather_url}" method="POST" speechTimeout="auto" language="{TELEPHONY_LANGUAGE}">
+        <Say voice="{TELEPHONY_DEFAULT_VOICE}">{reply}</Say>
+    </Gather>
+    <Say voice="{TELEPHONY_DEFAULT_VOICE}">Thank you for calling. Have a great day ahead! Goodbye.</Say>
+    <Hangup/>
+</Response>"""
+
+    return Response(content=twiml, media_type="application/xml")
+
+
+@app.post("/api/telephony/status")
+async def telephony_status_callback(request: Request):
+    """Twilio call status callback (ringing, in-progress, completed, failed)."""
+    form_data = await request.form()
+    params = dict(form_data)
+    call_sid = params.get("CallSid")
+    call_status = params.get("CallStatus", "completed")
+
+    if call_sid:
+        session_id = f"tel_{call_sid}"
+        def _update():
+            with db() as conn:
+                conn.execute(
+                    "UPDATE calls SET status = ?, last_activity = ? WHERE session_id = ?",
+                    (call_status, now(), session_id),
+                )
+        await asyncio.to_thread(_update)
+
+    return {"status": "ok", "call_sid": call_sid, "call_status": call_status}
+
+
+@app.post("/api/telephony/outbound")
+async def trigger_outbound_call(req: OutboundCallRequest, admin: dict = Depends(require_admin)):
+    """Initiate an automated outbound phone call to a customer using Twilio REST API."""
+    to_phone = req.to_phone.strip()
+    if not to_phone:
+        raise HTTPException(status_code=400, detail="Recipient phone number (to_phone) is required.")
+
+    if not TWILIO_ACCOUNT_SID or not TWILIO_AUTH_TOKEN or not TWILIO_PHONE_NUMBER:
+        # Graceful sandbox / mock response when credentials are not yet configured in .env
+        simulated_sid = f"SIM_{uuid.uuid4().hex[:16]}"
+        return {
+            "status": "simulated",
+            "provider": TELEPHONY_PROVIDER,
+            "call_sid": simulated_sid,
+            "to": to_phone,
+            "from": TWILIO_PHONE_NUMBER or "+10000000000",
+            "message": "Telephony credentials are not configured in .env. Call was simulated for testing.",
+        }
+
+    try:
+        if not TWILIO_SDK_AVAILABLE:
+            raise RuntimeError("twilio Python library is not installed. Install via: pip install twilio")
+        client = TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+        webhook_target = f"{TELEPHONY_WEBHOOK_URL}/api/telephony/voice"
+        call = client.calls.create(
+            to=to_phone,
+            from_=TWILIO_PHONE_NUMBER,
+            url=webhook_target,
+            status_callback=f"{TELEPHONY_WEBHOOK_URL}/api/telephony/status",
+            status_callback_event=["initiated", "ringing", "answered", "completed"],
+        )
+        return {
+            "status": "initiated",
+            "provider": "twilio",
+            "call_sid": call.sid,
+            "to": to_phone,
+            "from": TWILIO_PHONE_NUMBER,
+        }
+    except Exception as exc:
+        log.error("Outbound telephony call failed: %r", exc)
+        raise HTTPException(status_code=500, detail=f"Failed to place outbound call: {exc}")
+
+
+@app.get("/api/telephony/config")
+async def get_telephony_config(admin: dict = Depends(require_admin)):
+    """Return telephony configuration status for admin dashboard."""
+    is_configured = bool(TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN and TWILIO_PHONE_NUMBER)
+    return {
+        "provider": TELEPHONY_PROVIDER,
+        "is_configured": is_configured,
+        "phone_number": TWILIO_PHONE_NUMBER or None,
+        "webhook_url": TELEPHONY_WEBHOOK_URL or None,
+        "default_voice": TELEPHONY_DEFAULT_VOICE,
+        "language": TELEPHONY_LANGUAGE,
+        "inbound_voice_url": f"{TELEPHONY_WEBHOOK_URL}/api/telephony/voice" if TELEPHONY_WEBHOOK_URL else "/api/telephony/voice",
+    }
+
+
+# =====================================================================
+# 21. Main Server Entrypoint
 # =====================================================================
 if __name__ == "__main__":
     import uvicorn
