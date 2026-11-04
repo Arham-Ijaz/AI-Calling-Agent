@@ -1693,10 +1693,47 @@ def _expand_knowledge_keywords(words: set[str]) -> set[str]:
     return expanded
 
 
+CONVERSATIONAL_INTENTS: dict[str, tuple[set[str], str]] = {
+    "greeting": (
+        {"hello", "hi", "hey", "salam", "assalam", "aoa", "morning", "evening", "afternoon"},
+        "Hello! I am the DigiBuzz AI Calling Agent. How may I assist you with our wholesale products or services today?"
+    ),
+    "identity": (
+        {"who", "name", "identity", "kaun", "calling"},
+        "I am the DigiBuzz AI Calling Agent, your 24/7 automated assistant for wholesale orders, group buying pools, and product inquiries."
+    ),
+    "status": (
+        {"how", "doing", "haal", "kaise"},
+        "I am doing great, thank you! How may I assist you with DigiBuzz products or business orders today?"
+    ),
+    "gratitude": (
+        {"thanks", "thank", "shukriya", "jazakallah", "welcome"},
+        "You are very welcome! Please let me know if there is anything else I can help you with today."
+    ),
+    "catalog_overview": (
+        {"catalog", "categories", "products", "items", "list", "offer"},
+        "We offer wholesale pricing across mobile phones, laptops, tablets, power banks, networking routers, and printers. What product can I check for you?"
+    ),
+}
+
+
 def check_fast_knowledge_response(user_text: str, user_id: int | None = None) -> dict | None:
     """Fast-path lookup against SQLite FAQs and Product Catalog for 0ms ultra-low latency response."""
     clean_query = user_text.lower().strip()
-    q_words = set(re.findall(r"\b[a-z0-9]{3,}\b", clean_query)) - FAST_KNOWLEDGE_STOP_WORDS
+    words_all = set(re.findall(r"\b[a-z0-9]{2,}\b", clean_query))
+    if not words_all:
+        return None
+
+    # 1. Check conversational intents (greetings, identity, gratitude)
+    for intent, (triggers, reply) in CONVERSATIONAL_INTENTS.items():
+        if words_all.intersection(triggers) and len(words_all) <= 6:
+            return {
+                "type": "conversational",
+                "answer": reply,
+                "intent": intent,
+            }
+
+    q_words = words_all - FAST_KNOWLEDGE_STOP_WORDS
     if not q_words:
         return None
 
@@ -1706,7 +1743,7 @@ def check_fast_knowledge_response(user_text: str, user_id: int | None = None) ->
         with db() as conn:
             conn.row_factory = sqlite3.Row
 
-            # 1. Check FAQs
+            # 2. Check FAQs
             faq_rows = conn.execute(
                 """
                 SELECT question, answer FROM faqs
@@ -1735,7 +1772,7 @@ def check_fast_knowledge_response(user_text: str, user_id: int | None = None) ->
                     "intent": "faq_inquiry",
                 }
 
-            # 2. Check Products
+            # 3. Check Products
             prod_rows = conn.execute(
                 """
                 SELECT name, category, price, stock_status, description FROM products
@@ -1952,7 +1989,18 @@ async def websocket_ai_call_endpoint(websocket: WebSocket):
                 intent = fast_match.get("intent", "general_inquiry")
                 outcome = "Resolved"
 
-                # Stream words smoothly with 20ms human typing delay
+                # Immediately enqueue sentences to TTS worker so audio begins synthesis at millisecond 0!
+                m_split = SENTENCE_TERMINATORS.search(reply_text)
+                if m_split:
+                    first_sent = reply_text[:m_split.end()].strip()
+                    remainder = reply_text[m_split.end():].strip()
+                    await audio_queue.put(first_sent)
+                    if remainder:
+                        await audio_queue.put(remainder)
+                else:
+                    await audio_queue.put(reply_text)
+
+                # Concurrently stream words smoothly with 20ms human typing delay
                 words = reply_text.split(" ")
                 for i, w in enumerate(words):
                     token = w + (" " if i < len(words) - 1 else "")
@@ -1962,9 +2010,6 @@ async def websocket_ai_call_endpoint(websocket: WebSocket):
                         "delta": token,
                     }))
                     await asyncio.sleep(0.02)
-
-                # Queue answer for audio synthesis
-                await audio_queue.put(reply_text)
             else:
                 # 5. Open-ended / Conversational: Stream from Gemini in real-time
                 first_clause_enqueued = False
@@ -2118,7 +2163,18 @@ async def chat_endpoint(req: ChatRequest, request: Request):
     opt_user = await get_optional_user(request)
     user_id = opt_user["id"] if opt_user else None
 
-    result = await ask_gemini(req.session_id, text, user_id)
+    # Fast-path check: if exact or confident FAQ/product/conversational match, respond in < 5ms!
+    fast_match = check_fast_knowledge_response(text, user_id)
+    if fast_match:
+        result = {
+            "reply": fast_match["answer"],
+            "speech": fast_match["answer"],
+            "intent": fast_match.get("intent", "general_inquiry"),
+            "outcome": "Resolved",
+        }
+    else:
+        result = await ask_gemini(req.session_id, text, user_id)
+
     remember(req.session_id, text, result["reply"])
 
     try:

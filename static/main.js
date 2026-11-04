@@ -22,6 +22,7 @@ const state = {
   currentStreamText: "",
   activeUserText: "",
   isShowingFiller: false,
+  isSpeakingFiller: false,
 };
 
 // ---- Filler phrases spoken immediately while Gemini processes ----
@@ -460,6 +461,7 @@ class AudioStreamPlayer {
 
       if (!this.isPlaying) {
         this.isPlaying = true;
+        cancelInstantFiller(); // Immediately halt filler when real neural audio begins!
         if (typeof this.onPlaybackStart === "function") {
           this.onPlaybackStart();
         }
@@ -511,6 +513,37 @@ class AudioStreamPlayer {
   }
 }
 
+// =====================================================================
+// Instant Browser Voice Filler (0ms Audible Feedback)
+// =====================================================================
+function speakInstantFiller(phrase) {
+  if (!state.isVoiceEnabled) return;
+  const text = phrase || pickFiller();
+  if (typeof window !== "undefined" && window.speechSynthesis) {
+    try {
+      window.speechSynthesis.cancel();
+      const utter = new SpeechSynthesisUtterance(text);
+      utter.rate = 1.05;
+      utter.pitch = 1.0;
+      state.isSpeakingFiller = true;
+      utter.onend = () => { state.isSpeakingFiller = false; };
+      utter.onerror = () => { state.isSpeakingFiller = false; };
+      window.speechSynthesis.speak(utter);
+    } catch (e) {
+      console.warn("SpeechSynthesis filler error:", e);
+    }
+  }
+}
+
+function cancelInstantFiller() {
+  if (typeof window !== "undefined" && window.speechSynthesis && state.isSpeakingFiller) {
+    try {
+      window.speechSynthesis.cancel();
+    } catch (_) {}
+    state.isSpeakingFiller = false;
+  }
+}
+
 // Global audio playback & streaming methods
 async function playAudio(text) {
   if (!state.isVoiceEnabled || !text) return;
@@ -554,6 +587,7 @@ async function playAudio(text) {
 }
 
 function stopAudio() {
+  cancelInstantFiller();
   if (state.audioPlayer) {
     state.audioPlayer.stop();
   }
@@ -708,6 +742,27 @@ function initAiWebSocket() {
   }
 }
 
+async function ensureAiWebSocket() {
+  if (state.ws && state.ws.readyState === WebSocket.OPEN) {
+    return state.ws;
+  }
+  const ws = initAiWebSocket();
+  if (!ws) return null;
+  if (ws.readyState === WebSocket.OPEN) return ws;
+
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => resolve(ws.readyState === WebSocket.OPEN ? ws : null), 1200);
+    ws.addEventListener("open", () => {
+      clearTimeout(timer);
+      resolve(ws);
+    }, { once: true });
+    ws.addEventListener("error", () => {
+      clearTimeout(timer);
+      resolve(null);
+    }, { once: true });
+  });
+}
+
 // Detect spoken intent to end the call
 function isEndCallPhrase(text) {
   if (!text) return false;
@@ -772,6 +827,9 @@ async function sendMessage(text) {
   setBusy(true);
   setMicLocked(true);
 
+  // Instantly speak filler aloud at 0ms so caller hears immediate voice response!
+  speakInstantFiller();
+
   // Instantly render filler in chat bubble with 0ms delay
   state.isShowingFiller = true;
   state.currentStreamText = "Let me check that for you...";
@@ -779,11 +837,12 @@ async function sendMessage(text) {
   updateStreamingBotMessage(state.currentBotBubble, state.currentStreamText);
 
   // 1. Ultra-low latency streaming over WebSocket
-  if (state.ws && state.ws.readyState === WebSocket.OPEN) {
+  const ws = await ensureAiWebSocket();
+  if (ws && ws.readyState === WebSocket.OPEN) {
     if (state.audioPlayer) {
       state.audioPlayer.ensureContext();
     }
-    state.ws.send(JSON.stringify({
+    ws.send(JSON.stringify({
       type: "message",
       session_id: state.sessionId,
       text: text,
@@ -791,7 +850,7 @@ async function sendMessage(text) {
     return;
   }
 
-  // 2. Fallback to HTTP POST if WebSocket connection is not open
+  // 2. Fallback to HTTP POST if WebSocket connection is completely offline
   try {
     const res = await fetch("/api/chat", {
       method: "POST",
@@ -807,12 +866,14 @@ async function sendMessage(text) {
 
     const data = await res.json();
     setBusy(false);
+    cancelInstantFiller();
     addBotMessage(data.reply);
     recordClientCallTurn(state.sessionId, text, data.reply, data.intent, data.outcome);
     await playAudio(data.speech || data.reply);
   } catch (err) {
     setBusy(false);
     setMicLocked(false);
+    cancelInstantFiller();
     addBotMessage("Sorry, I encountered an error. Please try again.");
     console.error("Chat error:", err);
   }
@@ -1215,6 +1276,14 @@ document.addEventListener("DOMContentLoaded", () => {
   initSession();
   initSpeechRecognition();
   loadChips();
+  initAiWebSocket(); // Pre-connect WebSocket so it is OPEN and waiting before the first call!
+
+  // Resume / Unlock AudioContext on the very first user gesture anywhere on page
+  window.addEventListener("click", () => {
+    if (state.audioPlayer) {
+      state.audioPlayer.ensureContext();
+    }
+  }, { once: true });
 
   // Call controls (with null-safe 'on' helper)
   on("btnStartCall", "click", startCall);
