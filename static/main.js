@@ -4,12 +4,38 @@
 // AI Calling Agent — Main JS (Call Page + Navigation)
 // =====================================================================
 
+// =====================================================================
+// Phase 9B: State Machine & Anti-Echo Configuration
+// =====================================================================
+const CallState = {
+  IDLE: "IDLE",
+  LISTENING: "LISTENING",
+  THINKING: "THINKING",
+  SPEAKING: "SPEAKING",
+};
+
+const ECHO_COOLDOWN_MS = 500; // 400-600ms cooldown after agent speech before mic unpauses
+
+const vadConfig = {
+  headphonesMode: false,
+  minSpeechDurationMs: 300,
+  speakerBleedMultiplier: 1.8,
+  headphonesThreshold: 0.025,
+  speakerThreshold: 0.075,
+};
+
 // ---- State ----
 const state = {
   sessionId: null,
   isOnCall: false,
   isBusy: false,
   isVoiceEnabled: true, // Default to true so AI agent speaks aloud on call
+  callState: CallState.IDLE,
+  agentSpeaking: false,
+  lastAgentSpeechEndTime: 0,
+  recognitionRunning: false,
+  echoCooldownTimer: null,
+  echoDiscardedCount: 0,
   messageCount: 0,
   currentAudio: null,
   fillerPlaying: false,
@@ -28,6 +54,131 @@ const state = {
 };
 
 const ARABIC_SCRIPT_REGEX = /[\u0600-\u06FF\u0750-\u077F\uFB50-\uFDFF\uFE70-\uFEFF]/;
+
+// Known filler phrases for echo rejection
+const KNOWN_FILLER_PHRASES = [
+  "let me check",
+  "let me check that for you",
+  "one moment",
+  "one moment please",
+  "sure one moment",
+  "just a second",
+  "thanks for waiting",
+  "almost there",
+  "hold on",
+  "please hold",
+  "okay let me check",
+  "جی ایک سیکنڈ",
+  "جی میں دیکھتی ہوں",
+  "ایک لمحہ دیجیے",
+  "بس تھوڑا سا انتظار",
+  "jee aik second",
+  "main check karti hoon",
+  "aik second hold kijiye",
+];
+
+// Rolling memory of recent agent sentences (up to 5)
+const recentAgentSentences = [];
+
+function normalizeTextForEcho(text) {
+  if (!text) return "";
+  let s = text.toLowerCase();
+  s = s.replace(/[\.,\/#!$%\^&\*;:{}=\-_`~()؟۔،!"'‘’?]/g, " ");
+  s = s.replace(/[\u0640]/g, "");
+  s = s.replace(/[يى]/g, "ی");
+  s = s.replace(/[ك]/g, "ک");
+  s = s.replace(/[ؤ]/g, "و");
+  s = s.replace(/[آإأ]/g, "ا");
+  s = s.replace(/\s+/g, " ").trim();
+  return s;
+}
+
+function computeTokenJaccard(s1, s2) {
+  const tokens1 = new Set(s1.split(/\s+/).filter(Boolean));
+  const tokens2 = new Set(s2.split(/\s+/).filter(Boolean));
+  if (tokens1.size === 0 || tokens2.size === 0) return 0;
+  let intersection = 0;
+  for (const t of tokens1) {
+    if (tokens2.has(t)) intersection++;
+  }
+  const union = new Set([...tokens1, ...tokens2]).size;
+  return union > 0 ? intersection / union : 0;
+}
+
+function computeTokenOverlap(userText, agentText) {
+  const normUser = normalizeTextForEcho(userText);
+  const normAgent = normalizeTextForEcho(agentText);
+  if (!normUser || !normAgent) return 0;
+
+  if (normAgent.includes(normUser) && normUser.length >= 6) return 1.0;
+  if (normUser.includes(normAgent) && normAgent.length >= 6) return 1.0;
+
+  const userTokens = normUser.split(/\s+/).filter(Boolean);
+  const agentTokens = new Set(normAgent.split(/\s+/).filter(Boolean));
+  if (userTokens.length === 0 || agentTokens.size === 0) return 0;
+
+  let common = 0;
+  for (const t of userTokens) {
+    if (agentTokens.has(t)) common++;
+  }
+  const userOverlapRatio = common / userTokens.length;
+  const jaccard = computeTokenJaccard(normUser, normAgent);
+  return Math.max(userOverlapRatio, jaccard);
+}
+
+function recordAgentSentence(text) {
+  if (!text || !text.trim()) return;
+  const clean = text.trim();
+  const normalized = normalizeTextForEcho(clean);
+  if (!normalized) return;
+  recentAgentSentences.push({
+    text: clean,
+    normalized: normalized,
+    timestamp: Date.now(),
+  });
+  while (recentAgentSentences.length > 5) {
+    recentAgentSentences.shift();
+  }
+}
+
+function isEchoOfAgentSpeech(userText) {
+  if (!userText || !userText.trim()) return false;
+  const normUser = normalizeTextForEcho(userText);
+  if (!normUser) return false;
+
+  // 1. Check known filler phrases
+  for (const filler of KNOWN_FILLER_PHRASES) {
+    const normFiller = normalizeTextForEcho(filler);
+    if (normUser === normFiller || normUser.includes(normFiller) || normFiller.includes(normUser)) {
+      console.debug("[ECHO_DISCARDED] User speech matched known filler phrase:", userText);
+      state.echoDiscardedCount++;
+      updateEchoDiscardedDisplay();
+      return true;
+    }
+  }
+
+  // 2. Check overlap with recent agent sentences
+  const now = Date.now();
+  for (let i = recentAgentSentences.length - 1; i >= 0; i--) {
+    const record = recentAgentSentences[i];
+    const ageMs = now - record.timestamp;
+    if (ageMs <= 3500 || (state.lastAgentSpeechEndTime > 0 && now - state.lastAgentSpeechEndTime <= 3000)) {
+      const overlap = computeTokenOverlap(normUser, record.normalized);
+      if (overlap >= 0.60) {
+        console.debug(`[ECHO_DISCARDED] User speech overlap (${(overlap * 100).toFixed(0)}%) with recent agent sentence: "${record.text}" (age=${ageMs}ms):`, userText);
+        state.echoDiscardedCount++;
+        updateEchoDiscardedDisplay();
+        return true;
+      }
+    }
+  }
+
+  return false;
+}
+
+function updateEchoDiscardedDisplay() {
+  setText("sideEchoDiscarded", state.echoDiscardedCount);
+}
 
 // ---- Filler phrases spoken immediately while Gemini processes ----
 const FILLER_PHRASES = [
@@ -145,12 +296,12 @@ function initSession() {
   if (!state.audioPlayer) {
     state.audioPlayer = new AudioStreamPlayer();
     state.audioPlayer.onPlaybackStart = () => {
-      setMicLocked(true);
+      onAgentSpeechStart();
     };
     state.audioPlayer.onPlaybackComplete = () => {
-      setMicLocked(false);
-      setBusy(false);
-      autoStartListening();
+      if (!state.speechQueue || state.speechQueue.queue.length === 0) {
+        onAgentSpeechEnd();
+      }
     };
   }
   if (!state.speechQueue && state.audioPlayer) {
@@ -232,7 +383,6 @@ async function startCall() {
   }
   loadFillerPhrases();
 
-  setStatus("active", "Connected — DigiBuzz AI Calling Agent");
   setInputEnabled(true);
 
   const btnStart = $("btnStartCall");
@@ -242,46 +392,36 @@ async function startCall() {
   const hint = $("callHintBanner");
   if (hint) hint.style.display = "inline-flex";
 
-  setText("sideStatus", "Active");
   setText("settingsCallStatus", "Active");
 
   // Establish low-latency WebSocket connection
   initAiWebSocket();
 
-  // Request browser microphone permission right on call start if not done yet
-  await requestMicPermission();
+  // Initialize echo-cancelled microphone audio stream and VAD analyser (Phase 9B)
+  await initMicAudioStream();
 
   hidePlaceholder();
   const greeting = "Hello! I am the DigiBuzz AI Calling Agent. How may I assist you with our products or services today?";
   addBotMessage(greeting);
   loadChips();
 
-  // Speak the initial greeting out loud so the model speaks immediately upon call start
+  // Speak greeting — playAudio transitions to SPEAKING and safely gates mic
   playAudio(greeting);
 }
 
-// Prompt and verify user microphone permission
+// Prompt and verify user microphone permission with hardware echo-cancellation
 async function requestMicPermission() {
-  if (state.micPermissionRequested) return;
-  if (navigator.mediaDevices && navigator.mediaDevices.getUserMedia) {
-    try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      // Stop stream right after getting permission so browser mic is unlocked
-      stream.getTracks().forEach((track) => track.stop());
-      state.micPermissionRequested = true;
-      $("btnMic").title = "Click to speak";
-    } catch (err) {
-      console.warn("Microphone access permission denied or dismissed:", err);
-      $("btnMic").title = "Mic access blocked. Enable in browser site settings.";
-      addSystemMessage("⚠️ Microphone permission required for voice input. Click mic or enable in browser.");
-    }
-  }
+  if (state.micPermissionRequested && micStream && micStream.active) return micStream;
+  return await initMicAudioStream();
 }
 
 function endCall() {
   if (!state.isOnCall) return;
   state.isOnCall = false;
   state.isBusy = false;
+
+  setCallState(CallState.IDLE, "Call ended");
+  safeAbortRecognition();
 
   stopFillerAudio();
   if (state.speechQueue) {
@@ -291,10 +431,9 @@ function endCall() {
     clearTimeout(speechSilenceTimer);
     speechSilenceTimer = null;
   }
-
-  // Turn off mic if active
-  if (state.recognition && state.isListening) {
-    try { state.recognition.stop(); } catch (_) {}
+  if (state.echoCooldownTimer) {
+    clearTimeout(state.echoCooldownTimer);
+    state.echoCooldownTimer = null;
   }
 
   // Gracefully close WebSocket and interrupt any ongoing backend stream
@@ -308,7 +447,6 @@ function endCall() {
     state.ws = null;
   }
 
-  setStatus("idle", "Call ended");
   setInputEnabled(false);
 
   const btnStart = $("btnStartCall");
@@ -423,33 +561,265 @@ function addSystemMessage(text) {
 }
 
 // =====================================================================
-// Status / UI State Helpers
+// Status / UI State Helpers & Phase 9B State Machine
 // =====================================================================
+let recognitionDebounceTimer = null;
+let micStream = null;
+let micAudioContext = null;
+let micAnalyser = null;
+let micSource = null;
+let vadCheckInterval = null;
+let vadSpeechStartTime = 0;
+let playbackBleedBaseline = 0.02;
+
+function setCallState(newState, detailText = "") {
+  state.callState = newState;
+  const dot = $("statusDot");
+  const label = $("statusText");
+  const micBtn = $("btnMic");
+  const interruptBtn = $("btnTapInterrupt");
+  const typing = $("typingIndicator");
+
+  switch (newState) {
+    case CallState.IDLE:
+      state.isBusy = false;
+      state.agentSpeaking = false;
+      if (dot) dot.className = "status-dot idle";
+      if (label) label.textContent = detailText || "Ready to connect";
+      if (typing) typing.classList.add("hidden");
+      if (micBtn) {
+        micBtn.classList.remove("listening", "speaking-muted");
+        micBtn.disabled = true;
+        micBtn.title = "Start call to speak";
+        micBtn.innerHTML = "🎤";
+      }
+      if (interruptBtn) interruptBtn.classList.add("hidden");
+      break;
+
+    case CallState.LISTENING:
+      state.isBusy = false;
+      state.agentSpeaking = false;
+      if (dot) dot.className = "status-dot active";
+      if (label) label.textContent = detailText || "Listening to you…";
+      if (typing) typing.classList.add("hidden");
+      if (micBtn) {
+        micBtn.classList.remove("speaking-muted");
+        micBtn.classList.add("listening");
+        micBtn.disabled = false;
+        micBtn.title = "Listening to you... Click to pause";
+        micBtn.innerHTML = "🎙️";
+      }
+      if (interruptBtn) interruptBtn.classList.add("hidden");
+      break;
+
+    case CallState.THINKING:
+      state.isBusy = true;
+      state.agentSpeaking = false;
+      if (dot) dot.className = "status-dot thinking";
+      if (label) label.textContent = detailText || "DigiBuzz AI is thinking…";
+      if (typing) typing.classList.remove("hidden");
+      if (micBtn) {
+        micBtn.classList.remove("listening", "speaking-muted");
+        micBtn.disabled = true;
+        micBtn.title = "AI is thinking...";
+        micBtn.innerHTML = "⏳";
+      }
+      if (interruptBtn) interruptBtn.classList.add("hidden");
+      break;
+
+    case CallState.SPEAKING:
+      state.isBusy = true;
+      state.agentSpeaking = true;
+      if (dot) dot.className = "status-dot speaking";
+      if (label) label.textContent = detailText || "DigiBuzz AI is speaking…";
+      if (typing) typing.classList.add("hidden");
+      if (micBtn) {
+        micBtn.classList.remove("listening");
+        micBtn.classList.add("speaking-muted");
+        micBtn.disabled = false;
+        micBtn.title = "Agent is speaking... Click to interrupt";
+        micBtn.innerHTML = "🔇";
+      }
+      if (interruptBtn) interruptBtn.classList.remove("hidden");
+      break;
+  }
+
+  if (state.isOnCall && newState !== CallState.IDLE) {
+    setText("sideStatus", newState);
+  }
+}
+
+function onAgentSpeechStart() {
+  if (state.echoCooldownTimer) {
+    clearTimeout(state.echoCooldownTimer);
+    state.echoCooldownTimer = null;
+  }
+  state.agentSpeaking = true;
+  setCallState(CallState.SPEAKING);
+  safeAbortRecognition();
+}
+
+function onAgentSpeechEnd() {
+  state.agentSpeaking = false;
+  state.lastAgentSpeechEndTime = Date.now();
+  if (state.echoCooldownTimer) {
+    clearTimeout(state.echoCooldownTimer);
+  }
+  // Cooldown window (400-600ms) before opening mic to let room reverb and speaker bleed die out
+  state.echoCooldownTimer = setTimeout(() => {
+    if (state.isOnCall && !state.agentSpeaking && (state.callState === CallState.SPEAKING || state.callState === CallState.THINKING)) {
+      setCallState(CallState.LISTENING);
+      safeStartRecognition();
+    }
+  }, ECHO_COOLDOWN_MS);
+}
+
+function safeStartRecognition() {
+  if (!state.isOnCall || state.callState !== CallState.LISTENING || state.agentSpeaking) {
+    return;
+  }
+  if (!state.recognition) return;
+  if (state.recognitionRunning) return;
+
+  if (recognitionDebounceTimer) {
+    clearTimeout(recognitionDebounceTimer);
+  }
+
+  recognitionDebounceTimer = setTimeout(() => {
+    if (!state.isOnCall || state.callState !== CallState.LISTENING || state.agentSpeaking) {
+      return;
+    }
+    if (state.recognitionRunning) return;
+    try {
+      state.recognition.start();
+      state.recognitionRunning = true;
+    } catch (err) {
+      if (err.name !== "InvalidStateError") {
+        console.warn("safeStartRecognition notice:", err.message || err);
+      }
+    }
+  }, 100);
+}
+
+function safeAbortRecognition() {
+  if (recognitionDebounceTimer) {
+    clearTimeout(recognitionDebounceTimer);
+    recognitionDebounceTimer = null;
+  }
+  if (!state.recognition) return;
+  try {
+    state.recognition.abort(); // abort clears audio buffer immediately
+  } catch (_) {}
+  state.recognitionRunning = false;
+  state.isListening = false;
+  const micBtn = $("btnMic");
+  if (micBtn && state.callState !== CallState.LISTENING) {
+    micBtn.classList.remove("listening");
+  }
+}
+
+async function initMicAudioStream() {
+  if (micStream && micStream.active) return micStream;
+  if (navigator.mediaDevices && navigator.mediaDevices.getUserMedia) {
+    try {
+      micStream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true,
+        },
+      });
+      state.micPermissionRequested = true;
+      const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+      if (AudioContextClass) {
+        if (!micAudioContext) {
+          micAudioContext = new AudioContextClass();
+        }
+        if (micAudioContext.state === "suspended") {
+          micAudioContext.resume().catch(() => {});
+        }
+        micSource = micAudioContext.createMediaStreamSource(micStream);
+        micAnalyser = micAudioContext.createAnalyser();
+        micAnalyser.fftSize = 256;
+        micSource.connect(micAnalyser);
+        startVadMonitoring();
+      }
+      return micStream;
+    } catch (err) {
+      console.warn("Microphone access error:", err);
+      $("btnMic").title = "Mic access blocked. Enable in browser site settings.";
+      addSystemMessage("⚠️ Microphone permission required for voice input. Click mic or enable in browser.");
+      return null;
+    }
+  }
+  return null;
+}
+
+function startVadMonitoring() {
+  if (vadCheckInterval) return;
+  vadCheckInterval = setInterval(() => {
+    if (!state.isOnCall || !micAnalyser) return;
+    const dataArray = new Uint8Array(micAnalyser.fftSize);
+    micAnalyser.getByteTimeDomainData(dataArray);
+    let sum = 0;
+    for (let i = 0; i < dataArray.length; i++) {
+      const val = (dataArray[i] - 128) / 128;
+      sum += val * val;
+    }
+    const rms = Math.sqrt(sum / dataArray.length);
+
+    // Only monitor voice-activity barge-in while the agent is actively SPEAKING
+    if (state.callState === CallState.SPEAKING) {
+      playbackBleedBaseline = 0.85 * playbackBleedBaseline + 0.15 * rms;
+
+      const isHeadphones = vadConfig.headphonesMode;
+      const threshold = isHeadphones
+        ? vadConfig.headphonesThreshold
+        : Math.max(vadConfig.speakerThreshold, playbackBleedBaseline * vadConfig.speakerBleedMultiplier);
+
+      if (rms > threshold) {
+        if (vadSpeechStartTime === 0) {
+          vadSpeechStartTime = Date.now();
+        } else if (Date.now() - vadSpeechStartTime >= vadConfig.minSpeechDurationMs) {
+          console.log(`[VAD_BARGE_IN] Detected user voice above bleed threshold (${rms.toFixed(3)} > ${threshold.toFixed(3)})`);
+          vadSpeechStartTime = 0;
+          bargeIn();
+        }
+      } else {
+        vadSpeechStartTime = 0;
+      }
+    } else {
+      vadSpeechStartTime = 0;
+    }
+  }, 50);
+}
+
 function setStatus(type, text) {
   const dot = $("statusDot");
   const label = $("statusText");
-  dot.className = "status-dot " + type;
-  label.textContent = text;
+  if (dot) dot.className = "status-dot " + type;
+  if (label) label.textContent = text;
 }
 
 function setInputEnabled(enabled) {
   const input = $("chatInput");
   const sendBtn = $("btnSend");
   const micBtn = $("btnMic");
-  input.disabled = !enabled;
-  sendBtn.disabled = !enabled;
-  micBtn.disabled = !enabled;
+  if (input) input.disabled = !enabled;
+  if (sendBtn) sendBtn.disabled = !enabled;
+  if (micBtn) micBtn.disabled = !enabled;
 }
 
 function setBusy(busy) {
   state.isBusy = busy;
-  $("btnSend").disabled = busy || !state.isOnCall;
-  $("chatInput").disabled = busy || !state.isOnCall;
+  const sendBtn = $("btnSend");
+  const chatInput = $("chatInput");
   const typing = $("typingIndicator");
-  if (busy) {
-    typing.classList.remove("hidden");
-  } else {
-    typing.classList.add("hidden");
+  if (sendBtn) sendBtn.disabled = busy || !state.isOnCall;
+  if (chatInput) chatInput.disabled = busy || !state.isOnCall;
+  if (typing) {
+    if (busy) typing.classList.remove("hidden");
+    else typing.classList.add("hidden");
   }
 }
 
@@ -491,7 +861,8 @@ class AudioStreamPlayer {
 
       if (!this.isPlaying) {
         this.isPlaying = true;
-        cancelInstantFiller(); // Immediately halt filler when real neural audio begins!
+        onAgentSpeechStart();
+        cancelInstantFiller();
         if (typeof this.onPlaybackStart === "function") {
           this.onPlaybackStart();
         }
@@ -518,6 +889,9 @@ class AudioStreamPlayer {
         if (this.totalFinished >= this.totalQueued) {
           this.isPlaying = false;
           this.nextStartTime = 0;
+          if (!state.speechQueue || state.speechQueue.queue.length === 0) {
+            onAgentSpeechEnd();
+          }
           if (typeof this.onPlaybackComplete === "function") {
             this.onPlaybackComplete();
           }
@@ -625,6 +999,9 @@ class SentenceSpeechQueue {
     const isFirst = (item.idx === 0);
     const isUrdu = ARABIC_SCRIPT_REGEX.test(item.text);
 
+    // Record agent sentence for anti-echo filtering
+    recordAgentSentence(item.text);
+
     // Halt any active filler cleanly the instant the first real sentence arrives
     stopFillerAudio();
 
@@ -638,6 +1015,7 @@ class SentenceSpeechQueue {
         if (this.queue.length > 0) {
           this.prefetch(this.queue[0].text);
         }
+        onAgentSpeechStart();
         await new Promise((resolve) => {
           const utter = new SpeechSynthesisUtterance(item.text);
           utter.voice = isUrdu ? this.localUrVoice : this.localEnVoice;
@@ -647,6 +1025,9 @@ class SentenceSpeechQueue {
           utter.onerror = resolve;
           window.speechSynthesis.speak(utter);
         });
+        if (this.queue.length === 0 && (!this.audioPlayer || !this.audioPlayer.isPlaying)) {
+          onAgentSpeechEnd();
+        }
         this.processNext();
         return;
       } catch (err) {
@@ -767,6 +1148,7 @@ function stopFillerAudio() {
 
 function speakInstantFiller(phrase) {
   if (!state.isVoiceEnabled || !phrase) return;
+  recordAgentSentence(phrase);
   if (typeof window !== "undefined" && window.speechSynthesis) {
     try {
       window.speechSynthesis.cancel();
@@ -782,8 +1164,21 @@ function speakInstantFiller(phrase) {
       utter.pitch = 1.0;
       state.isSpeakingFiller = true;
       state.fillerPlaying = true;
-      utter.onend = () => { state.isSpeakingFiller = false; state.fillerPlaying = false; };
-      utter.onerror = () => { state.isSpeakingFiller = false; state.fillerPlaying = false; };
+      onAgentSpeechStart();
+      utter.onend = () => {
+        state.isSpeakingFiller = false;
+        state.fillerPlaying = false;
+        if (!state.speechQueue || (state.speechQueue.queue.length === 0 && (!state.audioPlayer || !state.audioPlayer.isPlaying))) {
+          onAgentSpeechEnd();
+        }
+      };
+      utter.onerror = () => {
+        state.isSpeakingFiller = false;
+        state.fillerPlaying = false;
+        if (!state.speechQueue || (state.speechQueue.queue.length === 0 && (!state.audioPlayer || !state.audioPlayer.isPlaying))) {
+          onAgentSpeechEnd();
+        }
+      };
       window.speechSynthesis.speak(utter);
     } catch (e) {
       console.warn("SpeechSynthesis filler error:", e);
@@ -816,14 +1211,24 @@ function bargeIn() {
   if (state.ws && state.ws.readyState === WebSocket.OPEN) {
     state.ws.send(JSON.stringify({ type: "interrupt" }));
   }
-  setBusy(false);
+  if (state.echoCooldownTimer) {
+    clearTimeout(state.echoCooldownTimer);
+    state.echoCooldownTimer = null;
+  }
+  state.agentSpeaking = false;
+  state.isBusy = false;
+  if (state.isOnCall) {
+    setCallState(CallState.LISTENING, "Listening (interrupted)…");
+    safeStartRecognition();
+  }
 }
 
 // Global audio playback & streaming methods
 async function playAudio(text) {
   if (!state.isVoiceEnabled || !text) return;
+  recordAgentSentence(text);
   stopAudio();
-  setMicLocked(true);
+  onAgentSpeechStart();
 
   try {
     const res = await fetch("/api/tts", {
@@ -832,8 +1237,7 @@ async function playAudio(text) {
       body: JSON.stringify({ text }),
     });
     if (!res.ok) {
-      setMicLocked(false);
-      autoStartListening();
+      onAgentSpeechEnd();
       return;
     }
 
@@ -847,8 +1251,7 @@ async function playAudio(text) {
       const cleanup = () => {
         URL.revokeObjectURL(url);
         if (state.currentAudio) state.currentAudio = null;
-        setMicLocked(false);
-        autoStartListening();
+        onAgentSpeechEnd();
       };
       state.currentAudio.onended = cleanup;
       state.currentAudio.onerror = cleanup;
@@ -856,8 +1259,7 @@ async function playAudio(text) {
     }
   } catch (err) {
     console.warn("playAudio error:", err);
-    setMicLocked(false);
-    autoStartListening();
+    onAgentSpeechEnd();
   }
 }
 
@@ -873,7 +1275,7 @@ function stopAudio() {
     state.currentAudio = null;
   }
   state.fillerPlaying = false;
-  setMicLocked(false);
+  state.agentSpeaking = false;
 }
 
 // =====================================================================
@@ -1072,25 +1474,37 @@ async function sendMessage(text) {
   addUserMessage(text);
   state.activeUserText = text;
 
-  // Interrupt any existing audio playback immediately
-  bargeIn();
+  // Immediately halt any lingering playback and recognition
+  stopAudio();
+  stopFillerAudio();
+  if (state.speechQueue) {
+    state.speechQueue.reset();
+  }
+  if (state.activeStreamController) {
+    try {
+      state.activeStreamController.abort();
+    } catch (_) {}
+    state.activeStreamController = null;
+  }
+  if (state.ws && state.ws.readyState === WebSocket.OPEN) {
+    state.ws.send(JSON.stringify({ type: "interrupt" }));
+  }
+
+  // Switch to THINKING state and abort recognition
+  setCallState(CallState.THINKING);
+  safeAbortRecognition();
 
   // Check if caller wants to finish the call via voice command
   if (isEndCallPhrase(text)) {
-    setBusy(true);
     const farewell = "Thank you for calling DigiBuzz Support. Have a wonderful day! Goodbye.";
     addBotMessage(farewell);
     
     if (state.isVoiceEnabled) {
       await playAudio(farewell);
     }
-    setBusy(false);
     endCall();
     return;
   }
-
-  setBusy(true);
-  setMicLocked(true);
 
   // Setup Phase 9 filler timers (700ms short ack, 4s waiting, 10s timeout)
   fillerState.firstSentenceArrived = false;
@@ -1120,10 +1534,9 @@ async function sendMessage(text) {
       addBotMessage(apology);
       if (state.isVoiceEnabled) {
         await playAudio(apology);
+      } else {
+        onAgentSpeechEnd();
       }
-      setBusy(false);
-      setMicLocked(false);
-      autoStartListening();
 
       // Register handoff request
       fetch("/api/handoff", {
@@ -1226,17 +1639,15 @@ async function sendStreamingMessage(text) {
       );
     }
 
-    // Wait until speech queue finishes before allowing mic input
+    // Wait until speech queue finishes before transitioning out of speaking
     if (state.speechQueue && state.speechQueue.isProcessing) {
       state.speechQueue.onQueueEmpty = () => {
-        setBusy(false);
-        setMicLocked(false);
-        autoStartListening();
+        if (!state.audioPlayer || !state.audioPlayer.isPlaying) {
+          onAgentSpeechEnd();
+        }
       };
-    } else {
-      setBusy(false);
-      setMicLocked(false);
-      autoStartListening();
+    } else if (!state.audioPlayer || !state.audioPlayer.isPlaying) {
+      onAgentSpeechEnd();
     }
   } catch (err) {
     if (err.name === "AbortError") {
@@ -1271,17 +1682,13 @@ async function fallbackHttpChat(text) {
     if (state.isVoiceEnabled) {
       await playAudio(data.speech || data.reply);
     } else {
-      setBusy(false);
-      setMicLocked(false);
-      autoStartListening();
+      onAgentSpeechEnd();
     }
   } catch (e) {
-    setBusy(false);
-    setMicLocked(false);
     clearFillerTimers();
     stopFillerAudio();
     addBotMessage("Sorry, I encountered an error. Please try again.");
-    autoStartListening();
+    onAgentSpeechEnd();
   }
 }
 
@@ -1411,7 +1818,8 @@ let currentSpeechTranscript = "";
 function initSpeechRecognition() {
   const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
   if (!SpeechRecognition) {
-    $("btnMic").title = "Speech recognition not supported in this browser";
+    const mic = $("btnMic");
+    if (mic) mic.title = "Speech recognition not supported in this browser";
     return;
   }
 
@@ -1422,6 +1830,19 @@ function initSpeechRecognition() {
   recog.maxAlternatives = 1;
 
   recog.onresult = (e) => {
+    // 1. Mic Gating: accept recognition events only while strictly in LISTENING state
+    if (state.callState !== CallState.LISTENING || state.agentSpeaking) {
+      console.debug("[ECHO_GATING] Discarded speech result because agent is speaking or not in LISTENING state.");
+      return;
+    }
+
+    // 2. Cooldown Window: ignore results that occur inside the acoustic reverb cooldown
+    const timeSinceSpeech = Date.now() - state.lastAgentSpeechEndTime;
+    if (state.lastAgentSpeechEndTime > 0 && timeSinceSpeech < ECHO_COOLDOWN_MS) {
+      console.debug(`[ECHO_COOLDOWN] Discarded speech result within cooldown window (${timeSinceSpeech}ms < ${ECHO_COOLDOWN_MS}ms).`);
+      return;
+    }
+
     let interim = "";
     let finalTranscript = "";
 
@@ -1436,14 +1857,14 @@ function initSpeechRecognition() {
     const spokenText = (finalTranscript || interim).trim();
     if (!spokenText) return;
 
-    // Phase 9 Barge-in: if AI agent is speaking or streaming, immediately halt all audio!
-    if (state.isBusy || (state.audioPlayer && state.audioPlayer.isPlaying) || state.currentAudio || state.fillerPlaying || state.isSpeakingFiller) {
-      if (spokenText.length >= 2) {
-        bargeIn();
-      }
+    // 3. Self-Transcript Safety Net: check overlap with recent agent speech and filler phrases
+    if (isEchoOfAgentSpeech(spokenText)) {
+      console.debug("[ECHO_FILTER] Discarded self-echo transcript:", spokenText);
+      return;
     }
 
-    $("chatInput").value = spokenText;
+    const chatInput = $("chatInput");
+    if (chatInput) chatInput.value = spokenText;
     currentSpeechTranscript = spokenText;
 
     // Turn-taking: wait ~800ms of silence before sending the finalized transcript
@@ -1455,36 +1876,51 @@ function initSpeechRecognition() {
     speechSilenceTimer = setTimeout(() => {
       const textToSend = currentSpeechTranscript.trim();
       currentSpeechTranscript = "";
-      if (textToSend && state.isOnCall && !state.isBusy) {
+      if (textToSend && state.isOnCall && state.callState === CallState.LISTENING && !state.agentSpeaking) {
         sendMessage(textToSend);
       }
     }, 800);
   };
 
   recog.onstart = () => {
+    state.recognitionRunning = true;
     state.isListening = true;
-    $("btnMic").classList.add("listening");
-    $("btnMic").title = "Listening to you live…";
+    const mic = $("btnMic");
+    if (mic && state.callState === CallState.LISTENING) {
+      mic.classList.add("listening");
+      mic.title = "Listening to you live… Click to pause";
+    }
   };
 
   recog.onend = () => {
+    state.recognitionRunning = false;
     state.isListening = false;
-    $("btnMic").classList.remove("listening");
-    $("btnMic").title = "Click to speak";
-    // Keep continuous listening alive while on active call if AI is not speaking
-    if (state.isOnCall && !state.isBusy && !state.currentAudio && !(state.audioPlayer && state.audioPlayer.isPlaying)) {
+    const mic = $("btnMic");
+    if (mic) {
+      mic.classList.remove("listening");
+      if (state.callState === CallState.LISTENING) {
+        mic.title = "Click to speak";
+      }
+    }
+
+    // Never auto-restart while agent is speaking or in cooldown or not in LISTENING state
+    if (state.isOnCall && state.callState === CallState.LISTENING && !state.agentSpeaking) {
       setTimeout(() => {
-        if (state.isOnCall && !state.isBusy && !state.isListening) {
-          try { recog.start(); } catch (_) {}
+        if (state.isOnCall && state.callState === CallState.LISTENING && !state.agentSpeaking && !state.recognitionRunning) {
+          safeStartRecognition();
         }
       }, 200);
     }
   };
 
   recog.onerror = (e) => {
+    state.recognitionRunning = false;
     state.isListening = false;
-    $("btnMic").classList.remove("listening");
-    $("btnMic").title = "Click to speak";
+    const mic = $("btnMic");
+    if (mic) {
+      mic.classList.remove("listening");
+      mic.title = "Click to speak";
+    }
     if (e.error === "not-allowed") {
       addSystemMessage("⚠️ Microphone blocked. Please allow mic permissions in your browser bar.");
     }
@@ -1492,52 +1928,56 @@ function initSpeechRecognition() {
 
   state.recognition = recog;
 
-  $("btnMic").addEventListener("click", async () => {
-    if (!state.isOnCall) return;
-    
-    // Ensure permission is granted
-    if (!state.micPermissionRequested) {
-      await requestMicPermission();
-    }
+  const micBtn = $("btnMic");
+  if (micBtn) {
+    micBtn.addEventListener("click", async () => {
+      if (!state.isOnCall) return;
 
-    if (state.isListening) {
-      try { recog.stop(); } catch (_) {}
-    } else {
-      bargeIn();
-      try {
-        recog.start();
-      } catch (err) {
-        console.warn("Recog start error:", err);
+      // Ensure permission is granted
+      if (!state.micPermissionRequested) {
+        await requestMicPermission();
       }
-    }
-  });
+
+      // If clicked during SPEAKING, user is clicking to interrupt (barge-in)
+      if (state.callState === CallState.SPEAKING || state.agentSpeaking) {
+        bargeIn();
+        return;
+      }
+
+      if (state.recognitionRunning || state.isListening) {
+        safeAbortRecognition();
+      } else {
+        setCallState(CallState.LISTENING);
+        safeStartRecognition();
+      }
+    });
+  }
 }
 
 // Disable/enable microphone when AI agent is speaking to prevent echo
 function setMicLocked(locked) {
-  const mic = $("btnMic");
-  if (!mic) return;
   if (locked) {
-    mic.title = "Agent is speaking... Speak to barge-in";
+    if (state.callState !== CallState.SPEAKING && state.callState !== CallState.THINKING) {
+      setCallState(CallState.SPEAKING);
+    }
+    safeAbortRecognition();
   } else {
-    mic.disabled = !state.isOnCall || state.isBusy;
-    mic.title = state.isListening ? "Listening to you live…" : "Click to speak";
+    if (state.callState === CallState.SPEAKING) {
+      onAgentSpeechEnd();
+    }
   }
 }
 
 // Automatically turn ON microphone when the AI agent completes speaking
 function autoStartListening() {
-  if (!state.isOnCall || state.isBusy || !state.recognition) return;
+  if (!state.isOnCall || state.agentSpeaking) return;
   if (state.audioPlayer && state.audioPlayer.isPlaying) return;
   if (state.speechQueue && state.speechQueue.isProcessing) return;
 
-  setTimeout(() => {
-    if (!state.isOnCall || state.isBusy || state.currentAudio || state.isListening) return;
-    if (state.audioPlayer && state.audioPlayer.isPlaying) return;
-    try {
-      state.recognition.start();
-    } catch (_) {}
-  }, 200);
+  if (state.callState !== CallState.LISTENING) {
+    setCallState(CallState.LISTENING);
+  }
+  safeStartRecognition();
 }
 
 // =====================================================================
@@ -1742,6 +2182,16 @@ document.addEventListener("DOMContentLoaded", () => {
     });
   }
   on("btnSend", "click", () => sendMessage());
+
+  // Phase 9B: Tap-to-interrupt button & Headphones mode toggle
+  on("btnTapInterrupt", "click", () => bargeIn());
+  const toggleHeadphones = $("toggleHeadphonesMode");
+  if (toggleHeadphones) {
+    toggleHeadphones.addEventListener("change", (e) => {
+      vadConfig.headphonesMode = !!e.target.checked;
+      console.log(`[VAD] Headphones mode set to: ${vadConfig.headphonesMode}`);
+    });
+  }
 
   // Check key status only if admin
   if (typeof authState !== "undefined" && authState && authState.isAdmin) {

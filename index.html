@@ -84,6 +84,8 @@
               <span class="status-dot idle" id="statusDot"></span>
               <span id="statusText">Ready to connect</span>
             </div>
+            <!-- Tap to Interrupt Button (Phase 9B: Visible during agent speaking) -->
+            <button class="btn btn-outline btn-sm hidden interrupt-pill" id="btnTapInterrupt" title="Interrupt the agent and speak">✋ Tap to interrupt</button>
             <!-- Live Voice Tip Hint Banner -->
             <div id="callHintBanner" class="call-hint-banner" style="display:none;">
               <span>💡 Tip:</span> Say <em>"End Call"</em> or <em>"Bye"</em> anytime to finish the call
@@ -169,6 +171,10 @@
             <div class="info-row">
               <span class="info-label">Voice Audio</span>
               <span class="info-value" id="sideVoiceStatus">Enabled 🔊</span>
+            </div>
+            <div class="info-row">
+              <span class="info-label">Echo Discarded</span>
+              <span class="info-value mono" id="sideEchoDiscarded">0</span>
             </div>
           </div>
 
@@ -461,6 +467,15 @@
             <span class="info-label">Urdu Script Engine</span>
             <span class="info-value">Google Urdu (ur)</span>
           </div>
+          <div class="info-row" style="align-items:center; justify-content:space-between; margin-top:0.6rem;">
+            <label for="toggleHeadphonesMode" style="cursor:pointer; display:flex; align-items:center; gap:0.5rem; font-size:0.83rem;">
+              <span>🎧 Headphones Mode</span>
+            </label>
+            <input type="checkbox" id="toggleHeadphonesMode" style="width:18px; height:18px; cursor:pointer;" />
+          </div>
+          <small class="text-muted" style="display:block; margin-top:-0.3rem; margin-bottom:0.75rem; font-size:0.75rem;">
+            Enable when wearing headphones for instant sensitive voice barge-in without speaker echo.
+          </small>
           <div style="display:flex; flex-direction:column; gap:0.5rem; margin-top:0.75rem;">
             <button class="btn btn-outline" id="settingsBtnToggleVoice">🔊 Voice Output: Enabled</button>
             <button class="btn btn-outline" id="settingsBtnNewSession">🔄 Reset Calling Session</button>
