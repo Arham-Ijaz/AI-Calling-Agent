@@ -52,7 +52,7 @@ from fastapi import (
     WebSocketDisconnect,
     status,
 )
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from gtts import gTTS
 from pydantic import BaseModel, EmailStr, Field, field_validator
@@ -438,6 +438,45 @@ def seed_default_admin() -> None:
             log.info("Default Admin account created: %s (Password: %s)", admin_email, admin_pass)
 
 
+def seed_business_settings() -> None:
+    """Seed default business settings if not already present."""
+    defaults = {
+        "business_name": "DigiBuzz",
+        "business_hours_en": "We are open Monday through Saturday from 9:00 AM to 9:00 PM. We are closed on Sundays.",
+        "business_hours_ur": "ہم پیر سے ہفتہ صبح 9 بجے سے رات 9 بجے تک کھلے رہتے ہیں۔ اتوار کو ہمارا دفتر بند ہوتا ہے۔",
+        "support_phone": "+92 300 1234567",
+        "support_email": "support@digibuzz.com",
+        "office_address": "DigiBuzz Technologies, Main Boulevard, Gulberg III, Lahore, Pakistan",
+    }
+    with db() as conn:
+        for k, v in defaults.items():
+            conn.execute(
+                "INSERT OR IGNORE INTO business_settings (key, value) VALUES (?, ?)",
+                (k, v),
+            )
+
+
+def seed_sample_orders() -> None:
+    """Seed sample orders for order status lookup."""
+    with db() as conn:
+        count = conn.execute("SELECT COUNT(*) AS total FROM orders").fetchone()["total"]
+        if count > 0:
+            return
+        sample_orders = [
+            ("ORD-1001", None, "Ali Ahmed", "+923001112233", "Shipped", "TCS-987654", 4500, now()),
+            ("ORD-1002", None, "Fatima Khan", "+923015556677", "Out for Delivery", "LEO-443322", 12000, now()),
+            ("ORD-1003", None, "Bilal Tariq", "+923214448899", "Confirmed", "PENDING", 8500, now()),
+        ]
+        conn.executemany(
+            """
+            INSERT INTO orders (order_number, user_id, customer_name, customer_phone, status, tracking_number, total_pkr, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            sample_orders,
+        )
+        log.info("Seeded %d sample orders.", len(sample_orders))
+
+
 def init_db() -> None:
     """Initialize all database tables, columns, indexes and seed default admin."""
     try:
@@ -506,10 +545,40 @@ def init_db() -> None:
                     user_id INTEGER REFERENCES users(id)
                 );
 
+                CREATE TABLE IF NOT EXISTS business_settings (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS handoff_requests (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    session_id TEXT NOT NULL,
+                    user_id INTEGER REFERENCES users(id),
+                    trigger_type TEXT NOT NULL,
+                    reason TEXT,
+                    created_at TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'pending'
+                );
+
+                CREATE TABLE IF NOT EXISTS orders (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    order_number TEXT UNIQUE NOT NULL,
+                    user_id INTEGER REFERENCES users(id),
+                    customer_name TEXT NOT NULL,
+                    customer_phone TEXT,
+                    status TEXT NOT NULL DEFAULT 'confirmed',
+                    tracking_number TEXT,
+                    total_pkr INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL
+                );
+
                 CREATE INDEX IF NOT EXISTS idx_users_email ON users(email);
                 CREATE INDEX IF NOT EXISTS idx_users_phone ON users(phone);
                 CREATE INDEX IF NOT EXISTS idx_calls_session ON calls(session_id);
                 CREATE INDEX IF NOT EXISTS idx_msgs_call ON call_messages(call_id, id);
+                CREATE INDEX IF NOT EXISTS idx_orders_num ON orders(order_number);
+                CREATE INDEX IF NOT EXISTS idx_orders_user ON orders(user_id);
+                CREATE INDEX IF NOT EXISTS idx_handoff_session ON handoff_requests(session_id);
                 """
             )
 
@@ -532,6 +601,8 @@ def init_db() -> None:
         seed_products()
         seed_faqs()
         seed_default_admin()
+        seed_business_settings()
+        seed_sample_orders()
 
         # Automatically defragment & re-sequence product and FAQ IDs on startup
         with db() as conn:
@@ -722,11 +793,21 @@ def get_legacy_model(user_id: int | None = None):
     return legacy_model
 
 
+CACHED_STREAM_SYSTEM_INSTRUCTION: dict[int | None, str] = {}
+CACHED_FAQ_ANSWERS: dict[str, dict] = {}
+CACHED_FAQS: dict[int | None, str] = {}
+CACHED_PRODUCTS: dict[int | None, str] = {}
+
+
 def refresh_knowledge_base() -> None:
     """Rebuild Gemini system instructions and invalidate cached state when FAQs or products change."""
     global legacy_model
     legacy_model = None
-    log.info("Knowledge base dynamically refreshed.")
+    CACHED_STREAM_SYSTEM_INSTRUCTION.clear()
+    CACHED_FAQ_ANSWERS.clear()
+    CACHED_FAQS.clear()
+    CACHED_PRODUCTS.clear()
+    log.info("Knowledge base dynamically refreshed and caches cleared.")
 
 
 # Initialize DB safely on startup
@@ -904,6 +985,7 @@ FILLER_PHRASES_UR = [
 ]
 
 FILLER_AUDIO_CACHE: dict[str, bytes] = {}
+TTS_AUDIO_CACHE: dict[str, bytes] = {}
 
 
 @lru_cache(maxsize=256)
@@ -915,11 +997,15 @@ def synthesize(text: str, lang: str) -> bytes:
 
 
 async def synthesize_edge_tts(text: str, voice: str | None = None) -> bytes:
-    """Synthesize text into natural neural MP3 audio using edge-tts with automatic fallback."""
+    """Synthesize text into natural neural MP3 audio using edge-tts with memory caching and automatic fallback."""
     clean_text = text.strip()
     if not clean_text:
         return b""
     selected_voice = voice or (DEFAULT_URDU_VOICE if ARABIC_SCRIPT.search(clean_text) else DEFAULT_ENGLISH_VOICE)
+    cache_key = f"{selected_voice}:{clean_text}"
+    if cache_key in TTS_AUDIO_CACHE:
+        return TTS_AUDIO_CACHE[cache_key]
+
     try:
         communicate = edge_tts.Communicate(clean_text, selected_voice)
         audio_chunks: list[bytes] = []
@@ -927,13 +1013,19 @@ async def synthesize_edge_tts(text: str, voice: str | None = None) -> bytes:
             if chunk["type"] == "audio":
                 audio_chunks.append(chunk["data"])
         if audio_chunks:
-            return b"".join(audio_chunks)
+            audio_data = b"".join(audio_chunks)
+            if len(TTS_AUDIO_CACHE) < 500:
+                TTS_AUDIO_CACHE[cache_key] = audio_data
+            return audio_data
     except Exception as exc:
         log.warning("edge-tts synthesis warning (%r), falling back to gTTS.", exc)
 
     # Reliable fallback to local gTTS
     lang = "ur" if ARABIC_SCRIPT.search(clean_text) else "en"
-    return await asyncio.to_thread(synthesize, clean_text, lang)
+    audio_data = await asyncio.to_thread(synthesize, clean_text, lang)
+    if audio_data and len(TTS_AUDIO_CACHE) < 500:
+        TTS_AUDIO_CACHE[cache_key] = audio_data
+    return audio_data
 
 
 async def get_or_create_filler_audio(text: str, voice: str | None = None) -> bytes:
@@ -1799,6 +1891,405 @@ def check_fast_knowledge_response(user_text: str, user_id: int | None = None) ->
     return None
 
 
+WORD_TO_NUMBER = {
+    "zero": 0, "one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
+    "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10,
+    "eleven": 11, "twelve": 12, "twenty": 20, "thirty": 30, "fifty": 50, "hundred": 100,
+    "ek": 1, "aik": 1, "do": 2, "teen": 3, "char": 4, "chaar": 4, "paanch": 5, "panch": 5,
+    "che": 6, "chay": 6, "saat": 7, "aath": 8, "ath": 8, "nau": 9, "no": 9, "das": 10,
+    "ایک": 1, "دو": 2, "تین": 3, "چار": 4, "پانچ": 5, "چھ": 6, "سات": 7, "آٹھ": 8, "نو": 9, "دس": 10,
+}
+
+
+def parse_quantity(text: str) -> int | None:
+    """Extract numeric or worded quantity from text."""
+    clean = text.lower().strip()
+    m = re.search(r"\b(\d+)\s*(?:items|pcs|pieces|piece|units|dane|adad|عدد|دانوں|دانیں)?\b", clean, re.IGNORECASE)
+    if m:
+        try:
+            return int(m.group(1))
+        except ValueError:
+            pass
+    tokens = re.findall(r"[\w\u0600-\u06FF]+", clean)
+    for t in tokens:
+        if t in WORD_TO_NUMBER:
+            return WORD_TO_NUMBER[t]
+    return None
+
+
+def get_business_hours(is_urdu: bool = False) -> str:
+    """Retrieve business hours from business_settings table."""
+    key = "business_hours_ur" if is_urdu else "business_hours_en"
+    try:
+        with db() as conn:
+            row = conn.execute("SELECT value FROM business_settings WHERE key = ?", (key,)).fetchone()
+            if row and row["value"]:
+                return row["value"]
+    except Exception:
+        pass
+    if is_urdu:
+        return "ہم پیر سے ہفتہ صبح 9 بجے سے رات 9 بجے تک کھلے رہتے ہیں۔ اتوار کو ہمارا دفتر بند ہوتا ہے۔"
+    return "We are open Monday through Saturday from 9:00 AM to 9:00 PM. We are closed on Sundays."
+
+
+def lookup_order_status(text: str, user_id: int | None = None) -> dict | None:
+    """Direct database lookup for order status queries."""
+    clean = text.lower().strip()
+    order_keywords = ["order status", "track order", "where is my order", "mera order", "status of my order", "order kahan hai", "order track", "آرڈر", "ارڈر"]
+    has_keyword = any(k in clean for k in order_keywords)
+
+    m = re.search(r"\b(?:ord(?:er)?[- ]?)?(\d{4,6})\b", clean, re.IGNORECASE)
+    digits = m.group(1) if m else None
+    order_num = f"ORD-{digits}" if digits else None
+
+    if not (has_keyword or order_num):
+        return None
+
+    is_urdu = bool(ARABIC_SCRIPT.search(text)) or any(w in clean.split() for w in ["kahan", "mera", "batao", "hai", "hain", "karo"])
+
+    try:
+        with db() as conn:
+            row = None
+            if order_num:
+                row = conn.execute(
+                    "SELECT order_number, status, tracking_number, total_pkr FROM orders WHERE order_number = ? OR order_number LIKE ?",
+                    (order_num, f"%{digits}%"),
+                ).fetchone()
+
+            if not row and user_id:
+                row = conn.execute(
+                    "SELECT order_number, status, tracking_number, total_pkr FROM orders WHERE user_id = ? ORDER BY id DESC LIMIT 1",
+                    (user_id,),
+                ).fetchone()
+
+            if not row and has_keyword and not order_num:
+                row = conn.execute(
+                    "SELECT order_number, status, tracking_number, total_pkr FROM orders ORDER BY id DESC LIMIT 1"
+                ).fetchone()
+
+            if row:
+                status_str = row["status"]
+                tracking_str = f"Tracking ID is {row['tracking_number']}." if row["tracking_number"] and row["tracking_number"] != "PENDING" else "Tracking details will be sent via SMS shortly."
+                if is_urdu:
+                    reply = f"آپ کا آرڈر نمبر {row['order_number']} اس وقت {status_str} ہے اور کل رقم {row['total_pkr']} روپے ہے۔"
+                    return {"reply": reply, "language": "ur", "intent": "order_status", "outcome": "Resolved", "confidence": 1.0}
+                reply = f"Your order {row['order_number']} is currently {status_str}. Total amount is PKR {row['total_pkr']:,}. {tracking_str}"
+                return {"reply": reply, "language": "en", "intent": "order_status", "outcome": "Resolved", "confidence": 1.0}
+    except Exception as exc:
+        log.warning("Order lookup error: %r", exc)
+
+    if has_keyword:
+        if is_urdu:
+            return {
+                "reply": "برائے مہربانی اپنا آرڈر نمبر بتائیے جیسے کہ ORD-1001، تاکہ میں تفصیلات چیک کر سکوں۔",
+                "language": "ur",
+                "intent": "order_status",
+                "outcome": "Inquiry",
+                "confidence": 1.0,
+            }
+        return {
+            "reply": "Please share your order number, for example ORD-1001, so I can look up your delivery status.",
+            "language": "en",
+            "intent": "order_status",
+            "outcome": "Inquiry",
+            "confidence": 1.0,
+        }
+    return None
+
+
+async def get_stream_system_instruction(user_id: int | None = None) -> str:
+    """Retrieve cached stream system instruction or rebuild in parallel with asyncio.gather."""
+    if user_id in CACHED_STREAM_SYSTEM_INSTRUCTION:
+        return CACHED_STREAM_SYSTEM_INSTRUCTION[user_id]
+
+    async def _get_faqs():
+        if user_id in CACHED_FAQS:
+            return CACHED_FAQS[user_id]
+        faqs = await asyncio.to_thread(load_faqs_context, user_id)
+        CACHED_FAQS[user_id] = faqs
+        return faqs
+
+    async def _get_prods():
+        if user_id in CACHED_PRODUCTS:
+            return CACHED_PRODUCTS[user_id]
+        prods = await asyncio.to_thread(load_products_context, user_id)
+        CACHED_PRODUCTS[user_id] = prods
+        return prods
+
+    faq_ctx, prod_ctx = await asyncio.gather(_get_faqs(), _get_prods())
+
+    instruction = f"""You are the DigiBuzz AI Calling Agent speaking live on a phone call.
+KNOWLEDGE BASE:
+1. Operational FAQs:
+{faq_ctx}
+
+2. Product Catalog:
+{prod_ctx}
+
+CRITICAL RULES:
+1. Spoken voice response: First, output ONLY the plain conversational spoken reply (maximum 1 to 2 short sentences, natural spoken style).
+2. DO NOT include markdown asterisks (*), hashtags (#), bullet points, emojis, or lists in the spoken reply.
+3. Immediately on a new line after the spoken text, output EXACTLY the separator "###META###" followed on the next line by a single-line JSON metadata object:
+###META###
+{{"intent": "<greeting|faq_inquiry|product_inquiry|order_status|place_order|support|unknown>", "confidence": 0.95, "outcome": "<Resolved|Transferred|Inquiry>", "needs_handoff": false, "language": "en", "quantity": null, "item_id": null}}
+4. If the user speaks Urdu or Roman Urdu, reply spoken text in clear conversational Urdu and set "language": "ur".
+5. If the caller asks for a human agent or has an unresolvable complaint, set "needs_handoff": true and outcome "Transferred".
+"""
+    CACHED_STREAM_SYSTEM_INSTRUCTION[user_id] = instruction
+    return instruction
+
+
+def check_instant_fast_path(text: str, session_id: str, user_id: int | None = None) -> dict | None:
+    """Instant 0ms deterministic handler for greetings, hours, bye, orders, handoff, confirmations, quantities, and cached FAQs."""
+    clean = text.lower().strip()
+    is_urdu = bool(ARABIC_SCRIPT.search(text)) or any(w in clean.split() for w in ["kya", "mera", "karo", "hai", "hain", "mujhe", "batao", "chahiye", "kahan", "kaise", "ap", "aap", "shukriya", "theek"])
+    words = clean.split()
+    word_count = len(words)
+
+    # 1. Human agent escalation keywords
+    human_keywords = [
+        "talk to human", "speak with agent", "agent se baat", "human agent",
+        "insan se baat", "operator", "customer service representative",
+        "transfer call", "live agent", "kisi bande se", "representative",
+        "نمائندہ", "انسان سے بات", "ایجنٹ سے بات", "بات کرواؤ", "بات کراؤ"
+    ]
+    if any(k in clean for k in human_keywords):
+        try:
+            with db() as conn:
+                conn.execute(
+                    """
+                    INSERT INTO handoff_requests (session_id, user_id, trigger_type, reason, created_at, status)
+                    VALUES (?, ?, 'user_requested', 'Caller requested human agent transfer', ?, 'pending')
+                    """,
+                    (session_id, user_id, now()),
+                )
+        except Exception as e:
+            log.warning("Handoff record error: %r", e)
+
+        if is_urdu:
+            reply = "جی بالکل، میں آپ کی کال کسٹمر سپورٹ نمائندے کو ٹرانسفر کر رہی ہوں۔ براہ کرم ہولڈ کیجیے۔"
+        else:
+            reply = "I am transferring your call to a human support agent right now. Please hold on."
+        return {
+            "reply": reply,
+            "language": "ur" if is_urdu else "en",
+            "intent": "human_handoff",
+            "outcome": "Transferred",
+            "needs_handoff": True,
+            "confidence": 1.0,
+        }
+
+    # 2. Business hours / timing inquiry
+    hours_keywords = ["timing", "timings", "hours", "open", "close", "schedule", "working hours", "office hours", "auqat", "kholo", "band", "اوقات", "ٹائمنگ", "کھلنے کا وقت", "بند ہونے کا وقت"]
+    if any(k in clean for k in hours_keywords) and word_count <= 8:
+        reply = get_business_hours(is_urdu)
+        return {
+            "reply": reply,
+            "language": "ur" if is_urdu else "en",
+            "intent": "business_hours",
+            "outcome": "Resolved",
+            "needs_handoff": False,
+            "confidence": 1.0,
+        }
+
+    # 3. Order status lookup
+    order_res = lookup_order_status(text, user_id)
+    if order_res:
+        order_res["needs_handoff"] = False
+        return order_res
+
+    # 4. Quantity verification steps
+    if word_count <= 4:
+        qty = parse_quantity(text)
+        if qty is not None:
+            if is_urdu:
+                reply = f"میں نے {qty} عدد نوٹ کر لیے ہیں۔ کیا آپ اس آرڈر کی تصدیق کرنا چاہتے ہیں؟"
+            else:
+                reply = f"I have noted {qty} units. Would you like me to confirm this item for your order?"
+            return {
+                "reply": reply,
+                "language": "ur" if is_urdu else "en",
+                "intent": "quantity_verification",
+                "outcome": "Inquiry",
+                "needs_handoff": False,
+                "confidence": 1.0,
+                "quantity": qty,
+            }
+
+    # 5. Yes / No confirmations
+    confirm_words_en = {"yes", "yeah", "yep", "sure", "ok", "okay", "confirm", "proceed", "no", "nope", "cancel"}
+    confirm_words_ur = {"جی", "ہاں", "جی ہاں", "نہیں", "ٹھیک ہے", "بالکل", "کینسل", "theek", "haan", "jee", "nahi"}
+    if word_count <= 3:
+        clean_no_punc = re.sub(r"[^\w\s]", "", clean)
+        if clean_no_punc in confirm_words_en or clean_no_punc in confirm_words_ur or any(w in confirm_words_en | confirm_words_ur for w in words):
+            if any(w in ["no", "nope", "cancel", "نہیں"] for w in words):
+                reply = "کوئی مسئلہ نہیں، یہ کینسل کر دیا گیا ہے۔ کیا آپ کو مزید کچھ درکار ہے؟" if is_urdu else "No problem at all, I have cancelled that. How else can I assist you?"
+            else:
+                reply = "جی سمجھ گئی، بتائیے مزید کیا معلومات درکار ہیں؟" if is_urdu else "Understood. How would you like to proceed?"
+            return {
+                "reply": reply,
+                "language": "ur" if is_urdu else "en",
+                "intent": "confirmation",
+                "outcome": "Resolved",
+                "needs_handoff": False,
+                "confidence": 1.0,
+            }
+
+    # 6. Thank you / Bye
+    farewell_words = {"bye", "goodbye", "thanks", "thank", "shukriya", "jazakallah", "allah hafiz", "khuda hafiz", "شکریہ", "اللہ حافظ", "خدا حافظ"}
+    if any(w in clean for w in farewell_words) and word_count <= 6:
+        if is_urdu:
+            reply = "ڈیجی بز پر رابطہ کرنے کا بہت شکریہ۔ اپنا خیال رکھیے گا، اللہ حافظ!"
+        else:
+            reply = "Thank you for calling DigiBuzz Support. Have a wonderful day ahead! Goodbye."
+        return {
+            "reply": reply,
+            "language": "ur" if is_urdu else "en",
+            "intent": "farewell",
+            "outcome": "Resolved",
+            "needs_handoff": False,
+            "confidence": 1.0,
+        }
+
+    # 7. Greetings
+    greeting_words = {"hi", "hello", "hey", "salam", "assalam", "aoa", "adaab", "اسلام علیکم", "سلام", "آداب", "صبح بخیر"}
+    if any(w in words for w in greeting_words) and word_count <= 5:
+        if is_urdu:
+            reply = "اسلام علیکم! ڈیجی بز سپورٹ میں خوش آمدید۔ میں آپ کی کیا مدد کر سکتی ہوں؟"
+        else:
+            reply = "Hello! Welcome to DigiBuzz AI calling service. How may I assist you with our wholesale catalog today?"
+        return {
+            "reply": reply,
+            "language": "ur" if is_urdu else "en",
+            "intent": "greeting",
+            "outcome": "Resolved",
+            "needs_handoff": False,
+            "confidence": 1.0,
+        }
+
+    # 8. In-memory repeated FAQ cache
+    norm_query = re.sub(r"[^\w\s\u0600-\u06FF]", "", clean).strip()
+    if norm_query in CACHED_FAQ_ANSWERS:
+        cached = CACHED_FAQ_ANSWERS[norm_query]
+        return {
+            "reply": cached["answer"],
+            "language": "ur" if is_urdu else "en",
+            "intent": cached.get("intent", "faq_inquiry"),
+            "outcome": "Resolved",
+            "needs_handoff": False,
+            "confidence": 1.0,
+        }
+
+    # 9. Knowledge fast match (from check_fast_knowledge_response)
+    fast_match = check_fast_knowledge_response(text, user_id)
+    if fast_match:
+        if fast_match.get("type") == "faq" and norm_query:
+            CACHED_FAQ_ANSWERS[norm_query] = {"answer": fast_match["answer"], "intent": fast_match.get("intent", "faq_inquiry")}
+        return {
+            "reply": fast_match["answer"],
+            "language": "ur" if is_urdu else "en",
+            "intent": fast_match.get("intent", "general_inquiry"),
+            "outcome": "Resolved",
+            "needs_handoff": False,
+            "confidence": 1.0,
+        }
+
+    return None
+
+
+class StreamingSentenceEmitter:
+    """Buffer streamed tokens, extract spoken text sentences cleanly, and separate ###META### JSON."""
+    def __init__(self):
+        self.spoken_buffer = ""
+        self.meta_buffer = ""
+        self.saw_meta = False
+        self.sentence_idx = 0
+        self.collected_spoken: list[str] = []
+        self.delims = re.compile(r'([.!?۔؟\n]+)')
+
+    def feed(self, chunk: str) -> list[str]:
+        if self.saw_meta:
+            self.meta_buffer += chunk
+            return []
+
+        combined = self.spoken_buffer + chunk
+        if "###META###" in combined:
+            self.saw_meta = True
+            spoken_part, meta_part = combined.split("###META###", 1)
+            self.spoken_buffer = spoken_part
+            self.meta_buffer = meta_part
+            return self._flush(flush_all=True)
+
+        self.spoken_buffer = combined
+        return self._flush(flush_all=False)
+
+    def _flush(self, flush_all: bool = False) -> list[str]:
+        results = []
+        while True:
+            match = self.delims.search(self.spoken_buffer)
+            if match:
+                end_pos = match.end()
+                sentence = self.spoken_buffer[:end_pos].strip()
+                self.spoken_buffer = self.spoken_buffer[end_pos:].lstrip()
+                clean_s = re.sub(r"[*#_`]+", "", sentence).strip()
+                if clean_s:
+                    results.append(clean_s)
+                    self.collected_spoken.append(clean_s)
+                continue
+
+            words = self.spoken_buffer.split()
+            if len(words) >= 12:
+                chunk = " ".join(words[:12])
+                self.spoken_buffer = " ".join(words[12:])
+                clean_s = re.sub(r"[*#_`]+", "", chunk).strip()
+                if clean_s:
+                    results.append(clean_s)
+                    self.collected_spoken.append(clean_s)
+                continue
+
+            break
+
+        if flush_all and self.spoken_buffer.strip():
+            clean_s = re.sub(r"[*#_`]+", "", self.spoken_buffer).strip()
+            if clean_s:
+                results.append(clean_s)
+                self.collected_spoken.append(clean_s)
+            self.spoken_buffer = ""
+
+        return results
+
+    def flush_all(self) -> list[str]:
+        return self._flush(flush_all=True)
+
+    def get_meta(self) -> dict:
+        meta = {
+            "type": "meta",
+            "intent": "general_inquiry",
+            "confidence": 0.9,
+            "outcome": "Resolved",
+            "needs_handoff": False,
+            "language": "en",
+            "quantity": None,
+            "item_id": None,
+        }
+        if self.meta_buffer:
+            match = re.search(r"\{.*\}", self.meta_buffer, re.DOTALL)
+            if match:
+                try:
+                    parsed = json.loads(match.group(0))
+                    meta.update(parsed)
+                    meta["type"] = "meta"
+                except Exception:
+                    pass
+        full_text = " ".join(self.collected_spoken)
+        if ARABIC_SCRIPT.search(full_text):
+            meta["language"] = "ur"
+        return meta
+
+    def get_full_spoken(self) -> str:
+        return " ".join(self.collected_spoken)
+
+
 def build_voice_system_instruction(user_id: int | None = None) -> str:
     """Build concise, conversational instructions tailored for low-latency live voice calls."""
     faq_ctx = load_faqs_context(user_id)
@@ -1828,8 +2319,11 @@ CRITICAL RULES FOR LIVE VOICE CALL:
 """
 
 
-async def stream_gemini_voice_tokens(session_id: str, user_text: str, user_id: int | None = None):
-    """Asynchronously stream text tokens from Gemini with automatic dual-key failover."""
+async def stream_gemini_voice_tokens(session_id: str, user_text: str, user_id: int | None = None, system_instruction: str | None = None):
+    """Asynchronously stream text tokens from Gemini with fast model tier and 6 turns context limit."""
+    sys_instruction = system_instruction or await get_stream_system_instruction(user_id)
+    history_turns = SESSIONS.get(session_id, [])[-12:]
+
     async def _stream_once():
         if NEW_GENAI_AVAILABLE:
             if not key_manager.client:
@@ -1839,7 +2333,7 @@ async def stream_gemini_voice_tokens(session_id: str, user_text: str, user_id: i
                     raise RuntimeError("GEMINI_API_KEY is not configured.")
 
             contents: list[types.Content] = []
-            for turn in SESSIONS.get(session_id, []):
+            for turn in history_turns:
                 role = "user" if turn.get("role") == "user" else "model"
                 parts = turn.get("parts", [""])
                 part_text = parts[0] if isinstance(parts, list) and parts else str(parts)
@@ -1848,9 +2342,9 @@ async def stream_gemini_voice_tokens(session_id: str, user_text: str, user_id: i
             contents.append(types.Content(role="user", parts=[types.Part.from_text(text=user_text)]))
 
             config = types.GenerateContentConfig(
-                system_instruction=build_voice_system_instruction(user_id),
+                system_instruction=sys_instruction,
                 temperature=0.2,
-                max_output_tokens=350,
+                max_output_tokens=150,
             )
 
             try:
@@ -1877,7 +2371,7 @@ async def stream_gemini_voice_tokens(session_id: str, user_text: str, user_id: i
                     raise
         else:
             model = get_legacy_model(user_id)
-            contents = SESSIONS.get(session_id, []) + [{"role": "user", "parts": [user_text]}]
+            contents = history_turns + [{"role": "user", "parts": [user_text]}]
             response = await model.generate_content_async(contents, stream=True)
             async for chunk in response:
                 if chunk.text:
@@ -2163,14 +2657,14 @@ async def chat_endpoint(req: ChatRequest, request: Request):
     opt_user = await get_optional_user(request)
     user_id = opt_user["id"] if opt_user else None
 
-    # Fast-path check: if exact or confident FAQ/product/conversational match, respond in < 5ms!
-    fast_match = check_fast_knowledge_response(text, user_id)
+    # Instant fast-path check (~0ms)
+    fast_match = check_instant_fast_path(text, req.session_id, user_id)
     if fast_match:
         result = {
-            "reply": fast_match["answer"],
-            "speech": fast_match["answer"],
+            "reply": fast_match["reply"],
+            "speech": fast_match["reply"],
             "intent": fast_match.get("intent", "general_inquiry"),
-            "outcome": "Resolved",
+            "outcome": fast_match.get("outcome", "Resolved"),
         }
     else:
         result = await ask_gemini(req.session_id, text, user_id)
@@ -2183,6 +2677,194 @@ async def chat_endpoint(req: ChatRequest, request: Request):
         log.error("Failed to run save_message: %r", exc)
 
     return result
+
+
+@app.post("/api/chat/stream")
+async def chat_stream_endpoint(req: ChatRequest, request: Request):
+    """
+    Real-call Server-Sent Events (SSE) streaming endpoint with 0ms fast-path & background logging.
+    Emits {type: "sentence", text, idx}, {type: "meta", ...}, and {type: "done"}.
+    """
+    text = req.message.strip()
+    if not text:
+        raise HTTPException(status_code=422, detail="Message is empty.")
+
+    opt_user = await get_optional_user(request)
+    user_id = opt_user["id"] if opt_user else None
+
+    # 1. Check instant fast path (0 ms, no LLM)
+    fast_match = check_instant_fast_path(text, req.session_id, user_id)
+    if fast_match:
+        async def fast_stream_generator():
+            delims = re.compile(r'([.!?۔؟\n]+)')
+            parts = [p.strip() for p in delims.split(fast_match["reply"]) if p.strip()]
+            sentences = []
+            curr = ""
+            for p in parts:
+                if p in ".!?۔؟\n":
+                    curr += p
+                    sentences.append(curr.strip())
+                    curr = ""
+                else:
+                    if curr:
+                        sentences.append(curr.strip())
+                    curr = p
+            if curr.strip():
+                sentences.append(curr.strip())
+            if not sentences:
+                sentences = [fast_match["reply"]]
+
+            for idx, s in enumerate(sentences):
+                yield f"data: {json.dumps({'type': 'sentence', 'text': s, 'idx': idx}, ensure_ascii=False)}\n\n"
+                await asyncio.sleep(0.01)
+
+            meta = {
+                "type": "meta",
+                "intent": fast_match.get("intent", "conversational"),
+                "confidence": fast_match.get("confidence", 1.0),
+                "outcome": fast_match.get("outcome", "Resolved"),
+                "needs_handoff": fast_match.get("needs_handoff", False),
+                "language": fast_match.get("language", "en"),
+                "quantity": fast_match.get("quantity"),
+                "item_id": fast_match.get("item_id"),
+            }
+            yield f"data: {json.dumps(meta, ensure_ascii=False)}\n\n"
+            yield "data: {\"type\": \"done\"}\n\n"
+
+            # Background persistence without blocking stream
+            remember(req.session_id, text, fast_match["reply"])
+            try:
+                await asyncio.to_thread(
+                    save_message,
+                    req.session_id,
+                    text,
+                    {
+                        "reply": fast_match["reply"],
+                        "speech": fast_match["reply"],
+                        "intent": fast_match.get("intent", "conversational"),
+                        "outcome": fast_match.get("outcome", "Resolved"),
+                    },
+                    user_id,
+                )
+            except Exception as exc:
+                log.error("Failed to save fast path message: %r", exc)
+
+        return StreamingResponse(
+            fast_stream_generator(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache, no-transform",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+            },
+        )
+
+    # 2. Streaming LLM Path
+    async def llm_stream_generator():
+        emitter = StreamingSentenceEmitter()
+        try:
+            async for token in stream_gemini_voice_tokens(req.session_id, text, user_id):
+                sentences = emitter.feed(token)
+                for s in sentences:
+                    yield f"data: {json.dumps({'type': 'sentence', 'text': s, 'idx': emitter.sentence_idx}, ensure_ascii=False)}\n\n"
+                    emitter.sentence_idx += 1
+
+            for s in emitter.flush_all():
+                yield f"data: {json.dumps({'type': 'sentence', 'text': s, 'idx': emitter.sentence_idx}, ensure_ascii=False)}\n\n"
+                emitter.sentence_idx += 1
+
+            meta = emitter.get_meta()
+            yield f"data: {json.dumps(meta, ensure_ascii=False)}\n\n"
+            yield "data: {\"type\": \"done\"}\n\n"
+
+            # Background persistence
+            full_speech = emitter.get_full_spoken() or "I am here to assist you."
+            remember(req.session_id, text, full_speech)
+            try:
+                await asyncio.to_thread(
+                    save_message,
+                    req.session_id,
+                    text,
+                    {
+                        "reply": full_speech,
+                        "speech": full_speech,
+                        "intent": meta.get("intent", "general_inquiry"),
+                        "outcome": meta.get("outcome", "Resolved"),
+                    },
+                    user_id,
+                )
+            except Exception as exc:
+                log.error("Failed to persist streamed message: %r", exc)
+        except Exception as exc:
+            log.error("Streaming error: %r", exc)
+            fallback = "I apologize, I am experiencing a brief connection delay. Let me assist you directly."
+            yield f"data: {json.dumps({'type': 'sentence', 'text': fallback, 'idx': 0}, ensure_ascii=False)}\n\n"
+            yield f"data: {json.dumps({'type': 'meta', 'intent': 'service_fallback', 'confidence': 0.5, 'outcome': 'Escalated', 'needs_handoff': True, 'language': 'en'}, ensure_ascii=False)}\n\n"
+            yield "data: {\"type\": \"done\"}\n\n"
+
+    return StreamingResponse(
+        llm_stream_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache, no-transform",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+class HandoffRequest(BaseModel):
+    session_id: str
+    trigger_type: str = "user_requested"
+    reason: str | None = None
+
+
+@app.post("/api/handoff")
+async def handoff_endpoint(req: HandoffRequest, request: Request):
+    """Register a human-agent handoff request."""
+    user = await get_optional_user(request)
+    user_id = user["id"] if user else None
+    with db() as conn:
+        cursor = conn.execute(
+            """
+            INSERT INTO handoff_requests (session_id, user_id, trigger_type, reason, created_at, status)
+            VALUES (?, ?, ?, ?, ?, 'pending')
+            """,
+            (req.session_id, user_id, req.trigger_type, req.reason or "Live agent escalation", now()),
+        )
+        handoff_id = cursor.lastrowid
+    return {"ok": True, "handoff_id": handoff_id, "message": "Handoff request registered."}
+
+
+@app.get("/api/fillers")
+async def get_fillers_endpoint():
+    """Return configured filler phrases for low-latency voice pipeline."""
+    return {
+        "en": {
+            "short_ack": ["Sure, one moment.", "Okay, let me check.", "Just a second."],
+            "order_status": "Let me check your order status.",
+            "faq_products": "Let me look that up for you.",
+            "place_order": "Okay, let me note that down.",
+            "second_filler": "Thanks for waiting, almost there.",
+            "timeout": "Sorry, I am having trouble connecting right now. Let me connect you with an agent.",
+        },
+        "ur": {
+            "short_ack": ["جی، ایک سیکنڈ۔", "جی، میں ابھی چیک کرتی ہوں۔", "ایک لمحہ دیجیے۔"],
+            "order_status": "جی، میں آپ کا آرڈر چیک کرتی ہوں۔",
+            "faq_products": "جی، میں معلومات چیک کر رہی ہوں۔",
+            "place_order": "ٹھیک ہے، میں یہ نوٹ کر لیتی ہوں۔",
+            "second_filler": "بس تھوڑا سا اور انتظار کیجیے، معلومات مل رہی ہیں۔",
+            "timeout": "معذرت، اس وقت سسٹم سے رابطہ نہیں ہو پا رہا۔ میں آپ کو نمائندے سے منسلک کر رہی ہوں۔",
+        },
+        "roman_ur": {
+            "short_ack": ["Jee, aik second.", "Jee, main check karti hoon.", "Aik second hold kijiye."],
+            "order_status": "Jee, main aap ka order check karti hoon.",
+            "faq_products": "Jee, main information check kar rahi hoon.",
+            "place_order": "Theek hai, main yeh note kar leti hoon.",
+            "second_filler": "Bas thora sa intezar kijiye, main details nikal rahi hoon.",
+            "timeout": "Sorry, system se contact nahi ho raha. Main aap ko support agent se connect kar rahi hoon.",
+        }
+    }
 
 
 @app.post("/api/tts")

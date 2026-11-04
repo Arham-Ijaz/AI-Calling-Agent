@@ -18,12 +18,16 @@ const state = {
   micPermissionRequested: false,
   ws: null,
   audioPlayer: null,
+  speechQueue: null,
+  activeStreamController: null,
   currentBotBubble: null,
   currentStreamText: "",
   activeUserText: "",
   isShowingFiller: false,
   isSpeakingFiller: false,
 };
+
+const ARABIC_SCRIPT_REGEX = /[\u0600-\u06FF\u0750-\u077F\uFB50-\uFDFF\uFE70-\uFEFF]/;
 
 // ---- Filler phrases spoken immediately while Gemini processes ----
 const FILLER_PHRASES = [
@@ -149,6 +153,10 @@ function initSession() {
       autoStartListening();
     };
   }
+  if (!state.speechQueue && state.audioPlayer) {
+    state.speechQueue = new SentenceSpeechQueue(state.audioPlayer);
+  }
+  loadFillerPhrases();
   updateSessionDisplay();
 }
 
@@ -219,6 +227,10 @@ async function startCall() {
   if (state.audioPlayer) {
     state.audioPlayer.ensureContext();
   }
+  if (!state.speechQueue && state.audioPlayer) {
+    state.speechQueue = new SentenceSpeechQueue(state.audioPlayer);
+  }
+  loadFillerPhrases();
 
   setStatus("active", "Connected — DigiBuzz AI Calling Agent");
   setInputEnabled(true);
@@ -270,6 +282,15 @@ function endCall() {
   if (!state.isOnCall) return;
   state.isOnCall = false;
   state.isBusy = false;
+
+  stopFillerAudio();
+  if (state.speechQueue) {
+    state.speechQueue.reset();
+  }
+  if (speechSilenceTimer) {
+    clearTimeout(speechSilenceTimer);
+    speechSilenceTimer = null;
+  }
 
   // Turn off mic if active
   if (state.recognition && state.isListening) {
@@ -349,10 +370,12 @@ function addBotMessage(text) {
   hidePlaceholder();
   const row = document.createElement("div");
   row.className = "message-row bot";
+  const isRtl = ARABIC_SCRIPT_REGEX.test(text);
+  const rtlStyle = isRtl ? 'dir="rtl" style="text-align:right;font-family:\'Noto Nastaliq Urdu\',\'Jameel Noori Nastaleeq\',\'Segoe UI\',sans-serif;"' : '';
   row.innerHTML = `
     <div class="message-avatar">🤖</div>
     <div>
-      <div class="message-bubble">${escapeHtml(text)}</div>
+      <div class="message-bubble" ${rtlStyle}>${escapeHtml(text)}</div>
       <div class="message-meta">${formatTime()}</div>
     </div>`;
   $("chatWindow").appendChild(row);
@@ -375,11 +398,18 @@ function createStreamingBotMessage() {
   return row;
 }
 
-function updateStreamingBotMessage(row, text) {
+function updateStreamingBotMessage(row, text, isDone = false) {
   if (!row) return;
   const bubble = row.querySelector(".message-bubble");
   if (bubble) {
-    bubble.innerHTML = `${escapeHtml(text)}<span class="streaming-cursor">▌</span>`;
+    if (ARABIC_SCRIPT_REGEX.test(text)) {
+      bubble.setAttribute("dir", "rtl");
+      bubble.style.textAlign = "right";
+      bubble.style.fontFamily = "'Noto Nastaliq Urdu', 'Jameel Noori Nastaleeq', 'Segoe UI', Tahoma, sans-serif";
+    }
+    bubble.innerHTML = isDone
+      ? escapeHtml(text)
+      : `${escapeHtml(text)}<span class="streaming-cursor">▌</span>`;
   }
   scrollChatToBottom();
 }
@@ -514,20 +544,246 @@ class AudioStreamPlayer {
 }
 
 // =====================================================================
-// Instant Browser Voice Filler (0ms Audible Feedback)
+// Sentence Speech Queue with Prefetching & Gapless Web Audio Scheduling
 // =====================================================================
+class SentenceSpeechQueue {
+  constructor(audioPlayer) {
+    this.audioPlayer = audioPlayer;
+    this.queue = [];
+    this.isProcessing = false;
+    this.prefetchCache = new Map();
+    this.onQueueEmpty = null;
+    this.localEnVoice = null;
+    this.localUrVoice = null;
+    this.initVoices();
+  }
+
+  initVoices() {
+    if (typeof window !== "undefined" && window.speechSynthesis) {
+      const updateVoices = () => {
+        const voices = window.speechSynthesis.getVoices() || [];
+        this.localEnVoice = voices.find((v) => v.lang && (v.lang.startsWith("en") || v.lang.includes("US") || v.lang.includes("UK"))) || null;
+        this.localUrVoice = voices.find((v) => v.lang && (v.lang.startsWith("ur") || v.lang.includes("PK"))) || null;
+      };
+      updateVoices();
+      if (window.speechSynthesis.onvoiceschanged !== undefined) {
+        window.speechSynthesis.onvoiceschanged = updateVoices;
+      }
+    }
+  }
+
+  reset() {
+    this.queue = [];
+    this.isProcessing = false;
+    this.prefetchCache.clear();
+    if (typeof window !== "undefined" && window.speechSynthesis) {
+      try {
+        window.speechSynthesis.cancel();
+      } catch (_) {}
+    }
+  }
+
+  async enqueue(sentence, idx) {
+    const clean = (sentence || "").trim();
+    if (!clean) return;
+    this.queue.push({ text: clean, idx: idx });
+    // Immediately prefetch TTS audio for this sentence from /api/tts
+    this.prefetch(clean);
+    if (!this.isProcessing) {
+      this.processNext();
+    }
+  }
+
+  async prefetch(text) {
+    if (!text || this.prefetchCache.has(text)) return;
+    try {
+      const res = await fetch("/api/tts", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ text }),
+      });
+      if (res.ok) {
+        const buf = await res.arrayBuffer();
+        this.prefetchCache.set(text, buf);
+      }
+    } catch (e) {
+      console.warn("TTS prefetch error:", e);
+    }
+  }
+
+  async processNext() {
+    if (this.queue.length === 0) {
+      this.isProcessing = false;
+      if (typeof this.onQueueEmpty === "function") {
+        this.onQueueEmpty();
+      }
+      return;
+    }
+
+    this.isProcessing = true;
+    const item = this.queue.shift();
+    const isFirst = (item.idx === 0);
+    const isUrdu = ARABIC_SCRIPT_REGEX.test(item.text);
+
+    // Halt any active filler cleanly the instant the first real sentence arrives
+    stopFillerAudio();
+
+    // Browser speechSynthesis for first sentence if voice for that language exists
+    const canUseBrowserSpeech = isFirst && (
+      (!isUrdu && this.localEnVoice) || (isUrdu && this.localUrVoice)
+    );
+
+    if (canUseBrowserSpeech && window.speechSynthesis) {
+      try {
+        if (this.queue.length > 0) {
+          this.prefetch(this.queue[0].text);
+        }
+        await new Promise((resolve) => {
+          const utter = new SpeechSynthesisUtterance(item.text);
+          utter.voice = isUrdu ? this.localUrVoice : this.localEnVoice;
+          utter.lang = isUrdu ? "ur-PK" : "en-US";
+          utter.rate = 1.05;
+          utter.onend = resolve;
+          utter.onerror = resolve;
+          window.speechSynthesis.speak(utter);
+        });
+        this.processNext();
+        return;
+      } catch (err) {
+        console.warn("speechSynthesis error, using edge-tts:", err);
+      }
+    }
+
+    // Neural audio via edge-tts & Web Audio API
+    let buf = this.prefetchCache.get(item.text);
+    if (!buf) {
+      try {
+        const res = await fetch("/api/tts", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ text: item.text }),
+        });
+        if (res.ok) {
+          buf = await res.arrayBuffer();
+        }
+      } catch (err) {
+        console.warn("TTS fetch error:", err);
+      }
+    }
+
+    if (this.queue.length > 0) {
+      this.prefetch(this.queue[0].text);
+    }
+
+    if (buf && this.audioPlayer) {
+      await this.audioPlayer.queueAudio(buf);
+      this.processNext();
+    } else {
+      this.processNext();
+    }
+  }
+}
+
+// =====================================================================
+// Phase 9: Filler / Handler Phrases System
+// =====================================================================
+const fillerState = {
+  data: null,
+  lastFiller: "",
+  timer700ms: null,
+  timer4s: null,
+  timer10s: null,
+  firstSentenceArrived: false,
+};
+
+async function loadFillerPhrases() {
+  if (fillerState.data) return;
+  try {
+    const res = await fetch("/api/fillers");
+    if (res.ok) {
+      fillerState.data = await res.json();
+    }
+  } catch (e) {
+    console.warn("Could not load /api/fillers:", e);
+  }
+}
+
+function detectInputLanguage(text) {
+  if (ARABIC_SCRIPT_REGEX.test(text)) return "ur";
+  const romanUrduWords = ["mera", "meri", "karo", "kya", "hai", "hain", "kahan", "mujhe", "batao", "chahiye", "theek", "shukriya", "salam", "ap", "aap", "kitna", "kitne"];
+  const lowerWords = (text || "").toLowerCase().split(/\s+/);
+  if (lowerWords.some((w) => romanUrduWords.includes(w))) return "roman_ur";
+  return "en";
+}
+
+function pickFillerPhrase(userText, isSecond = false) {
+  const lang = detectInputLanguage(userText);
+  const fillers = (fillerState.data && fillerState.data[lang]) || (fillerState.data && fillerState.data.en) || {
+    short_ack: ["Sure, one moment.", "Okay, let me check.", "Just a second."],
+    order_status: "Let me check your order status.",
+    faq_products: "Let me look that up for you.",
+    place_order: "Okay, let me note that down.",
+    second_filler: "Thanks for waiting, almost there.",
+    timeout: "Sorry, I am having trouble right now. Let me connect you with an agent.",
+  };
+
+  if (isSecond) {
+    return fillers.second_filler || "Thanks for waiting, almost there.";
+  }
+
+  const clean = (userText || "").toLowerCase();
+  if (clean.includes("order") || clean.includes("ord-") || clean.includes("track") || clean.includes("kahan")) {
+    return fillers.order_status;
+  }
+  if (clean.includes("buy") || clean.includes("book") || clean.includes("piece") || clean.includes("quantity")) {
+    return fillers.place_order;
+  }
+  if (clean.includes("price") || clean.includes("cost") || clean.includes("specs") || clean.includes("what is") || clean.includes("kya")) {
+    return fillers.faq_products;
+  }
+
+  const list = Array.isArray(fillers.short_ack) ? fillers.short_ack : [fillers.short_ack];
+  const candidates = list.filter((f) => f !== fillerState.lastFiller);
+  const picked = candidates.length > 0 ? candidates[Math.floor(Math.random() * candidates.length)] : list[0];
+  fillerState.lastFiller = picked;
+  return picked;
+}
+
+function clearFillerTimers() {
+  if (fillerState.timer700ms) { clearTimeout(fillerState.timer700ms); fillerState.timer700ms = null; }
+  if (fillerState.timer4s) { clearTimeout(fillerState.timer4s); fillerState.timer4s = null; }
+  if (fillerState.timer10s) { clearTimeout(fillerState.timer10s); fillerState.timer10s = null; }
+}
+
+function stopFillerAudio() {
+  clearFillerTimers();
+  cancelInstantFiller();
+  if (state.currentAudio && state.fillerPlaying) {
+    try { state.currentAudio.pause(); } catch (_) {}
+    state.currentAudio = null;
+    state.fillerPlaying = false;
+  }
+}
+
 function speakInstantFiller(phrase) {
-  if (!state.isVoiceEnabled) return;
-  const text = phrase || pickFiller();
+  if (!state.isVoiceEnabled || !phrase) return;
   if (typeof window !== "undefined" && window.speechSynthesis) {
     try {
       window.speechSynthesis.cancel();
-      const utter = new SpeechSynthesisUtterance(text);
+      const utter = new SpeechSynthesisUtterance(phrase);
+      const isUrdu = ARABIC_SCRIPT_REGEX.test(phrase);
+      if (isUrdu && state.speechQueue && state.speechQueue.localUrVoice) {
+        utter.voice = state.speechQueue.localUrVoice;
+      } else if (!isUrdu && state.speechQueue && state.speechQueue.localEnVoice) {
+        utter.voice = state.speechQueue.localEnVoice;
+      }
+      utter.lang = isUrdu ? "ur-PK" : "en-US";
       utter.rate = 1.05;
       utter.pitch = 1.0;
       state.isSpeakingFiller = true;
-      utter.onend = () => { state.isSpeakingFiller = false; };
-      utter.onerror = () => { state.isSpeakingFiller = false; };
+      state.fillerPlaying = true;
+      utter.onend = () => { state.isSpeakingFiller = false; state.fillerPlaying = false; };
+      utter.onerror = () => { state.isSpeakingFiller = false; state.fillerPlaying = false; };
       window.speechSynthesis.speak(utter);
     } catch (e) {
       console.warn("SpeechSynthesis filler error:", e);
@@ -541,7 +797,26 @@ function cancelInstantFiller() {
       window.speechSynthesis.cancel();
     } catch (_) {}
     state.isSpeakingFiller = false;
+    state.fillerPlaying = false;
   }
+}
+
+function bargeIn() {
+  stopAudio();
+  stopFillerAudio();
+  if (state.speechQueue) {
+    state.speechQueue.reset();
+  }
+  if (state.activeStreamController) {
+    try {
+      state.activeStreamController.abort();
+    } catch (_) {}
+    state.activeStreamController = null;
+  }
+  if (state.ws && state.ws.readyState === WebSocket.OPEN) {
+    state.ws.send(JSON.stringify({ type: "interrupt" }));
+  }
+  setBusy(false);
 }
 
 // Global audio playback & streaming methods
@@ -798,10 +1073,7 @@ async function sendMessage(text) {
   state.activeUserText = text;
 
   // Interrupt any existing audio playback immediately
-  stopAudio();
-  if (state.ws && state.ws.readyState === WebSocket.OPEN) {
-    state.ws.send(JSON.stringify({ type: "interrupt" }));
-  }
+  bargeIn();
 
   // Check if caller wants to finish the call via voice command
   if (isEndCallPhrase(text)) {
@@ -810,14 +1082,7 @@ async function sendMessage(text) {
     addBotMessage(farewell);
     
     if (state.isVoiceEnabled) {
-      if (state.audioPlayer) {
-        state.audioPlayer.onPlaybackComplete = () => {
-          setBusy(false);
-          endCall();
-        };
-      }
       await playAudio(farewell);
-      return;
     }
     setBusy(false);
     endCall();
@@ -827,30 +1092,163 @@ async function sendMessage(text) {
   setBusy(true);
   setMicLocked(true);
 
-  // Instantly speak filler aloud at 0ms so caller hears immediate voice response!
-  speakInstantFiller();
+  // Setup Phase 9 filler timers (700ms short ack, 4s waiting, 10s timeout)
+  fillerState.firstSentenceArrived = false;
+  clearFillerTimers();
 
-  // Instantly render filler in chat bubble with 0ms delay
-  state.isShowingFiller = true;
-  state.currentStreamText = "Let me check that for you...";
-  state.currentBotBubble = createStreamingBotMessage();
-  updateStreamingBotMessage(state.currentBotBubble, state.currentStreamText);
-
-  // 1. Ultra-low latency streaming over WebSocket
-  const ws = await ensureAiWebSocket();
-  if (ws && ws.readyState === WebSocket.OPEN) {
-    if (state.audioPlayer) {
-      state.audioPlayer.ensureContext();
+  fillerState.timer700ms = setTimeout(() => {
+    if (!fillerState.firstSentenceArrived && state.isOnCall && state.isBusy) {
+      const phrase = pickFillerPhrase(text, false);
+      speakInstantFiller(phrase);
     }
-    ws.send(JSON.stringify({
-      type: "message",
-      session_id: state.sessionId,
-      text: text,
-    }));
-    return;
+  }, 700);
+
+  fillerState.timer4s = setTimeout(() => {
+    if (!fillerState.firstSentenceArrived && state.isOnCall && state.isBusy) {
+      const phrase = pickFillerPhrase(text, true);
+      speakInstantFiller(phrase);
+    }
+  }, 4000);
+
+  fillerState.timer10s = setTimeout(async () => {
+    if (!fillerState.firstSentenceArrived && state.isOnCall && state.isBusy) {
+      stopFillerAudio();
+      if (state.activeStreamController) {
+        state.activeStreamController.abort();
+      }
+      const apology = "Sorry, I am having trouble right now. Let me connect you with an agent.";
+      addBotMessage(apology);
+      if (state.isVoiceEnabled) {
+        await playAudio(apology);
+      }
+      setBusy(false);
+      setMicLocked(false);
+      autoStartListening();
+
+      // Register handoff request
+      fetch("/api/handoff", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          session_id: state.sessionId,
+          trigger_type: "low_confidence",
+          reason: "10s latency timeout on voice stream",
+        }),
+      }).catch(() => {});
+    }
+  }, 10000);
+
+  // Create streaming bot message bubble
+  state.currentBotBubble = createStreamingBotMessage();
+
+  // Stream via SSE /api/chat/stream
+  await sendStreamingMessage(text);
+}
+
+async function sendStreamingMessage(text) {
+  const controller = new AbortController();
+  state.activeStreamController = controller;
+
+  if (state.speechQueue) {
+    state.speechQueue.reset();
   }
 
-  // 2. Fallback to HTTP POST if WebSocket connection is completely offline
+  try {
+    const res = await fetch("/api/chat/stream", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      credentials: "same-origin",
+      body: JSON.stringify({ session_id: state.sessionId, message: text }),
+      signal: controller.signal,
+    });
+
+    if (!res.ok) {
+      throw new Error(`HTTP ${res.status}`);
+    }
+
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder("utf-8");
+    let buffer = "";
+    let fullTextAccumulator = "";
+    let metaData = null;
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split("\n");
+      buffer = lines.pop(); // keep partial trailing line
+
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (!trimmed.startsWith("data:")) continue;
+        const jsonStr = trimmed.slice(5).trim();
+        if (!jsonStr) continue;
+
+        try {
+          const event = JSON.parse(jsonStr);
+          if (event.type === "sentence") {
+            // First sentence arrived! Halt all fillers cleanly
+            if (!fillerState.firstSentenceArrived) {
+              fillerState.firstSentenceArrived = true;
+              clearFillerTimers();
+              stopFillerAudio();
+            }
+
+            fullTextAccumulator += (fullTextAccumulator ? " " : "") + event.text;
+            updateStreamingBotMessage(state.currentBotBubble, fullTextAccumulator, false);
+
+            if (state.isVoiceEnabled && state.speechQueue) {
+              state.speechQueue.enqueue(event.text, event.idx);
+            }
+          } else if (event.type === "meta") {
+            metaData = event;
+          } else if (event.type === "done") {
+            updateStreamingBotMessage(state.currentBotBubble, fullTextAccumulator, true);
+          }
+        } catch (parseErr) {
+          console.warn("SSE parse error:", parseErr, trimmed);
+        }
+      }
+    }
+
+    clearFillerTimers();
+    stopFillerAudio();
+
+    if (metaData) {
+      recordClientCallTurn(
+        state.sessionId,
+        text,
+        fullTextAccumulator,
+        metaData.intent || "general_inquiry",
+        metaData.outcome || "Resolved"
+      );
+    }
+
+    // Wait until speech queue finishes before allowing mic input
+    if (state.speechQueue && state.speechQueue.isProcessing) {
+      state.speechQueue.onQueueEmpty = () => {
+        setBusy(false);
+        setMicLocked(false);
+        autoStartListening();
+      };
+    } else {
+      setBusy(false);
+      setMicLocked(false);
+      autoStartListening();
+    }
+  } catch (err) {
+    if (err.name === "AbortError") {
+      console.log("Streaming aborted by barge-in or caller action.");
+      return;
+    }
+    console.warn("SSE stream failed, falling back to /api/chat:", err);
+    await fallbackHttpChat(text);
+  }
+}
+
+async function fallbackHttpChat(text) {
   try {
     const res = await fetch("/api/chat", {
       method: "POST",
@@ -858,24 +1256,32 @@ async function sendMessage(text) {
       credentials: "same-origin",
       body: JSON.stringify({ session_id: state.sessionId, message: text }),
     });
-
     if (!res.ok) {
-      const err = await res.json().catch(() => ({}));
-      throw new Error(err.detail || `HTTP ${res.status}`);
+      throw new Error(`HTTP ${res.status}`);
     }
-
     const data = await res.json();
-    setBusy(false);
-    cancelInstantFiller();
-    addBotMessage(data.reply);
+    clearFillerTimers();
+    stopFillerAudio();
+    if (state.currentBotBubble) {
+      updateStreamingBotMessage(state.currentBotBubble, data.reply, true);
+    } else {
+      addBotMessage(data.reply);
+    }
     recordClientCallTurn(state.sessionId, text, data.reply, data.intent, data.outcome);
-    await playAudio(data.speech || data.reply);
-  } catch (err) {
+    if (state.isVoiceEnabled) {
+      await playAudio(data.speech || data.reply);
+    } else {
+      setBusy(false);
+      setMicLocked(false);
+      autoStartListening();
+    }
+  } catch (e) {
     setBusy(false);
     setMicLocked(false);
-    cancelInstantFiller();
+    clearFillerTimers();
+    stopFillerAudio();
     addBotMessage("Sorry, I encountered an error. Please try again.");
-    console.error("Chat error:", err);
+    autoStartListening();
   }
 }
 
@@ -997,8 +1403,11 @@ async function loadChips() {
 }
 
 // =====================================================================
-// Speech Recognition (Mic Button) & Half-Duplex Lock
+// Speech Recognition (Mic Button) & Half-Duplex Lock with Barge-In
 // =====================================================================
+let speechSilenceTimer = null;
+let currentSpeechTranscript = "";
+
 function initSpeechRecognition() {
   const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
   if (!SpeechRecognition) {
@@ -1008,30 +1417,68 @@ function initSpeechRecognition() {
 
   const recog = new SpeechRecognition();
   recog.lang = "en-US";
-  recog.interimResults = false;
+  recog.continuous = true;
+  recog.interimResults = true;
   recog.maxAlternatives = 1;
 
   recog.onresult = (e) => {
-    const transcript = e.results[0][0].transcript;
-    $("chatInput").value = transcript;
-    sendMessage(transcript);
+    let interim = "";
+    let finalTranscript = "";
+
+    for (let i = e.resultIndex; i < e.results.length; ++i) {
+      if (e.results[i].isFinal) {
+        finalTranscript += e.results[i][0].transcript;
+      } else {
+        interim += e.results[i][0].transcript;
+      }
+    }
+
+    const spokenText = (finalTranscript || interim).trim();
+    if (!spokenText) return;
+
+    // Phase 9 Barge-in: if AI agent is speaking or streaming, immediately halt all audio!
+    if (state.isBusy || (state.audioPlayer && state.audioPlayer.isPlaying) || state.currentAudio || state.fillerPlaying || state.isSpeakingFiller) {
+      if (spokenText.length >= 2) {
+        bargeIn();
+      }
+    }
+
+    $("chatInput").value = spokenText;
+    currentSpeechTranscript = spokenText;
+
+    // Turn-taking: wait ~800ms of silence before sending the finalized transcript
+    if (speechSilenceTimer) {
+      clearTimeout(speechSilenceTimer);
+      speechSilenceTimer = null;
+    }
+
+    speechSilenceTimer = setTimeout(() => {
+      const textToSend = currentSpeechTranscript.trim();
+      currentSpeechTranscript = "";
+      if (textToSend && state.isOnCall && !state.isBusy) {
+        sendMessage(textToSend);
+      }
+    }, 800);
   };
 
   recog.onstart = () => {
     state.isListening = true;
     $("btnMic").classList.add("listening");
-    $("btnMic").title = "Listening to you…";
-    // If agent was playing audio, mute/stop it immediately so mic doesn't catch AI voice
-    stopAudio();
-    if (state.ws && state.ws.readyState === WebSocket.OPEN) {
-      state.ws.send(JSON.stringify({ type: "interrupt" }));
-    }
+    $("btnMic").title = "Listening to you live…";
   };
 
   recog.onend = () => {
     state.isListening = false;
     $("btnMic").classList.remove("listening");
     $("btnMic").title = "Click to speak";
+    // Keep continuous listening alive while on active call if AI is not speaking
+    if (state.isOnCall && !state.isBusy && !state.currentAudio && !(state.audioPlayer && state.audioPlayer.isPlaying)) {
+      setTimeout(() => {
+        if (state.isOnCall && !state.isBusy && !state.isListening) {
+          try { recog.start(); } catch (_) {}
+        }
+      }, 200);
+    }
   };
 
   recog.onerror = (e) => {
@@ -1046,7 +1493,7 @@ function initSpeechRecognition() {
   state.recognition = recog;
 
   $("btnMic").addEventListener("click", async () => {
-    if (!state.isOnCall || state.isBusy) return;
+    if (!state.isOnCall) return;
     
     // Ensure permission is granted
     if (!state.micPermissionRequested) {
@@ -1054,13 +1501,9 @@ function initSpeechRecognition() {
     }
 
     if (state.isListening) {
-      recog.stop();
+      try { recog.stop(); } catch (_) {}
     } else {
-      // Never allow mic while AI agent is speaking
-      stopAudio();
-      if (state.ws && state.ws.readyState === WebSocket.OPEN) {
-        state.ws.send(JSON.stringify({ type: "interrupt" }));
-      }
+      bargeIn();
       try {
         recog.start();
       } catch (err) {
@@ -1075,14 +1518,10 @@ function setMicLocked(locked) {
   const mic = $("btnMic");
   if (!mic) return;
   if (locked) {
-    if (state.recognition && state.isListening) {
-      try { state.recognition.stop(); } catch (_) {}
-    }
-    mic.disabled = true;
-    mic.title = "Agent is speaking... Mic is paused to avoid echo";
+    mic.title = "Agent is speaking... Speak to barge-in";
   } else {
     mic.disabled = !state.isOnCall || state.isBusy;
-    mic.title = state.isListening ? "Listening to you…" : "Click to speak";
+    mic.title = state.isListening ? "Listening to you live…" : "Click to speak";
   }
 }
 
@@ -1090,17 +1529,15 @@ function setMicLocked(locked) {
 function autoStartListening() {
   if (!state.isOnCall || state.isBusy || !state.recognition) return;
   if (state.audioPlayer && state.audioPlayer.isPlaying) return;
-  
-  // Brief delay (300ms) to ensure speakers have completely released the audio buffer
+  if (state.speechQueue && state.speechQueue.isProcessing) return;
+
   setTimeout(() => {
     if (!state.isOnCall || state.isBusy || state.currentAudio || state.isListening) return;
     if (state.audioPlayer && state.audioPlayer.isPlaying) return;
     try {
       state.recognition.start();
-    } catch (e) {
-      console.log("Auto-mic start attempt:", e.message || e);
-    }
-  }, 300);
+    } catch (_) {}
+  }, 200);
 }
 
 // =====================================================================

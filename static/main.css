@@ -124,7 +124,7 @@ a:hover { text-decoration: underline; }
    Navigation
    ===================================================================== */
 .navbar {
-  position: sticky;
+  position: fixed;
   top: 0;
   z-index: 1000;
   height: var(--nav-h);
@@ -216,7 +216,7 @@ a:hover { text-decoration: underline; }
 .main-content {
   max-width: 1280px;
   width: 100%;
-  margin: 0 auto;
+  margin: 40px auto;
   padding: 2rem 1.5rem;
   min-width: 0;
 }
@@ -414,6 +414,15 @@ a:hover { text-decoration: underline; }
   color: var(--text);
   border: 1px solid var(--border);
   border-bottom-left-radius: 4px;
+}
+
+.message-bubble[dir="rtl"],
+[dir="rtl"] .message-bubble {
+  direction: rtl;
+  text-align: right;
+  font-family: "Noto Nastaliq Urdu", "Jameel Noori Nastaleeq", "Segoe UI", Tahoma, sans-serif;
+  line-height: 1.8;
+  font-size: 1.02rem;
 }
 
 .message-meta {
