@@ -21,6 +21,7 @@ const state = {
   currentBotBubble: null,
   currentStreamText: "",
   activeUserText: "",
+  isShowingFiller: false,
 };
 
 // ---- Filler phrases spoken immediately while Gemini processes ----
@@ -602,8 +603,21 @@ function initAiWebSocket() {
           case "start":
             setBusy(true);
             setMicLocked(true);
-            state.currentStreamText = "";
-            state.currentBotBubble = createStreamingBotMessage();
+            if (!state.currentBotBubble) {
+              state.isShowingFiller = true;
+              state.currentStreamText = "Let me check that for you...";
+              state.currentBotBubble = createStreamingBotMessage();
+              updateStreamingBotMessage(state.currentBotBubble, state.currentStreamText);
+            }
+            break;
+
+          case "filler":
+            state.isShowingFiller = true;
+            state.currentStreamText = data.text || "Let me check that for you...";
+            if (!state.currentBotBubble) {
+              state.currentBotBubble = createStreamingBotMessage();
+            }
+            updateStreamingBotMessage(state.currentBotBubble, state.currentStreamText);
             break;
 
           case "audio_start":
@@ -612,6 +626,10 @@ function initAiWebSocket() {
 
           case "text_delta":
             if (data.delta) {
+              if (state.isShowingFiller) {
+                state.isShowingFiller = false;
+                state.currentStreamText = "";
+              }
               state.currentStreamText += data.delta;
               updateStreamingBotMessage(state.currentBotBubble, state.currentStreamText);
             }
@@ -627,6 +645,7 @@ function initAiWebSocket() {
             break;
 
           case "done":
+            state.isShowingFiller = false;
             const finalReply = data.reply || state.currentStreamText;
             if (state.currentBotBubble) {
               updateStreamingBotMessage(state.currentBotBubble, finalReply);
@@ -752,6 +771,12 @@ async function sendMessage(text) {
 
   setBusy(true);
   setMicLocked(true);
+
+  // Instantly render filler in chat bubble with 0ms delay
+  state.isShowingFiller = true;
+  state.currentStreamText = "Let me check that for you...";
+  state.currentBotBubble = createStreamingBotMessage();
+  updateStreamingBotMessage(state.currentBotBubble, state.currentStreamText);
 
   // 1. Ultra-low latency streaming over WebSocket
   if (state.ws && state.ws.readyState === WebSocket.OPEN) {

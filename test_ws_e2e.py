@@ -1,4 +1,5 @@
 import json
+import time
 from fastapi.testclient import TestClient
 import app
 
@@ -6,58 +7,58 @@ def test_websocket_flow():
     client = TestClient(app.app)
     print("Connecting to /ws/ai-call...")
     with client.websocket_connect("/ws/ai-call") as ws:
-        # 1. Test ping/pong
+        # 1. Ping
         ws.send_text(json.dumps({"type": "ping"}))
         pong = ws.receive_json()
-        print("Received ping response:", pong)
         assert pong.get("type") == "pong"
 
-        # 2. Test sending a message
-        print("Sending message...")
-        ws.send_text(json.dumps({
-            "type": "message",
-            "session_id": "test-session-ws-1",
-            "text": "Hello, what are your delivery times?"
-        }))
+        queries = [
+            "What are your delivery times?",
+            "What is the minimum order quantity for wholesale prices?",
+        ]
 
-        # 3. Receive streaming frames
-        text_frames = []
-        binary_frames = []
-        is_done = False
+        for idx, q in enumerate(queries, 1):
+            print(f"\n--- Turn {idx}: '{q}' ---")
+            t0 = time.time()
+            ws.send_text(json.dumps({
+                "type": "message",
+                "session_id": "test-multiturn-session",
+                "text": q
+            }))
 
-        for _ in range(50):
-            msg = ws.receive()
-            if "text" in msg:
-                data = json.loads(msg["text"])
-                msg_type = data.get("type")
-                if msg_type == "start":
-                    print("[START frame received]")
-                elif msg_type == "text_delta":
-                    text_frames.append(data.get("delta", ""))
-                elif msg_type == "audio_start":
-                    print("[AUDIO_START frame received]")
-                elif msg_type == "audio_end":
-                    print(f"[AUDIO_END frame received]")
-                elif msg_type == "done":
-                    print(f"[DONE frame received] Reply: {data.get('reply')[:60]}... Intent: {data.get('intent')}")
-                    is_done = True
-                    break
-                elif msg_type == "error":
-                    print("[ERROR frame received]:", data)
-                    break
-            elif "bytes" in msg:
-                binary_frames.append(msg["bytes"])
-                print(f"[BINARY audio chunk received]: {len(msg['bytes'])} bytes")
+            text_chunks = 0
+            binary_chunks = 0
+            first_audio_time = None
+            first_text_time = None
 
-        print(f"Total text delta chunks: {len(text_frames)}")
-        print(f"Total binary audio chunks: {len(binary_frames)}")
-        total_audio_bytes = sum(len(b) for b in binary_frames)
-        print(f"Total audio bytes streamed: {total_audio_bytes} bytes")
+            while True:
+                msg = ws.receive()
+                if "text" in msg:
+                    data = json.loads(msg["text"])
+                    mtype = data.get("type")
+                    if mtype == "filler":
+                        print(f"  [0ms Filler]: '{data.get('text')}'")
+                    elif mtype == "text_delta":
+                        if first_text_time is None:
+                            first_text_time = time.time()
+                        text_chunks += 1
+                    elif mtype == "done":
+                        t_done = time.time()
+                        print(f"  [DONE] Total Turn Time: {t_done - t0:.3f}s")
+                        print(f"  First audio latency: {(first_audio_time - t0)*1000:.1f}ms" if first_audio_time else "No audio")
+                        print(f"  Total text tokens: {text_chunks}")
+                        print(f"  Total audio chunks: {binary_chunks}")
+                        print(f"  Reply: {data.get('reply')[:70]}...")
+                        break
+                elif "bytes" in msg:
+                    if first_audio_time is None:
+                        first_audio_time = time.time()
+                    binary_chunks += 1
 
-        assert is_done, "Expected 'done' frame"
-        assert len(binary_frames) > 0, "Expected at least one binary audio chunk"
-        assert total_audio_bytes > 500, "Expected valid audio byte payload"
-        print("WebSocket live voice streaming test PASSED successfully!")
+            assert binary_chunks >= 2, "Expected filler audio + reply audio"
+            assert text_chunks > 0, "Expected streamed text tokens"
+
+    print("\nAll multi-turn streaming tests PASSED!")
 
 if __name__ == "__main__":
     test_websocket_flow()

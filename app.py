@@ -27,6 +27,7 @@ import io
 import json
 import logging
 import os
+import random
 import re
 import shutil
 import sqlite3
@@ -890,6 +891,20 @@ def _build_error_response(exc: Exception) -> dict:
 DEFAULT_ENGLISH_VOICE = os.getenv("EDGE_TTS_VOICE_EN", "en-US-JennyNeural")
 DEFAULT_URDU_VOICE = os.getenv("EDGE_TTS_VOICE_UR", "ur-PK-UzmaNeural")
 
+FILLER_PHRASES_EN = [
+    "Let me check that for you.",
+    "One moment please, checking that for you.",
+    "Sure, let me look into that.",
+    "Got it, checking our system now.",
+    "Please hold on a moment while I check.",
+]
+FILLER_PHRASES_UR = [
+    "جی، میں ابھی چیک کرتا ہوں۔",
+    "ایک سیکنڈ، میں معلومات دیکھتا ہوں۔",
+]
+
+FILLER_AUDIO_CACHE: dict[str, bytes] = {}
+
 
 @lru_cache(maxsize=256)
 def synthesize(text: str, lang: str) -> bytes:
@@ -919,6 +934,31 @@ async def synthesize_edge_tts(text: str, voice: str | None = None) -> bytes:
     # Reliable fallback to local gTTS
     lang = "ur" if ARABIC_SCRIPT.search(clean_text) else "en"
     return await asyncio.to_thread(synthesize, clean_text, lang)
+
+
+async def get_or_create_filler_audio(text: str, voice: str | None = None) -> bytes:
+    """Retrieve pre-synthesized filler audio from memory cache or synthesize and cache it for 0ms voice response."""
+    if text in FILLER_AUDIO_CACHE:
+        return FILLER_AUDIO_CACHE[text]
+    audio = await synthesize_edge_tts(text, voice)
+    if audio:
+        FILLER_AUDIO_CACHE[text] = audio
+    return audio
+
+
+async def warmup_filler_audio():
+    """Warm up natural filler audio in background for instantaneous voice calls."""
+    for phrase in FILLER_PHRASES_EN:
+        try:
+            await get_or_create_filler_audio(phrase, DEFAULT_ENGLISH_VOICE)
+        except Exception as e:
+            log.warning("Warmup filler warning: %r", e)
+    for phrase in FILLER_PHRASES_UR:
+        try:
+            await get_or_create_filler_audio(phrase, DEFAULT_URDU_VOICE)
+        except Exception as e:
+            log.warning("Warmup Urdu filler warning: %r", e)
+
 
 
 # =====================================================================
@@ -1107,6 +1147,12 @@ app = FastAPI(
     description="Multi-tenant Voice-based AI Customer Support Platform powered by Gemini and gTTS.",
     version="3.0.0",
 )
+
+
+@app.on_event("startup")
+async def on_startup_warmup():
+    """Warm up memory-cached filler audio for 0ms instantaneous voice streaming."""
+    asyncio.create_task(warmup_filler_audio())
 
 
 # OWASP Top 10 A05: Security Headers Middleware
@@ -1620,6 +1666,101 @@ async def get_key_status(admin: dict = Depends(require_admin)):
 SENTENCE_TERMINATORS = re.compile(r"([.!?\n]+|\;\s*|\:\s*)")
 CLAUSE_TERMINATORS = re.compile(r"(\,\s+|\s+-\s+)")
 
+FAST_KNOWLEDGE_STOP_WORDS = {
+    "what", "are", "your", "is", "the", "how", "do", "i", "can", "you", "to",
+    "for", "a", "in", "of", "and", "my", "me", "tell", "about", "please", "we",
+    "any", "some", "there", "have", "does", "give", "get", "show", "much", "many",
+}
+
+KNOWLEDGE_SYNONYM_MAP: dict[str, set[str]] = {
+    "delivery": {"delivery", "shipping", "deliver", "delivered", "dispatch", "dispatched", "times", "time", "speed", "leopards", "tcs"},
+    "cancel": {"cancel", "cancelling", "cancellation", "canceling"},
+    "price": {"price", "pricing", "rate", "rates", "cost", "costs", "pkr", "wholesale"},
+    "minimum": {"minimum", "moq", "least", "smallest", "quantity", "unit", "units"},
+    "return": {"return", "returns", "refund", "refunds", "damaged", "exchange", "warranty", "broken", "replace"},
+    "payment": {"payment", "payments", "pay", "cash", "card", "bank", "transfer", "cod", "advance"},
+    "khata": {"khata", "ledger", "credit", "customer", "debit", "hisab", "record", "bill"},
+    "pool": {"pool", "pooling", "pooled", "group", "buying"},
+}
+
+
+def _expand_knowledge_keywords(words: set[str]) -> set[str]:
+    expanded = set(words)
+    for w in words:
+        for root, syns in KNOWLEDGE_SYNONYM_MAP.items():
+            if w in syns or root in w:
+                expanded.update(syns)
+    return expanded
+
+
+def check_fast_knowledge_response(user_text: str, user_id: int | None = None) -> dict | None:
+    """Fast-path lookup against SQLite FAQs and Product Catalog for 0ms ultra-low latency response."""
+    clean_query = user_text.lower().strip()
+    q_words = set(re.findall(r"\b[a-z0-9]{3,}\b", clean_query)) - FAST_KNOWLEDGE_STOP_WORDS
+    if not q_words:
+        return None
+
+    expanded_q = _expand_knowledge_keywords(q_words)
+
+    try:
+        with db() as conn:
+            conn.row_factory = sqlite3.Row
+
+            # 1. Check FAQs
+            faq_rows = conn.execute(
+                """
+                SELECT question, answer FROM faqs
+                WHERE user_id IS NULL OR user_id IN (SELECT id FROM users WHERE role = 'admin') OR user_id = ?
+                """,
+                (user_id or 0,),
+            ).fetchall()
+
+            best_faq = None
+            best_score = 0.0
+
+            for row in faq_rows:
+                f_words = set(re.findall(r"\b[a-z0-9]{3,}\b", row["question"].lower())) - FAST_KNOWLEDGE_STOP_WORDS
+                f_expanded = _expand_knowledge_keywords(f_words)
+                common = expanded_q.intersection(f_expanded)
+                if len(common) >= 1:
+                    score = len(common) / max(len(q_words), 1)
+                    if score > best_score:
+                        best_score = score
+                        best_faq = (row["question"], row["answer"])
+
+            if best_faq and best_score >= 0.5:
+                return {
+                    "type": "faq",
+                    "answer": best_faq[1],
+                    "intent": "faq_inquiry",
+                }
+
+            # 2. Check Products
+            prod_rows = conn.execute(
+                """
+                SELECT name, category, price, stock_status, description FROM products
+                WHERE user_id IS NULL OR user_id IN (SELECT id FROM users WHERE role = 'admin') OR user_id = ?
+                """,
+                (user_id or 0,),
+            ).fetchall()
+
+            for row in prod_rows:
+                name_clean = row["name"].lower()
+                name_words = set(re.findall(r"\b[a-z0-9]{3,}\b", name_clean)) - FAST_KNOWLEDGE_STOP_WORDS
+                common_name = q_words.intersection(name_words)
+                if len(common_name) >= 2 or (len(name_words) == 1 and len(common_name) == 1) or any(w in clean_query for w in name_words if len(w) >= 6):
+                    status = "in stock" if "in" in str(row["stock_status"]).lower() else "currently out of stock"
+                    reply = f"The {row['name']} is {status} at wholesale rate PKR {row['price']:,.0f}. {row['description']}"
+                    return {
+                        "type": "product",
+                        "answer": reply,
+                        "intent": "product_inquiry",
+                    }
+    except Exception as exc:
+        log.warning("Fast knowledge lookup error: %r", exc)
+
+    return None
+
 
 def build_voice_system_instruction(user_id: int | None = None) -> str:
     """Build concise, conversational instructions tailored for low-latency live voice calls."""
@@ -1727,6 +1868,7 @@ async def stream_gemini_voice_tokens(session_id: str, user_text: str, user_id: i
 async def websocket_ai_call_endpoint(websocket: WebSocket):
     """Ultra-low latency real-time voice streaming WebSocket endpoint."""
     await websocket.accept()
+    asyncio.create_task(warmup_filler_audio())
 
     # Extract authenticated user context if cookie or token present
     opt_user = None
@@ -1753,58 +1895,129 @@ async def websocket_ai_call_endpoint(websocket: WebSocket):
         buffer = ""
 
         try:
-            # 1. Inform client that generation has begun
+            # 1. Inform client that processing has begun
             await websocket.send_text(json.dumps({
                 "type": "start",
                 "session_id": session_id,
                 "user_text": user_text,
             }))
+
+            # 2. IMMEDIATE 0ms FILLER AUDIO:
+            # Transmit pre-cached natural filler phrase audio immediately so the caller hears voice within milliseconds!
+            is_urdu = bool(ARABIC_SCRIPT.search(user_text))
+            filler_candidates = FILLER_PHRASES_UR if is_urdu else FILLER_PHRASES_EN
+            cached_phrase = next((p for p in filler_candidates if p in FILLER_AUDIO_CACHE), None)
+            if cached_phrase:
+                filler_text = cached_phrase
+                filler_audio = FILLER_AUDIO_CACHE[cached_phrase]
+            else:
+                filler_text = random.choice(filler_candidates)
+                filler_audio = await get_or_create_filler_audio(filler_text, DEFAULT_URDU_VOICE if is_urdu else DEFAULT_ENGLISH_VOICE)
+
+            await websocket.send_text(json.dumps({
+                "type": "filler",
+                "text": filler_text,
+            }))
+            if filler_audio:
+                await websocket.send_bytes(filler_audio)
+
             await websocket.send_text(json.dumps({"type": "audio_start"}))
 
-            # 2. Stream tokens from Gemini and convert sentences to audio in real-time
-            async for token in stream_gemini_voice_tokens(session_id, user_text, user_id):
-                full_text += token
-                buffer += token
+            # 3. CONCURRENT AUDIO QUEUE:
+            # Decouple token streaming from audio synthesis so Gemini tokens stream word-by-word into the client's UI
+            # without waiting on edge-tts synthesis network calls!
+            audio_queue: asyncio.Queue[str | None] = asyncio.Queue()
 
-                # Send text token immediately to update the client's chat UI
-                await websocket.send_text(json.dumps({
-                    "type": "text_delta",
-                    "delta": token,
-                }))
-
-                # Check for sentence completion (terminal punctuation)
-                m_term = SENTENCE_TERMINATORS.search(buffer)
-                if m_term:
-                    end_idx = m_term.end()
-                    sentence = buffer[:end_idx].strip()
-                    buffer = buffer[end_idx:]
-                    if len(sentence) >= 4:
-                        audio_data = await synthesize_edge_tts(sentence)
+            async def _tts_worker():
+                while True:
+                    sentence_chunk = await audio_queue.get()
+                    if sentence_chunk is None:
+                        audio_queue.task_done()
+                        break
+                    try:
+                        audio_data = await synthesize_edge_tts(sentence_chunk)
                         if audio_data:
                             await websocket.send_bytes(audio_data)
-                elif len(buffer) >= 45:
-                    # Check for natural clause pause
-                    m_clause = CLAUSE_TERMINATORS.search(buffer)
-                    if m_clause:
-                        end_idx = m_clause.end()
-                        clause = buffer[:end_idx].strip()
-                        buffer = buffer[end_idx:]
-                        if len(clause) >= 8:
-                            audio_data = await synthesize_edge_tts(clause)
-                            if audio_data:
-                                await websocket.send_bytes(audio_data)
+                    except Exception as e_tts:
+                        log.warning("Streaming TTS chunk error: %r", e_tts)
+                    finally:
+                        audio_queue.task_done()
 
-            # 3. Flush any remaining text in buffer to audio
-            tail = buffer.strip()
-            if tail:
-                audio_data = await synthesize_edge_tts(tail)
-                if audio_data:
-                    await websocket.send_bytes(audio_data)
+            tts_task = asyncio.create_task(_tts_worker())
 
-            # 4. Notify client that all audio chunks have been sent
+            # 4. Check FAST-PATH Knowledge Base (0ms direct FAQ & Product Catalog lookup)
+            fast_match = check_fast_knowledge_response(user_text, user_id)
+            if fast_match:
+                reply_text = fast_match["answer"]
+                intent = fast_match.get("intent", "general_inquiry")
+                outcome = "Resolved"
+
+                # Stream words smoothly with 20ms human typing delay
+                words = reply_text.split(" ")
+                for i, w in enumerate(words):
+                    token = w + (" " if i < len(words) - 1 else "")
+                    full_text += token
+                    await websocket.send_text(json.dumps({
+                        "type": "text_delta",
+                        "delta": token,
+                    }))
+                    await asyncio.sleep(0.02)
+
+                # Queue answer for audio synthesis
+                await audio_queue.put(reply_text)
+            else:
+                # 5. Open-ended / Conversational: Stream from Gemini in real-time
+                first_clause_enqueued = False
+                async for token in stream_gemini_voice_tokens(session_id, user_text, user_id):
+                    full_text += token
+                    buffer += token
+
+                    # Send text token immediately to update the client's chat UI word-by-word
+                    await websocket.send_text(json.dumps({
+                        "type": "text_delta",
+                        "delta": token,
+                    }))
+
+                    # For the very first chunk, synthesize earlier (after 3-5 words or clause)
+                    if not first_clause_enqueued:
+                        m_term = SENTENCE_TERMINATORS.search(buffer) or (CLAUSE_TERMINATORS.search(buffer) if len(buffer) >= 20 else None)
+                        if m_term:
+                            end_idx = m_term.end()
+                            first_sentence = buffer[:end_idx].strip()
+                            buffer = buffer[end_idx:]
+                            if len(first_sentence) >= 4:
+                                first_clause_enqueued = True
+                                await audio_queue.put(first_sentence)
+                    else:
+                        m_term = SENTENCE_TERMINATORS.search(buffer)
+                        if m_term:
+                            end_idx = m_term.end()
+                            sentence = buffer[:end_idx].strip()
+                            buffer = buffer[end_idx:]
+                            if len(sentence) >= 4:
+                                await audio_queue.put(sentence)
+                        elif len(buffer) >= 45:
+                            m_clause = CLAUSE_TERMINATORS.search(buffer)
+                            if m_clause:
+                                end_idx = m_clause.end()
+                                clause = buffer[:end_idx].strip()
+                                buffer = buffer[end_idx:]
+                                if len(clause) >= 8:
+                                    await audio_queue.put(clause)
+
+                # Flush any remaining text in buffer to audio queue
+                tail = buffer.strip()
+                if tail:
+                    await audio_queue.put(tail)
+
+            # Signal worker to complete and await all audio chunk synthesis
+            await audio_queue.put(None)
+            await tts_task
+
+            # Notify client that all audio chunks have been sent
             await websocket.send_text(json.dumps({"type": "audio_end"}))
 
-            # 5. Determine intent & outcome
+            # 6. Determine intent & outcome
             clean_reply = full_text.strip() or "Thank you for reaching DigiBuzz. How may I assist you?"
             lower_r = clean_reply.lower()
             outcome = "Escalated" if ("human" in lower_r or "transfer" in lower_r or "escalat" in lower_r) else "Resolved"
@@ -1818,7 +2031,7 @@ async def websocket_ai_call_endpoint(websocket: WebSocket):
             elif outcome == "Escalated":
                 intent = "human_handoff"
 
-            # 6. Persist to memory and SQLite database
+            # 7. Persist to memory and SQLite database
             remember(session_id, user_text, clean_reply)
             try:
                 await asyncio.to_thread(
@@ -1831,7 +2044,7 @@ async def websocket_ai_call_endpoint(websocket: WebSocket):
             except Exception as e_save:
                 log.error("Failed to save stream call message: %r", e_save)
 
-            # 7. Notify client that turn is complete
+            # 8. Notify client that turn is complete
             await websocket.send_text(json.dumps({
                 "type": "done",
                 "session_id": session_id,
