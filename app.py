@@ -1194,6 +1194,31 @@ init_db()
 # =====================================================================
 SESSIONS: OrderedDict[str, list[dict]] = OrderedDict()
 CONSECUTIVE_ERRORS: int = 0
+GUEST_TURNS: dict[str, int] = {}
+GUEST_CALL_LIMIT = 5
+
+
+def check_guest_limit(session_id: str, user_id: int | None, is_urdu: bool = False) -> dict | None:
+    """Enforce guest turn limit for unauthenticated callers without account sign-up."""
+    if user_id is not None:
+        return None
+    turns = GUEST_TURNS.get(session_id, 0) + 1
+    GUEST_TURNS[session_id] = turns
+    if turns > GUEST_CALL_LIMIT:
+        b_name = get_business_setting("business_name", "our business")
+        if is_urdu:
+            msg = f"آپ نے مفت گیسٹ کال کی حد ({GUEST_CALL_LIMIT} سوالات) مکمل کر لی ہے۔ مزید گفتگو جاری رکھنے اور آرڈرز کے لیے برائے مہربانی اکاؤنٹ بنائیں یا لاگ ان کریں۔"
+        else:
+            msg = f"You have reached the free guest call limit of {GUEST_CALL_LIMIT} questions. Please sign up or log in to your account to continue placing orders and speaking with our AI assistant at {b_name}."
+        return {
+            "reply": msg,
+            "speech": msg,
+            "intent": "guest_limit_reached",
+            "outcome": "Resolved",
+            "guest_limit_reached": True,
+            "turns": turns,
+        }
+    return None
 
 
 def remember(session_id: str, user_text: str, reply: str) -> None:
@@ -1216,9 +1241,10 @@ def parse_model_json(raw: str) -> dict:
         except Exception:
             pass
     clean_text = text.replace("```json", "").replace("```", "").strip()
+    b_name = get_business_setting("business_name", "our business")
     return {
-        "response_text": clean_text or "Hello! How can I assist you with DigiBuzz today?",
-        "speech_text": clean_text or "Hello! How can I assist you with DigiBuzz today?",
+        "response_text": clean_text or f"Hello! How can I assist you with {b_name} today?",
+        "speech_text": clean_text or f"Hello! How can I assist you with {b_name} today?",
         "intent": "general_inquiry",
         "outcome": "Resolved",
     }
@@ -1308,7 +1334,8 @@ async def ask_gemini(session_id: str, user_text: str, user_id: int | None = None
     data = parse_model_json(raw)
     reply = str(data.get("response_text") or "").strip()
     if not reply:
-        reply = "Hello! How can I assist you with DigiBuzz today?"
+        b_name = get_business_setting("business_name", "our business")
+        reply = f"Hello! How can I assist you with {b_name} today?"
 
     raw_outcome = str(data.get("outcome", "")).strip().lower()
     outcome = "Escalated" if raw_outcome == "escalated" else "Resolved"
@@ -2203,108 +2230,122 @@ def _expand_knowledge_keywords(words: set[str]) -> set[str]:
     return expanded
 
 
-CONVERSATIONAL_INTENTS: dict[str, tuple[set[str], str]] = {
-    "greeting": (
-        {"hello", "hi", "hey", "salam", "assalam", "aoa", "morning", "evening", "afternoon"},
-        "Hello! Welcome to our automated assistance. How may I assist you with our catalog and services today?"
-    ),
-    "identity": (
-        {"who are you", "who is this", "your name", "what is your name", "kaun ho", "kaun hain", "ap kaun", "tum kaun"},
-        "I am an automated AI Calling Assistant, here to assist you 24/7 with our catalog, services, and order inquiries."
-    ),
-    "status": (
-        {"how are you", "how are u", "kaise ho", "kya haal"},
-        "I am doing great, thank you! How may I assist you today?"
-    ),
-    "gratitude": (
-        {"thanks", "thank you", "shukriya", "jazakallah"},
-        "You are very welcome! Please let me know if there is anything else I can help you with today."
-    ),
-    "catalog_overview": (
-        {"catalog", "categories", "products", "items list", "services list"},
-        "We offer a wide range of verified products and professional services. What item or service can I check for you?"
-    ),
-}
-
-
 def check_fast_knowledge_response(user_text: str, user_id: int | None = None) -> dict | None:
     """Fast-path lookup against SQLite FAQs and Product Catalog for 0ms ultra-low latency response."""
     clean_query = user_text.lower().strip()
-    words_all = set(re.findall(r"\b[a-z0-9]{2,}\b", clean_query))
+    clean_no_punc = re.sub(r"[^\w\s\u0600-\u06FF]", " ", clean_query).strip()
+    words_all = set(clean_no_punc.split())
     if not words_all:
         return None
 
-    # 1. Check conversational intents
-    for intent, (triggers, reply) in CONVERSATIONAL_INTENTS.items():
-        if any(trig in clean_query for trig in triggers) and len(words_all) <= 8:
-            return {
-                "type": "conversational",
-                "answer": reply,
-                "intent": intent,
-            }
-
-    q_words = words_all - FAST_KNOWLEDGE_STOP_WORDS
-    if not q_words:
-        return None
-
-    expanded_q = _expand_knowledge_keywords(q_words)
-
+    # 1. First check FAQs (Direct exact & high-similarity normalized match)
     try:
         with db() as conn:
             conn.row_factory = sqlite3.Row
-
-            # 2. Check FAQs
             faq_rows = conn.execute(
                 """
-                SELECT question, answer FROM faqs
+                SELECT id, question, answer, intent FROM faqs
                 WHERE user_id IS NULL OR user_id IN (SELECT id FROM users WHERE role = 'admin') OR user_id = ?
                 """,
                 (user_id or 0,),
             ).fetchall()
 
-            best_faq = None
-            best_score = 0.0
+            norm_clean = re.sub(r"\s+", " ", clean_no_punc)
 
+            # Direct exact question match (case/punctuation insensitive)
             for row in faq_rows:
-                f_words = set(re.findall(r"\b[a-z0-9]{3,}\b", row["question"].lower())) - FAST_KNOWLEDGE_STOP_WORDS
-                f_expanded = _expand_knowledge_keywords(f_words)
-                common = expanded_q.intersection(f_expanded)
-                if len(common) >= 1:
-                    score = len(common) / max(len(q_words), 1)
-                    if score > best_score:
-                        best_score = score
-                        best_faq = (row["question"], row["answer"])
-
-            if best_faq and best_score >= 0.5:
-                return {
-                    "type": "faq",
-                    "answer": best_faq[1],
-                    "intent": "faq_inquiry",
-                }
-
-            # 3. Check Products
-            prod_rows = conn.execute(
-                """
-                SELECT name, category, price, stock_status, description FROM products
-                WHERE user_id IS NULL OR user_id IN (SELECT id FROM users WHERE role = 'admin') OR user_id = ?
-                """,
-                (user_id or 0,),
-            ).fetchall()
-
-            for row in prod_rows:
-                name_clean = row["name"].lower()
-                name_words = set(re.findall(r"\b[a-z0-9]{3,}\b", name_clean)) - FAST_KNOWLEDGE_STOP_WORDS
-                common_name = q_words.intersection(name_words)
-                if len(common_name) >= 2 or (len(name_words) == 1 and len(common_name) == 1) or any(w in clean_query for w in name_words if len(w) >= 6):
-                    status = "in stock" if "in" in str(row["stock_status"]).lower() else "currently out of stock"
-                    reply = f"The {row['name']} is {status} at wholesale rate PKR {row['price']:,.0f}. {row['description']}"
+                q_norm = re.sub(r"[^\w\s\u0600-\u06FF]", " ", row["question"].lower()).strip()
+                q_norm = re.sub(r"\s+", " ", q_norm)
+                if norm_clean == q_norm:
                     return {
-                        "type": "product",
-                        "answer": reply,
-                        "intent": "product_inquiry",
+                        "type": "faq",
+                        "answer": row["answer"],
+                        "intent": row["intent"] or "faq_inquiry",
                     }
+
+            q_words = words_all - FAST_KNOWLEDGE_STOP_WORDS
+            if q_words:
+                expanded_q = _expand_knowledge_keywords(q_words)
+                best_faq = None
+                best_score = 0.0
+
+                for row in faq_rows:
+                    f_words = set(re.findall(r"\b[a-z0-9]{3,}\b", row["question"].lower())) - FAST_KNOWLEDGE_STOP_WORDS
+                    f_expanded = _expand_knowledge_keywords(f_words)
+                    common = expanded_q.intersection(f_expanded)
+                    if len(common) >= 1:
+                        score = len(common) / max(len(q_words), 1)
+                        if score > best_score:
+                            best_score = score
+                            best_faq = (row["question"], row["answer"], row["intent"])
+
+                if best_faq and best_score >= 0.5:
+                    return {
+                        "type": "faq",
+                        "answer": best_faq[1],
+                        "intent": best_faq[2] or "faq_inquiry",
+                    }
+
+            # 2. Check Products
+            if q_words:
+                prod_rows = conn.execute(
+                    """
+                    SELECT name, category, price, stock_status, description FROM products
+                    WHERE user_id IS NULL OR user_id IN (SELECT id FROM users WHERE role = 'admin') OR user_id = ?
+                    """,
+                    (user_id or 0,),
+                ).fetchall()
+
+                for row in prod_rows:
+                    name_clean = row["name"].lower()
+                    name_words = set(re.findall(r"\b[a-z0-9]{3,}\b", name_clean)) - FAST_KNOWLEDGE_STOP_WORDS
+                    common_name = q_words.intersection(name_words)
+                    if len(common_name) >= 2 or (len(name_words) == 1 and len(common_name) == 1) or any(w in clean_query for w in name_words if len(w) >= 6):
+                        status = "in stock" if "in" in str(row["stock_status"]).lower() else "currently out of stock"
+                        reply = f"The {row['name']} is {status} at wholesale rate PKR {row['price']:,.0f}. {row['description']}"
+                        return {
+                            "type": "product",
+                            "answer": reply,
+                            "intent": "product_inquiry",
+                        }
     except Exception as exc:
         log.warning("Fast knowledge lookup error: %r", exc)
+
+    # 3. Check Conversational Intents (Strict matching only for pure conversational turns)
+    b_name = get_business_setting("business_name", "our business")
+    clean_phrase = " ".join(clean_no_punc.split())
+
+    status_exact = {"how are you", "how are u", "how are you doing", "how do you do", "kaise ho", "kya haal hai", "kya haal", "theek ho"}
+    if clean_phrase in status_exact:
+        return {
+            "type": "conversational",
+            "answer": f"I am doing great, thank you! How may I assist you with {b_name} today?",
+            "intent": "status",
+        }
+
+    identity_exact = {"who are you", "who is this", "what is your name", "tell me about yourself", "tell me about you", "ap kaun ho", "ap kaun hain", "tum kaun ho"}
+    if clean_phrase in identity_exact:
+        return {
+            "type": "conversational",
+            "answer": f"I am an automated AI Calling Assistant for {b_name}, here to assist you 24/7 with our catalog, services, and order inquiries.",
+            "intent": "identity",
+        }
+
+    gratitude_exact = {"thanks", "thank you", "thank you so much", "thanks a lot", "shukriya", "jazakallah", "bohat shukriya"}
+    if clean_phrase in gratitude_exact:
+        return {
+            "type": "conversational",
+            "answer": "You are very welcome! Please let me know if there is anything else I can help you with today.",
+            "intent": "gratitude",
+        }
+
+    catalog_exact = {"what do you sell", "what products do you have", "show catalog", "product catalog", "what products do you offer", "what are your products", "list of products", "services list"}
+    if clean_phrase in catalog_exact:
+        return {
+            "type": "conversational",
+            "answer": f"We offer a wide range of verified products and professional services at {b_name}. What item or service can I check for you?",
+            "intent": "catalog_overview",
+        }
 
     return None
 
@@ -2454,7 +2495,9 @@ async def get_stream_system_instruction(user_id: int | None = None) -> str:
 
     faq_ctx, prod_ctx = await asyncio.gather(_get_faqs(), _get_prods())
 
-    instruction = f"""You are the DigiBuzz AI Calling Agent speaking live on a phone call.
+    b_name = get_business_setting("business_name", "our business")
+    b_type = get_business_setting("business_type", "Products & Services")
+    instruction = f"""You are the automated AI Calling Assistant for {b_name} ({b_type}) speaking live on a phone call.
 KNOWLEDGE BASE:
 1. Operational FAQs:
 {faq_ctx}
@@ -2614,17 +2657,22 @@ def check_instant_fast_path(text: str, session_id: str, user_id: int | None = No
 
     # 4. Yes / No confirmations (checked before generic quantities)
     confirm_words_en = {"yes", "yeah", "yep", "sure", "ok", "okay", "confirm", "proceed", "no", "nope", "cancel"}
-    confirm_words_ur = {"جی", "ہاں", "جی ہاں", "نہیں", "ٹھیک ہے", "بالکل", "کینسل", "theek", "haan", "jee", "nahi"}
-    confirm_phrases = ["theek hai", "confirm karo", "confirm it", "yes confirm", "no cancel", "cancel that", "جی بالکل ٹھیک", "ٹھیک ہے", "بالکل ٹھیک", "جی ہاں", "جی بالکل"]
-    clean_no_punc = re.sub(r"[^\w\s\u0600-\u06FF]", "", clean)
+    confirm_words_ur = {"جی", "ہاں", "جی ہاں", "نہیں", "ٹھیک ہے", "ٹھیک", "بالکل", "کینسل", "theek", "haan", "jee", "nahi", "ہے"}
+    confirm_phrases = [
+        "theek hai", "confirm karo", "confirm it", "yes confirm", "no cancel", "cancel that",
+        "جی بالکل ٹھیک", "جی بالکل ٹھیک ہے", "ٹھیک ہے", "بالکل ٹھیک", "بالکل ٹھیک ہے", "جی ہاں", "جی بالکل"
+    ]
+    clean_no_punc = re.sub(r"[^\w\s\u0600-\u06FF]", "", clean).strip()
     words_no_punc = set(clean_no_punc.split())
 
-    if word_count <= 6 and (
+    is_pure_confirm = (
         clean_no_punc in confirm_words_en
         or clean_no_punc in confirm_words_ur
-        or any(p in clean_no_punc for p in confirm_phrases)
-        or any(w in confirm_words_en | confirm_words_ur for w in words_no_punc)
-    ):
+        or clean_no_punc in confirm_phrases
+        or (word_count <= 4 and clean_no_punc.startswith(("yes ", "no ", "sure ", "theek hai", "confirm ")))
+        or (word_count <= 4 and words_no_punc.issubset(confirm_words_en | confirm_words_ur))
+    )
+    if is_pure_confirm:
         if any(w in ["no", "nope", "cancel", "نہیں"] for w in words):
             reply = "کوئی مسئلہ نہیں، یہ کینسل کر دیا گیا ہے۔ کیا آپ کو مزید کچھ درکار ہے؟" if is_urdu else "No problem at all, I have cancelled that. How else can I assist you?"
         else:
@@ -2969,9 +3017,37 @@ async def websocket_ai_call_endpoint(websocket: WebSocket):
                 "user_text": user_text,
             }))
 
+            # 1b. Check Guest Limits for unauthenticated callers without sign-up
+            is_urdu = bool(ARABIC_SCRIPT.search(user_text))
+            guest_check = check_guest_limit(session_id, user_id, is_urdu)
+            if guest_check:
+                limit_text = guest_check["reply"]
+                words = limit_text.split(" ")
+                for i, w in enumerate(words):
+                    token = w + (" " if i < len(words) - 1 else "")
+                    await websocket.send_text(json.dumps({
+                        "type": "text_delta",
+                        "delta": token,
+                    }))
+                    await asyncio.sleep(0.02)
+                audio_data = await synthesize_edge_tts(guest_check["speech"], DEFAULT_URDU_VOICE if is_urdu else DEFAULT_ENGLISH_VOICE)
+                if audio_data:
+                    await websocket.send_text(json.dumps({"type": "audio_start"}))
+                    await websocket.send_bytes(audio_data)
+                await websocket.send_text(json.dumps({
+                    "type": "guest_limit",
+                    "message": limit_text,
+                    "guest_limit_reached": True,
+                }))
+                await websocket.send_text(json.dumps({
+                    "type": "meta",
+                    "intent": "guest_limit_reached",
+                    "outcome": "Resolved",
+                }))
+                return
+
             # 2. IMMEDIATE 0ms FILLER AUDIO:
             # Transmit pre-cached natural filler phrase audio immediately so the caller hears voice within milliseconds!
-            is_urdu = bool(ARABIC_SCRIPT.search(user_text))
             filler_candidates = FILLER_PHRASES_UR if is_urdu else FILLER_PHRASES_EN
             cached_phrase = next((p for p in filler_candidates if p in FILLER_AUDIO_CACHE), None)
             if cached_phrase:
@@ -3093,7 +3169,8 @@ async def websocket_ai_call_endpoint(websocket: WebSocket):
             await websocket.send_text(json.dumps({"type": "audio_end"}))
 
             # 6. Determine intent & outcome
-            clean_reply = full_text.strip() or "Thank you for reaching DigiBuzz. How may I assist you?"
+            b_name = get_business_setting("business_name", "our business")
+            clean_reply = full_text.strip() or f"Thank you for contacting {b_name}. How may I assist you?"
             lower_r = clean_reply.lower()
             outcome = "Escalated" if ("human" in lower_r or "transfer" in lower_r or "escalat" in lower_r) else "Resolved"
             intent = "general_inquiry"
@@ -3193,6 +3270,12 @@ async def chat_endpoint(req: ChatRequest, request: Request):
     opt_user = await get_optional_user(request)
     user_id = opt_user["id"] if opt_user else None
 
+    # Check guest turn limit for unauthenticated callers
+    is_urdu = bool(ARABIC_SCRIPT.search(text))
+    guest_check = check_guest_limit(req.session_id, user_id, is_urdu)
+    if guest_check:
+        return guest_check
+
     # Instant fast-path check (~0ms)
     fast_match = check_instant_fast_path(text, req.session_id, user_id)
     if fast_match:
@@ -3227,6 +3310,17 @@ async def chat_stream_endpoint(req: ChatRequest, request: Request):
 
     opt_user = await get_optional_user(request)
     user_id = opt_user["id"] if opt_user else None
+
+    # Check guest turn limit for unauthenticated callers
+    is_urdu = bool(ARABIC_SCRIPT.search(text))
+    guest_check = check_guest_limit(req.session_id, user_id, is_urdu)
+    if guest_check:
+        async def guest_stream_generator():
+            yield f"data: {json.dumps({'type': 'sentence', 'text': guest_check['reply'], 'idx': 0}, ensure_ascii=False)}\n\n"
+            yield f"data: {json.dumps({'type': 'guest_limit', 'message': guest_check['reply'], 'guest_limit_reached': True}, ensure_ascii=False)}\n\n"
+            yield f"data: {json.dumps({'type': 'meta', 'intent': 'guest_limit_reached', 'outcome': 'Resolved', 'confidence': 1.0, 'needs_handoff': False}, ensure_ascii=False)}\n\n"
+            yield f"data: {json.dumps({'type': 'done'})}\n\n"
+        return StreamingResponse(guest_stream_generator(), media_type="text/event-stream")
 
     # 1. Check instant fast path (0 ms, no LLM)
     fast_match = check_instant_fast_path(text, req.session_id, user_id)

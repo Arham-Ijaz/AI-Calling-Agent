@@ -879,6 +879,7 @@ async function loadAdminPendingOrders() {
     const orders = await res.json();
 
     if (countBadge) countBadge.textContent = `${orders.length} Pending`;
+    if (typeof updateAdminOrdersNavBadge === "function") updateAdminOrdersNavBadge();
 
     if (!orders || orders.length === 0) {
       tbody.innerHTML = `<tr><td colspan="8" class="loading-row" style="color:var(--text-muted)">✅ No pending order requests awaiting confirmation.</td></tr>`;
@@ -1013,6 +1014,7 @@ async function loadAdminCancelRequests() {
     const orders = await res.json();
 
     if (countBadge) countBadge.textContent = `${orders.length} Requests`;
+    if (typeof updateAdminOrdersNavBadge === "function") updateAdminOrdersNavBadge();
 
     if (!orders || orders.length === 0) {
       tbody.innerHTML = `<tr><td colspan="7" class="loading-row" style="color:var(--text-muted)">✅ No customer cancellation requests pending.</td></tr>`;

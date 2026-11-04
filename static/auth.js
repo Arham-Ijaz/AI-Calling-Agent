@@ -105,6 +105,9 @@ function updateAuthUI() {
   if (navFaqs) navFaqs.style.display = isAdm ? "inline-flex" : "none";
   if (sidebarFaqs) sidebarFaqs.style.display = isAdm ? "block" : "none";
 
+  // Orders navigation tab customization: for Admin, show "Orders" + live pending/in-process count badge
+  updateAdminOrdersNavBadge();
+
   const pageFaq = document.getElementById("page-faqs");
   if (pageFaq && pageFaq.classList.contains("active") && !isAdm) {
     if (typeof navigateTo === "function") navigateTo("home");
@@ -125,6 +128,50 @@ function updateAuthUI() {
 
   // Update Settings Page View for active role
   updateSettingsView();
+}
+
+async function updateAdminOrdersNavBadge() {
+  const navOrdersLink = document.getElementById("navOrdersLink");
+  if (!navOrdersLink) return;
+
+  if (!authState || !authState.isLoggedIn) {
+    navOrdersLink.innerHTML = "🛍️ My Orders";
+    navOrdersLink.setAttribute("data-page", "orders");
+    return;
+  }
+
+  if (!authState.isAdmin) {
+    navOrdersLink.innerHTML = "🛍️ My Orders";
+    navOrdersLink.setAttribute("data-page", "orders");
+    return;
+  }
+
+  // Admin view: change label to "Orders" and show live status badge (pending / in process)
+  navOrdersLink.setAttribute("data-page", "admin-orders");
+  try {
+    const res = await fetch("/api/admin/orders/summary", { credentials: "same-origin" });
+    if (!res.ok) {
+      navOrdersLink.innerHTML = "📦 Orders";
+      return;
+    }
+    const data = await res.json();
+    const pending = data.pending_confirmation_count || 0;
+    const cancelReq = data.cancel_requested_count || 0;
+    const confirmed = data.confirmed_count || 0;
+
+    let badge = "";
+    if (pending > 0) {
+      badge = ` <span style="background:#eab308;color:#000;font-size:0.75rem;padding:2px 7px;border-radius:12px;font-weight:700;margin-left:4px;">${pending} Pending</span>`;
+    } else if (cancelReq > 0) {
+      badge = ` <span style="background:#ef4444;color:#fff;font-size:0.75rem;padding:2px 7px;border-radius:12px;font-weight:700;margin-left:4px;">${cancelReq} Cancel</span>`;
+    } else if (confirmed > 0) {
+      badge = ` <span style="background:#3b82f6;color:#fff;font-size:0.75rem;padding:2px 7px;border-radius:12px;font-weight:700;margin-left:4px;">${confirmed} In Process</span>`;
+    }
+
+    navOrdersLink.innerHTML = `📦 Orders${badge}`;
+  } catch (_) {
+    navOrdersLink.innerHTML = "📦 Orders";
+  }
 }
 
 function updateSettingsView() {

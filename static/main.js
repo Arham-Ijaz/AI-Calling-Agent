@@ -262,6 +262,19 @@ function navigateTo(page) {
     page = "home";
   }
 
+  // Orders navigation for Admin: Route admin directly to admin orders panel
+  if (page === "orders" || page === "admin-orders") {
+    if (typeof authState !== "undefined" && authState && authState.isLoggedIn && authState.isAdmin) {
+      page = "admin";
+      setTimeout(() => {
+        const pendingBox = document.getElementById("adminPendingOrdersSection");
+        if (pendingBox) {
+          pendingBox.scrollIntoView({ behavior: "smooth", block: "start" });
+        }
+      }, 80);
+    }
+  }
+
   const navLinks = $("navLinks");
   if (navLinks) navLinks.classList.remove("open");
 
@@ -1334,6 +1347,14 @@ function initAiWebSocket() {
       try {
         const data = JSON.parse(event.data);
         switch (data.type) {
+          case "guest_limit":
+            state.guestLimitReached = true;
+            setTimeout(() => {
+              if (state.isOnCall) endCall();
+              showGuestLimitNotice(data.message);
+            }, 800);
+            break;
+
           case "start":
             setBusy(true);
             setMicLocked(true);
@@ -1652,6 +1673,11 @@ async function sendStreamingMessage(text) {
             if (state.isVoiceEnabled && state.speechQueue) {
               state.speechQueue.enqueue(event.text, event.idx);
             }
+          } else if (event.type === "guest_limit") {
+            state.guestLimitReached = true;
+            setTimeout(() => {
+              showGuestLimitNotice(event.message);
+            }, 600);
           } else if (event.type === "meta") {
             metaData = event;
           } else if (event.type === "done") {
@@ -1675,10 +1701,12 @@ async function sendStreamingMessage(text) {
       );
 
       // If backend detected farewell intent or caller spoke goodbye, finish speaking then end call
-      if (metaData.intent === "farewell" || isEndCallPhrase(text)) {
+      if (metaData.intent === "farewell" || metaData.intent === "guest_limit_reached" || metaData.guest_limit_reached || isEndCallPhrase(text)) {
+        const isGuestLimit = metaData.intent === "guest_limit_reached" || metaData.guest_limit_reached;
         const finishAndEnd = () => {
           setTimeout(() => {
             if (state.isOnCall) endCall();
+            if (isGuestLimit) showGuestLimitNotice(fullTextAccumulator);
           }, 500);
         };
         if (state.speechQueue && state.speechQueue.isProcessing) {
@@ -2401,5 +2429,25 @@ async function handleConfirmCustomerCancel() {
       err.textContent = ex.message;
       err.classList.remove("hidden");
     }
+  }
+}
+
+function showGuestLimitNotice(msg) {
+  const container = document.getElementById("toastNotificationContainer") || document.body;
+  const toast = document.createElement("div");
+  toast.className = "notification-toast urgent";
+  toast.style.cssText = "position:fixed;top:20px;right:20px;z-index:9999;background:#ef4444;color:#fff;padding:14px 20px;border-radius:10px;box-shadow:0 6px 18px rgba(0,0,0,0.35);font-size:0.92rem;max-width:400px;line-height:1.4;";
+  toast.innerHTML = `<strong>⚠️ Guest Limit Reached</strong><br>${msg || "You have reached the free guest call limit. Please sign up or log in to continue."}`;
+  container.appendChild(toast);
+  setTimeout(() => {
+    toast.style.opacity = "0";
+    toast.style.transition = "opacity 0.5s ease";
+    setTimeout(() => toast.remove(), 500);
+  }, 6000);
+
+  if (typeof openAuthModal === "function") {
+    setTimeout(() => {
+      openAuthModal("register");
+    }, 1200);
   }
 }
