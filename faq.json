@@ -3,102 +3,102 @@
     {
       "intent": "group_buying_process",
       "question": "How can I join a group buying pool?",
-      "answer": "You can open the 'Active Pools' tab in our app and add the desired items to your cart. Once fellow shopkeepers participate and meet the target pool volume, the bulk order is placed at factory wholesale rates."
+      "answer": "Open 'Active Pools' and add items to your cart. Once the pool target is met, the bulk order is placed at wholesale rates."
     },
     {
       "intent": "minimum_order",
       "question": "What is the minimum order quantity for wholesale prices?",
-      "answer": "Since you pool your orders with other business retailers, there is zero minimum order quantity. You can purchase even 1 unit at bulk wholesale rate."
+      "answer": "No minimum. Pool with other retailers and buy even 1 unit at the wholesale rate."
     },
     {
       "intent": "delivery_time",
       "question": "How long does order delivery take?",
-      "answer": "As soon as the group pool target is locked, your inventory is dispatched and delivered directly to your shop doorstep within 24 to 48 business hours."
+      "answer": "Within 24 to 48 business hours after the pool locks."
     },
     {
       "intent": "order_cancellation",
       "question": "Can I cancel my pooled order?",
-      "answer": "You can cancel free of charge at any time before the pool locks. Once the pool is locked and confirmed with suppliers, cancellations are not permitted."
+      "answer": "Yes, free of charge before the pool locks. After that, cancellation is not allowed."
     },
     {
       "intent": "pricing",
       "question": "How do I verify I am getting genuine wholesale pricing?",
-      "answer": "Our app transparently displays both the prevailing open retail market price and our pooled bulk wholesale price, so you can calculate your exact store profit margin before ordering."
+      "answer": "The app shows both the retail market price and our pooled wholesale price, so you can check your margin before ordering."
     },
     {
       "intent": "delivery_areas",
       "question": "Which cities and areas do you currently serve?",
-      "answer": "We currently serve major commercial hubs across Pakistan. You can enter your shop postal code or commercial area in the app to check immediate delivery coverage."
+      "answer": "Major commercial hubs across Pakistan. Enter your postal code in the app to check coverage."
     },
     {
       "intent": "out_of_stock",
       "question": "What happens if a product goes out of stock in wholesale market?",
-      "answer": "You will receive an instant notification, and any advance payment made will be 100% credited back to your DigiBuzz wallet or bank account immediately."
+      "answer": "You are notified instantly and any advance payment is fully refunded to your wallet or bank."
     },
     {
       "intent": "digital_khata_usage",
       "question": "How do I track customer credit and payments in Digital Khata?",
-      "answer": "Navigate to the 'Digital Khata' tab in the app, click 'Add Customer', and easily log daily credit debit entries, receipts, and outstanding dues."
+      "answer": "Open 'Digital Khata', tap 'Add Customer', and log credit, payments and dues."
     },
     {
       "intent": "data_security",
       "question": "Is my business ledger and customer credit data secure?",
-      "answer": "Yes, absolutely. All your ledger and customer transactions are end-to-end encrypted and automatically backed up to secure cloud storage daily."
+      "answer": "Yes. Your data is encrypted and backed up daily to secure cloud storage."
     },
     {
       "intent": "credit_reminders",
       "question": "Can I send automated payment reminder bills to customers?",
-      "answer": "Yes, you can send automated, courteous payment reminder notices with ledger statements directly to customer WhatsApp and SMS numbers with one click."
+      "answer": "Yes. Send reminders with ledger statements via WhatsApp or SMS in one click."
     },
     {
       "intent": "retailer_credit",
       "question": "Do you offer credit or installment financing for shopkeepers?",
-      "answer": "Initially wholesale purchases are on cash terms. However, active retailers who regularly trade through our group buying network become eligible for credit limits and revolving financing."
+      "answer": "Purchases start on cash terms. Active group-buying retailers become eligible for credit limits."
     },
     {
       "intent": "payment_methods",
       "question": "What payment methods are accepted for bulk orders?",
-      "answer": "We accept Cash on Delivery (COD), Online Bank Transfers (IBFT), and mobile business wallets including EasyPaisa and JazzCash."
+      "answer": "Cash on Delivery, bank transfer (IBFT), EasyPaisa and JazzCash."
     },
     {
       "intent": "hidden_charges",
       "question": "Are there any hidden membership or service charges?",
-      "answer": "No, Digital Khata and DigiBuzz membership are 100% free forever. For group deliveries, only a transparent, nominal delivery fee is shown before final checkout."
+      "answer": "No. Membership and Digital Khata are free. Only a small delivery fee is shown before checkout."
     },
     {
       "intent": "damaged_items",
       "question": "What is the return policy for damaged or defective items?",
-      "answer": "If you receive any damaged or defective stock, simply submit photo proof via 'Help & Claims' in the app within 24 hours of delivery. We provide a full replacement or instant refund."
+      "answer": "Submit photo proof in 'Help & Claims' within 24 hours of delivery for a replacement or instant refund."
     },
     {
       "intent": "refund_policy",
       "question": "How quickly are refunds processed?",
-      "answer": "Approved refunds are credited to your DigiBuzz wallet instantly or transferred to your bank account within 2 to 3 business working days."
+      "answer": "Wallet refunds are instant. Bank refunds take 2 to 3 working days."
     },
     {
       "intent": "account_registration",
       "question": "How can I register my shop on the DigiBuzz B2B Network?",
-      "answer": "Download the DigiBuzz mobile app, enter your phone number, business shop name, and commercial address. Your merchant account activates immediately."
+      "answer": "Download the app and enter your phone number, shop name and address. Your account activates immediately."
     },
     {
       "intent": "offline_usage",
       "question": "Can I record ledger transactions offline without internet?",
-      "answer": "Yes, you can record entries offline. The moment your phone re-connects to the internet, all offline entries synchronize seamlessly to the cloud."
+      "answer": "Yes. Offline entries sync automatically when you reconnect."
     },
     {
       "intent": "app_issues",
       "question": "What should I do if the app is slow or facing technical errors?",
-      "answer": "Please ensure you have the latest app version installed or clear the app cache. You can also contact our technical helpline directly for instant support."
+      "answer": "Update the app or clear the cache. If it continues, contact our technical helpline."
     },
     {
       "intent": "business_hours",
       "question": "What are your operating hours for deliveries and customer support?",
-      "answer": "Customer support is active from 9:00 AM to 6:00 PM (Monday to Saturday). Warehouse deliveries operate from 10:00 AM to 8:00 PM daily."
+      "answer": "Support: 9 AM to 6 PM, Monday to Saturday. Deliveries: 10 AM to 8 PM daily."
     },
     {
       "intent": "human_handoff",
       "question": "Can I speak directly with a human representative or manager?",
-      "answer": "Certainly, I am transferring your call to our dedicated human customer support manager. Please stay on the line."
+      "answer": "Transferring you to our human support manager. Please stay on the line."
     }
   ]
 }

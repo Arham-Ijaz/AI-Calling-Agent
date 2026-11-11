@@ -44,8 +44,9 @@ venv.bak/
 Thumbs.db
 
 # Database runtime temporary lock files
-call_logs.db-wal
-call_logs.db-shm
+*.db
+*.db-wal
+*.db-shm
 *.db-journal
 
 # Audio / temporary cache

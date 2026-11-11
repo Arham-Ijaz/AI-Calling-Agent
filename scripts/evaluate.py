@@ -9,7 +9,6 @@ Generates comprehensive report in REPORT.md.
 import sys
 import os
 import json
-import sqlite3
 from datetime import datetime
 
 # Ensure project root is in sys.path
@@ -23,6 +22,7 @@ from app import (
     parse_quantity,
     get_business_hours,
     init_db,
+    mongo_db,
     db,
     now,
 )
@@ -148,12 +148,11 @@ def run_evaluation():
             if outcome == "Escalated" or (fast_res and fast_res.get("needs_handoff")):
                 escalation_correct += 1
 
-        # Check DB handoff creation
-        with db() as conn:
-            h_row = conn.execute("SELECT priority, status FROM handoff_requests WHERE session_id = ?", (session_id,)).fetchone()
-            if h_row:
-                handoff_created_count += 1
-                priority = h_row["priority"]
+        # Check DB handoff creation in MongoDB
+        h_row = mongo_db["handoff_requests"].find_one({"session_id": session_id})
+        if h_row:
+            handoff_created_count += 1
+            priority = h_row.get("priority")
 
         # Check compliance / hallucination guardrails
         if item.get("no_unauthorized_commitment") or item.get("category") == "Compliance":

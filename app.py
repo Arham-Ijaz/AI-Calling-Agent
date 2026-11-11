@@ -22,7 +22,7 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, date, timedelta, timezone
 import io
 import json
 import logging
@@ -30,8 +30,13 @@ import os
 import random
 import re
 import shutil
-import sqlite3
 import tempfile
+import time
+from typing import Any
+import uuid
+from bson import ObjectId
+import pymongo
+from pymongo import MongoClient, ReturnDocument
 from collections import OrderedDict
 from contextlib import contextmanager
 from functools import lru_cache
@@ -76,44 +81,19 @@ load_dotenv()
 BASE_DIR = Path(__file__).resolve().parent
 
 
-def resolve_db_path() -> Path:
-    """Determine a safe and writable path for SQLite database across local and serverless environments."""
-    if env_path := (os.getenv("DB_PATH") or os.getenv("DATABASE_PATH")):
-        p = Path(env_path)
-        p.parent.mkdir(parents=True, exist_ok=True)
-        return p
+# =====================================================================
+# MongoDB Atlas Database Configuration & Vercel Connection Caching
+# =====================================================================
+MONGODB_URI = os.getenv(
+    "MONGODB_URI",
+    "mongodb://sheikh66752_db_user:NEmB6MVobQzWfBL9@ac-zlwkrvq-shard-00-00.ksuapus.mongodb.net:27017,ac-zlwkrvq-shard-00-01.ksuapus.mongodb.net:27017,ac-zlwkrvq-shard-00-02.ksuapus.mongodb.net:27017/?ssl=true&replicaSet=atlas-tgmsyx-shard-0&authSource=admin",
+)
+MONGODB_DB_NAME = os.getenv("MONGODB_DB_NAME", "ai_calling_db")
 
-    # Running on Vercel, AWS Lambda, or Serverless read-only container
-    if os.getenv("VERCEL") or os.getenv("AWS_LAMBDA_FUNCTION_NAME"):
-        tmp_db = Path(tempfile.gettempdir()) / "call_logs.db"
-        tmp_db.parent.mkdir(parents=True, exist_ok=True)
-        default_local = BASE_DIR / "call_logs.db"
-        if default_local.exists() and (not tmp_db.exists() or tmp_db.stat().st_size == 0):
-            try:
-                shutil.copy2(default_local, tmp_db)
-            except Exception:
-                pass
-        return tmp_db
-
-    # Test if BASE_DIR is writable
-    try:
-        test_file = BASE_DIR / ".write_test"
-        test_file.touch()
-        test_file.unlink()
-        return BASE_DIR / "call_logs.db"
-    except (OSError, PermissionError):
-        tmp_db = Path(tempfile.gettempdir()) / "call_logs.db"
-        tmp_db.parent.mkdir(parents=True, exist_ok=True)
-        default_local = BASE_DIR / "call_logs.db"
-        if default_local.exists() and (not tmp_db.exists() or tmp_db.stat().st_size == 0):
-            try:
-                shutil.copy2(default_local, tmp_db)
-            except Exception:
-                pass
-        return tmp_db
-
-
-DB_PATH = resolve_db_path()
+# The MongoClient MUST be initialized globally (outside the FastAPI route functions)
+# so Vercel caches the connection pool across serverless invocations.
+mongo_client: MongoClient = MongoClient(MONGODB_URI)
+mongo_db = mongo_client[MONGODB_DB_NAME]
 FAQ_PATH = BASE_DIR / "faq.json"
 PRODUCTS_PATH = BASE_DIR / "products.json"
 INDEX_HTML = BASE_DIR / "index.html"
@@ -315,108 +295,147 @@ key_manager = ApiKeyManager()
 
 
 # =====================================================================
-# 4. Database Setup, Migrations and Seed Data
+# 4. Database Setup, PyMongo Operations and Seed Data
 # =====================================================================
 @contextmanager
 def db():
-    """Context manager for SQLite database connections."""
-    conn = sqlite3.connect(DB_PATH, timeout=20, check_same_thread=False)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys = ON")
+    """Context manager yielding global MongoDB database for backward compatibility."""
+    yield mongo_db
+
+
+def get_next_sequence_value(sequence_name: str) -> int:
+    """Atomic counter for auto-incrementing integer IDs in MongoDB."""
+    doc = mongo_db["counters"].find_one_and_update(
+        {"_id": sequence_name},
+        {"$inc": {"seq": 1}},
+        upsert=True,
+        return_document=ReturnDocument.AFTER,
+    )
+    return int(doc["seq"])
+
+
+def serialize_doc(doc: dict | None) -> dict | None:
+    """Recursively convert MongoDB native ObjectId and date objects to JSON-serializable types."""
+    if doc is None:
+        return None
+    out = {}
+    for k, v in doc.items():
+        if isinstance(v, ObjectId):
+            out[k] = str(v)
+        elif isinstance(v, (datetime, date)):
+            out[k] = v.isoformat()
+        elif isinstance(v, list):
+            out[k] = [
+                serialize_doc(i) if isinstance(i, dict) else (str(i) if isinstance(i, ObjectId) else i)
+                for i in v
+            ]
+        elif isinstance(v, dict):
+            out[k] = serialize_doc(v)
+        else:
+            out[k] = v
+    if "id" not in out and "_id" in out:
+        out["id"] = out["_id"]
+    return out
+
+
+def serialize_docs(docs) -> list[dict]:
+    """Serialize a list or cursor of MongoDB documents."""
+    return [serialize_doc(d) for d in docs if d is not None]
+
+
+def make_id_query(val: int | str, id_field: str = "id") -> dict:
+    """Query builder matching integer id, string id, or native ObjectId on _id."""
+    conditions = []
     try:
-        yield conn
-        conn.commit()
-    finally:
-        conn.close()
+        conditions.append({id_field: int(val)})
+    except (ValueError, TypeError):
+        pass
+    conditions.append({id_field: str(val)})
+    if isinstance(val, str) and ObjectId.is_valid(val):
+        conditions.append({"_id": ObjectId(val)})
+    if len(conditions) == 1:
+        return conditions[0]
+    return {"$or": conditions}
 
 
 def seed_products() -> None:
-    """Seed the products table from products.json if empty."""
-    with db() as conn:
-        count = conn.execute("SELECT COUNT(*) AS total FROM products").fetchone()["total"]
-        if count > 0:
-            return
-        if not PRODUCTS_PATH.exists():
-            return
-        try:
-            data = json.loads(PRODUCTS_PATH.read_text(encoding="utf-8"))
-            items = data.get("products", [])
-        except Exception as exc:
-            log.error("Failed to parse products.json: %r", exc)
-            return
-        product_tuples = [
-            (
-                p.get("name", "Unknown Item"),
-                p.get("category", "General"),
-                p.get("brand", "Generic"),
-                int(p.get("price", 0)),
-                p.get("stock_status", "in_stock"),
-                p.get("description", ""),
-                None,  # Platform default (no owner)
-            )
-            for p in items
-        ]
-        if product_tuples:
-            conn.executemany(
-                "INSERT INTO products (name, category, brand, price, stock_status, description, user_id) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                product_tuples,
-            )
-            log.info("Seeded %d platform products.", len(product_tuples))
+    """Seed the products collection from products.json if empty."""
+    if mongo_db["products"].count_documents({}) > 0:
+        return
+    if not PRODUCTS_PATH.exists():
+        return
+    try:
+        data = json.loads(PRODUCTS_PATH.read_text(encoding="utf-8"))
+        items = data.get("products", [])
+    except Exception as exc:
+        log.error("Failed to parse products.json: %r", exc)
+        return
+    for p in items:
+        pid = get_next_sequence_value("products")
+        mongo_db["products"].insert_one({
+            "id": pid,
+            "name": p.get("name", "Unknown Item"),
+            "category": p.get("category", "General"),
+            "brand": p.get("brand", "Generic"),
+            "price": int(p.get("price", 0)),
+            "stock_status": p.get("stock_status", "in_stock"),
+            "description": p.get("description", ""),
+            "item_type": "product",
+            "user_id": None,
+        })
+    log.info("Seeded %d platform products into MongoDB.", len(items))
 
 
 def seed_faqs() -> None:
-    """Seed the faqs table from faq.json if empty."""
-    with db() as conn:
-        count = conn.execute("SELECT COUNT(*) AS total FROM faqs").fetchone()["total"]
-        if count > 0:
-            return
-        if not FAQ_PATH.exists():
-            return
-        try:
-            data = json.loads(FAQ_PATH.read_text(encoding="utf-8"))
-            items = data.get("faqs", [])
-        except Exception as exc:
-            log.error("Failed to parse faq.json: %r", exc)
-            return
-        faq_tuples = [
-            (
-                f.get("intent", "general"),
-                f.get("question", ""),
-                f.get("answer", ""),
-                None,  # Platform default (no owner)
-            )
-            for f in items
-            if f.get("question") and f.get("answer")
-        ]
-        if faq_tuples:
-            conn.executemany(
-                "INSERT INTO faqs (intent, question, answer, user_id) VALUES (?, ?, ?, ?)",
-                faq_tuples,
-            )
-            log.info("Seeded %d platform FAQs.", len(faq_tuples))
+    """Seed the faqs collection from faq.json if empty."""
+    if mongo_db["faqs"].count_documents({}) > 0:
+        return
+    if not FAQ_PATH.exists():
+        return
+    try:
+        data = json.loads(FAQ_PATH.read_text(encoding="utf-8"))
+        items = data.get("faqs", [])
+    except Exception as exc:
+        log.error("Failed to parse faq.json: %r", exc)
+        return
+    seeded = 0
+    for f in items:
+        if f.get("question") and f.get("answer"):
+            fid = get_next_sequence_value("faqs")
+            mongo_db["faqs"].insert_one({
+                "id": fid,
+                "intent": f.get("intent", "general"),
+                "question": f.get("question", ""),
+                "answer": f.get("answer", ""),
+                "user_id": None,
+            })
+            seeded += 1
+    log.info("Seeded %d platform FAQs into MongoDB.", seeded)
 
 
 PRIMARY_ADMIN_EMAIL = os.getenv("DEFAULT_ADMIN_EMAIL", "admin@digibuzz.com").strip().lower()
 
 
-def is_primary_admin(user_id: int | None = None, email: str | None = None) -> bool:
+def is_primary_admin(user_id: int | str | None = None, email: str | None = None) -> bool:
     """Check if the given user_id or email corresponds to the Primary Super Admin."""
-    if user_id == 1:
+    if user_id in (1, "1"):
         return True
     if email and email.strip().lower() == PRIMARY_ADMIN_EMAIL:
         return True
     try:
-        with db() as conn:
-            # The earliest created admin account is the primary platform super admin
-            row = conn.execute(
-                "SELECT id, email FROM users WHERE LOWER(email) = ? OR role = 'admin' ORDER BY id ASC LIMIT 1",
-                (PRIMARY_ADMIN_EMAIL,),
-            ).fetchone()
-            if row:
-                if user_id is not None and row["id"] == user_id:
-                    return True
-                if email and row["email"].strip().lower() == email.strip().lower():
-                    return True
+        row = mongo_db["users"].find_one(
+            {"$or": [{"email": PRIMARY_ADMIN_EMAIL}, {"role": "admin"}]},
+            sort=[("id", 1)],
+        )
+        if row:
+            if user_id is not None and (
+                row.get("id") == user_id
+                or str(row.get("id")) == str(user_id)
+                or str(row.get("_id")) == str(user_id)
+            ):
+                return True
+            if email and row.get("email", "").strip().lower() == email.strip().lower():
+                return True
     except Exception:
         pass
     return False
@@ -424,18 +443,25 @@ def is_primary_admin(user_id: int | None = None, email: str | None = None) -> bo
 
 def seed_default_admin() -> None:
     """Ensure at least one admin account exists."""
-    with db() as conn:
-        admin = conn.execute("SELECT id FROM users WHERE role = 'admin' LIMIT 1").fetchone()
-        if not admin:
-            admin_email = PRIMARY_ADMIN_EMAIL
-            admin_phone = os.getenv("DEFAULT_ADMIN_PHONE", "+923001234567").strip()
-            admin_pass = os.getenv("DEFAULT_ADMIN_PASSWORD", "Admin@12345")
-            hashed = hash_password(admin_pass)
-            conn.execute(
-                "INSERT INTO users (email, phone, full_name, password_hash, role, is_active, created_at) VALUES (?, ?, ?, ?, 'admin', 1, ?)",
-                (admin_email, admin_phone, "Platform Administrator", hashed, now()),
-            )
-            log.info("Default Admin account created: %s (Password: %s)", admin_email, admin_pass)
+    admin = mongo_db["users"].find_one({"role": "admin"})
+    if not admin:
+        admin_email = PRIMARY_ADMIN_EMAIL
+        admin_phone = os.getenv("DEFAULT_ADMIN_PHONE", "+923001234567").strip()
+        admin_pass = os.getenv("DEFAULT_ADMIN_PASSWORD", "Admin@12345")
+        hashed = hash_password(admin_pass)
+        uid = get_next_sequence_value("users")
+        mongo_db["users"].insert_one({
+            "id": uid,
+            "email": admin_email,
+            "phone": admin_phone,
+            "full_name": "Platform Administrator",
+            "password_hash": hashed,
+            "role": "admin",
+            "is_active": 1,
+            "created_at": now(),
+            "last_login": None,
+        })
+        log.info("Default Admin account created in MongoDB: %s (Password: %s)", admin_email, admin_pass)
 
 
 def seed_business_settings() -> None:
@@ -454,261 +480,76 @@ def seed_business_settings() -> None:
         "support_email": "support@example.com",
         "office_address": "Main Boulevard, Gulberg III, Lahore, Pakistan",
     }
-    with db() as conn:
-        for k, v in defaults.items():
-            conn.execute(
-                "INSERT OR IGNORE INTO business_settings (key, value) VALUES (?, ?)",
-                (k, v),
-            )
+    for k, v in defaults.items():
+        mongo_db["business_settings"].update_one(
+            {"key": k},
+            {"$setOnInsert": {"key": k, "value": v}},
+            upsert=True,
+        )
 
 
 def seed_sample_orders() -> None:
     """Seed sample orders for testing status flows and admin confirmation."""
-    with db() as conn:
-        count = conn.execute("SELECT COUNT(*) AS total FROM orders").fetchone()["total"]
-        if count > 0:
-            return
-        sample_orders = [
-            ("ORD-1001", None, "Ali Ahmed", "+923001112233", "pending_admin_confirmation", "General Medical Consultation", 2500, 1, "2026-11-10 10:00", 2500, now(), now(), 0),
-            ("ORD-1002", None, "Fatima Khan", "+923015556677", "confirmed", "Logitech MK270 Combo", 6500, 2, None, 13000, now(), now(), 0),
-            ("ORD-1003", None, "Bilal Tariq", "+923214448899", "cancel_requested", "Samsung Galaxy A54", 89500, 1, None, 89500, now(), now(), 0),
-        ]
-        conn.executemany(
-            """
-            INSERT INTO orders (
-                order_number, user_id, customer_name, customer_phone,
-                status, item_name_snapshot, unit_price_snapshot, quantity,
-                preferred_datetime, total_pkr, created_at, updated_at, is_locked
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            sample_orders,
-        )
-        # Seed initial order events for sample orders
-        for row in conn.execute("SELECT id, status FROM orders").fetchall():
-            conn.execute(
-                """
-                INSERT INTO order_events (order_id, actor_user_id, actor_role, event_type, old_status, new_status, note, created_at)
-                VALUES (?, NULL, 'system', 'order_created', NULL, ?, 'Initial seeded order', ?)
-                """,
-                (row["id"], row["status"], now()),
-            )
-        log.info("Seeded %d sample orders with audit events.", len(sample_orders))
+    if mongo_db["orders"].count_documents({}) > 0:
+        return
+    sample_orders = [
+        {"order_number": "ORD-1001", "user_id": None, "customer_name": "Ali Ahmed", "customer_phone": "+923001112233", "status": "pending_admin_confirmation", "item_name_snapshot": "General Medical Consultation", "unit_price_snapshot": 2500, "quantity": 1, "preferred_datetime": "2026-11-10 10:00", "total_pkr": 2500, "created_at": now(), "updated_at": now(), "is_locked": 0},
+        {"order_number": "ORD-1002", "user_id": None, "customer_name": "Fatima Khan", "customer_phone": "+923015556677", "status": "confirmed", "item_name_snapshot": "Logitech MK270 Combo", "unit_price_snapshot": 6500, "quantity": 2, "preferred_datetime": None, "total_pkr": 13000, "created_at": now(), "updated_at": now(), "is_locked": 0},
+        {"order_number": "ORD-1003", "user_id": None, "customer_name": "Bilal Tariq", "customer_phone": "+923214448899", "status": "cancel_requested", "item_name_snapshot": "Samsung Galaxy A54", "unit_price_snapshot": 89500, "quantity": 1, "preferred_datetime": None, "total_pkr": 89500, "created_at": now(), "updated_at": now(), "is_locked": 0},
+    ]
+    for o in sample_orders:
+        oid = get_next_sequence_value("orders")
+        o["id"] = oid
+        mongo_db["orders"].insert_one(o)
+        eid = get_next_sequence_value("order_events")
+        mongo_db["order_events"].insert_one({
+            "id": eid,
+            "order_id": oid,
+            "actor_user_id": None,
+            "actor_role": "system",
+            "event_type": "order_created",
+            "old_status": None,
+            "new_status": o["status"],
+            "note": "Initial seeded order",
+            "created_at": now(),
+        })
+    log.info("Seeded %d sample orders with audit events.", len(sample_orders))
 
 
 def init_db() -> None:
-    """Initialize all database tables, columns, indexes and seed default admin."""
+    """Initialize MongoDB Atlas collections, indexes, sequence counters, and seed initial data."""
     try:
-        with db() as conn:
-            try:
-                conn.execute("PRAGMA journal_mode=WAL")
-            except sqlite3.OperationalError:
-                try:
-                    conn.execute("PRAGMA journal_mode=DELETE")
-                except sqlite3.OperationalError:
-                    pass
+        mongo_db["users"].create_index("email", unique=True)
+        mongo_db["users"].create_index("phone")
+        mongo_db["users"].create_index("id")
+        mongo_db["calls"].create_index("session_id", unique=True)
+        mongo_db["calls"].create_index("user_id")
+        mongo_db["calls"].create_index("id")
+        mongo_db["call_messages"].create_index("call_id")
+        mongo_db["call_messages"].create_index("id")
+        mongo_db["products"].create_index("user_id")
+        mongo_db["products"].create_index("id")
+        mongo_db["faqs"].create_index("user_id")
+        mongo_db["faqs"].create_index("id")
+        mongo_db["business_settings"].create_index("key", unique=True)
+        mongo_db["handoff_requests"].create_index("session_id")
+        mongo_db["handoff_requests"].create_index("status")
+        mongo_db["handoff_requests"].create_index("priority")
+        mongo_db["handoff_requests"].create_index("id")
+        mongo_db["orders"].create_index("order_number", unique=True)
+        mongo_db["orders"].create_index("user_id")
+        mongo_db["orders"].create_index("status")
+        mongo_db["orders"].create_index("id")
+        mongo_db["order_events"].create_index("order_id")
+        mongo_db["order_events"].create_index("id")
 
-            conn.executescript(
-                """
-                -- Users table (OWASP A01 / A07 Multi-tenant RBAC)
-                CREATE TABLE IF NOT EXISTS users (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    email TEXT UNIQUE NOT NULL,
-                    phone TEXT UNIQUE NOT NULL,
-                    full_name TEXT NOT NULL,
-                    password_hash TEXT NOT NULL,
-                    role TEXT NOT NULL DEFAULT 'user',
-                    is_active INTEGER NOT NULL DEFAULT 1,
-                    created_at TEXT NOT NULL,
-                    last_login TEXT
-                );
-
-                CREATE TABLE IF NOT EXISTS calls (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    session_id TEXT UNIQUE NOT NULL,
-                    started_at TEXT NOT NULL,
-                    last_activity TEXT,
-                    ended_at TEXT,
-                    status TEXT NOT NULL DEFAULT 'active',
-                    outcome TEXT NOT NULL DEFAULT 'Resolved',
-                    total_messages INTEGER NOT NULL DEFAULT 0,
-                    user_id INTEGER REFERENCES users(id)
-                );
-
-                CREATE TABLE IF NOT EXISTS call_messages (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    call_id INTEGER NOT NULL REFERENCES calls(id) ON DELETE CASCADE,
-                    timestamp TEXT NOT NULL,
-                    user_transcript TEXT,
-                    ai_response TEXT,
-                    detected_intent TEXT,
-                    outcome TEXT
-                );
-
-                CREATE TABLE IF NOT EXISTS products (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    name TEXT NOT NULL,
-                    category TEXT NOT NULL,
-                    brand TEXT NOT NULL,
-                    price INTEGER NOT NULL,
-                    stock_status TEXT NOT NULL,
-                    description TEXT NOT NULL,
-                    user_id INTEGER REFERENCES users(id)
-                );
-
-                CREATE TABLE IF NOT EXISTS faqs (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    intent TEXT NOT NULL,
-                    question TEXT NOT NULL,
-                    answer TEXT NOT NULL,
-                    user_id INTEGER REFERENCES users(id)
-                );
-
-                CREATE TABLE IF NOT EXISTS business_settings (
-                    key TEXT PRIMARY KEY,
-                    value TEXT NOT NULL
-                );
-
-                CREATE TABLE IF NOT EXISTS handoff_requests (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    call_id INTEGER REFERENCES calls(id),
-                    session_id TEXT NOT NULL,
-                    user_id INTEGER REFERENCES users(id),
-                    contact_name TEXT,
-                    contact_phone TEXT,
-                    trigger_type TEXT NOT NULL,
-                    reason TEXT,
-                    priority TEXT NOT NULL DEFAULT 'normal',
-                    language TEXT NOT NULL DEFAULT 'en',
-                    last_user_message TEXT,
-                    summary TEXT,
-                    status TEXT NOT NULL DEFAULT 'open',
-                    assigned_to INTEGER REFERENCES users(id),
-                    staff_note TEXT,
-                    created_at TEXT NOT NULL,
-                    assigned_at TEXT,
-                    resolved_at TEXT,
-                    resolved_by INTEGER REFERENCES users(id)
-                );
-
-                CREATE TABLE IF NOT EXISTS orders (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    order_number TEXT UNIQUE NOT NULL,
-                    user_id INTEGER REFERENCES users(id),
-                    call_session_id TEXT,
-                    item_id INTEGER REFERENCES products(id),
-                    item_name_snapshot TEXT NOT NULL DEFAULT 'Item',
-                    unit_price_snapshot INTEGER NOT NULL DEFAULT 0,
-                    quantity INTEGER NOT NULL DEFAULT 1,
-                    preferred_datetime TEXT,
-                    status TEXT NOT NULL DEFAULT 'pending_admin_confirmation',
-                    cancel_requested_at TEXT,
-                    cancel_reason TEXT,
-                    decided_by INTEGER REFERENCES users(id),
-                    decided_at TEXT,
-                    admin_note TEXT,
-                    created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL DEFAULT '',
-                    is_locked INTEGER DEFAULT 0
-                );
-
-                CREATE TABLE IF NOT EXISTS order_events (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    order_id INTEGER NOT NULL REFERENCES orders(id),
-                    actor_user_id INTEGER REFERENCES users(id),
-                    actor_role TEXT NOT NULL,
-                    event_type TEXT NOT NULL,
-                    old_status TEXT,
-                    new_status TEXT NOT NULL,
-                    note TEXT,
-                    created_at TEXT NOT NULL
-                );
-
-                CREATE INDEX IF NOT EXISTS idx_users_email ON users(email);
-                CREATE INDEX IF NOT EXISTS idx_users_phone ON users(phone);
-                CREATE INDEX IF NOT EXISTS idx_calls_session ON calls(session_id);
-                CREATE INDEX IF NOT EXISTS idx_msgs_call ON call_messages(call_id, id);
-                CREATE INDEX IF NOT EXISTS idx_orders_num ON orders(order_number);
-                CREATE INDEX IF NOT EXISTS idx_orders_user ON orders(user_id);
-                CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status);
-                CREATE INDEX IF NOT EXISTS idx_order_events_order ON order_events(order_id);
-                CREATE INDEX IF NOT EXISTS idx_handoff_session ON handoff_requests(session_id);
-                CREATE INDEX IF NOT EXISTS idx_handoff_status ON handoff_requests(status);
-                CREATE INDEX IF NOT EXISTS idx_handoff_priority ON handoff_requests(priority);
-                """
-            )
-
-            # Column migrations if database was created by previous version
-            for tbl in ("calls", "products", "faqs"):
-                try:
-                    conn.execute(f"ALTER TABLE {tbl} ADD COLUMN user_id INTEGER REFERENCES users(id)")
-                except sqlite3.OperationalError:
-                    pass
-
-            # Products item_type migration ('product' | 'service')
-            try:
-                conn.execute("ALTER TABLE products ADD COLUMN item_type TEXT DEFAULT 'product'")
-            except sqlite3.OperationalError:
-                pass
-
-            # Calls table migrations (summary, follow_up_status, detected_intent)
-            for col, col_def in (
-                ("summary", "TEXT"),
-                ("follow_up_status", "TEXT DEFAULT 'none'"),
-                ("detected_intent", "TEXT"),
-            ):
-                try:
-                    conn.execute(f"ALTER TABLE calls ADD COLUMN {col} {col_def}")
-                except sqlite3.OperationalError:
-                    pass
-
-            # Orders table migrations (support generic items, snapshots, datetime, lock)
-            for col, col_def in (
-                ("call_session_id", "TEXT"),
-                ("item_id", "INTEGER"),
-                ("item_name_snapshot", "TEXT DEFAULT 'Item'"),
-                ("unit_price_snapshot", "INTEGER DEFAULT 0"),
-                ("quantity", "INTEGER DEFAULT 1"),
-                ("preferred_datetime", "TEXT"),
-                ("cancel_requested_at", "TEXT"),
-                ("cancel_reason", "TEXT"),
-                ("decided_by", "INTEGER"),
-                ("decided_at", "TEXT"),
-                ("admin_note", "TEXT"),
-                ("updated_at", "TEXT DEFAULT ''"),
-                ("is_locked", "INTEGER DEFAULT 0"),
-            ):
-                try:
-                    conn.execute(f"ALTER TABLE orders ADD COLUMN {col} {col_def}")
-                except sqlite3.OperationalError:
-                    pass
-
-            # Handoff requests migrations (call_id, contact, priority, language, etc.)
-            for col, col_def in (
-                ("call_id", "INTEGER REFERENCES calls(id)"),
-                ("contact_name", "TEXT"),
-                ("contact_phone", "TEXT"),
-                ("priority", "TEXT DEFAULT 'normal'"),
-                ("language", "TEXT DEFAULT 'en'"),
-                ("last_user_message", "TEXT"),
-                ("summary", "TEXT"),
-                ("assigned_to", "TEXT"),
-                ("staff_note", "TEXT"),
-                ("assigned_at", "TEXT"),
-                ("resolved_at", "TEXT"),
-                ("resolved_by", "TEXT"),
-            ):
-                try:
-                    conn.execute(f"ALTER TABLE handoff_requests ADD COLUMN {col} {col_def}")
-                except sqlite3.OperationalError:
-                    pass
-
-            # Create tenant indexes after column migrations
-            conn.executescript(
-                """
-                CREATE INDEX IF NOT EXISTS idx_calls_user ON calls(user_id);
-                CREATE INDEX IF NOT EXISTS idx_products_user ON products(user_id);
-                CREATE INDEX IF NOT EXISTS idx_faqs_user ON faqs(user_id);
-                """
+        for coll_name in ["users", "calls", "call_messages", "products", "faqs", "handoff_requests", "orders", "order_events"]:
+            max_doc = mongo_db[coll_name].find_one(sort=[("id", -1)])
+            max_id = int(max_doc["id"]) if max_doc and "id" in max_doc and max_doc["id"] is not None else 0
+            mongo_db["counters"].update_one(
+                {"_id": coll_name},
+                {"$max": {"seq": max_id}},
+                upsert=True,
             )
 
         seed_products()
@@ -717,97 +558,81 @@ def init_db() -> None:
         seed_business_settings()
         seed_sample_orders()
 
-        # Automatically defragment & re-sequence product and FAQ IDs on startup
-        with db() as conn:
-            conn.execute(
-                """
-                UPDATE orders
-                SET status = 'pending_admin_confirmation'
-                WHERE status NOT IN ('pending_admin_confirmation', 'confirmed', 'completed', 'cancel_requested', 'cancelled', 'rejected')
-                """
-            )
-            resequence_table(conn, "products")
-            resequence_table(conn, "faqs")
+        valid_statuses = ['pending_admin_confirmation', 'confirmed', 'completed', 'cancel_requested', 'cancelled', 'rejected']
+        mongo_db["orders"].update_many(
+            {"status": {"$nin": valid_statuses}},
+            {"$set": {"status": "pending_admin_confirmation"}},
+        )
     except Exception as exc:
-        log.error("Notice during database initialization: %r", exc)
+        log.error("Notice during MongoDB initialization: %r", exc)
 
 
-def resequence_table(conn: sqlite3.Connection, table_name: str) -> None:
-    """
-    Resequence primary keys in a table consecutively (1, 2, 3...)
-    and synchronize sqlite_sequence so that new insertions always receive
-    the exact next sequential ID (e.g. 21 -> 22, and if 22 is deleted,
-    the next item is 22, never skipping numbers).
-    """
-    rows = conn.execute(f"SELECT id FROM {table_name} ORDER BY id ASC").fetchall()
-    if not rows:
-        conn.execute("DELETE FROM sqlite_sequence WHERE name = ?", (table_name,))
-        conn.execute("INSERT INTO sqlite_sequence (name, seq) VALUES (?, 0)", (table_name,))
-        return
-    # Two-phase ID assignment to prevent SQLite UNIQUE constraint collisions
-    for i, row in enumerate(rows, start=1):
-        conn.execute(f"UPDATE {table_name} SET id = ? WHERE id = ?", (-i, row["id"]))
-    for i in range(1, len(rows) + 1):
-        conn.execute(f"UPDATE {table_name} SET id = ? WHERE id = ?", (i, -i))
-    max_id = len(rows)
-    conn.execute("DELETE FROM sqlite_sequence WHERE name = ?", (table_name,))
-    conn.execute("INSERT INTO sqlite_sequence (name, seq) VALUES (?, ?)", (table_name, max_id))
-
-
-def get_or_create_call(conn: sqlite3.Connection, session_id: str, user_id: int | None = None) -> int:
-    """Get or create a call session row and return its primary key."""
-    row = conn.execute("SELECT id, user_id FROM calls WHERE session_id = ?", (session_id,)).fetchone()
+def get_or_create_call(session_id: str, user_id: int | None = None) -> int:
+    """Get or create a call session document and return its integer primary key."""
+    row = mongo_db["calls"].find_one({"session_id": session_id})
     if row:
-        if user_id is not None and row["user_id"] is None:
-            conn.execute("UPDATE calls SET user_id = ? WHERE id = ?", (user_id, row["id"]))
-        return row["id"]
-    cursor = conn.execute(
-        "INSERT INTO calls (session_id, started_at, last_activity, user_id) VALUES (?, ?, ?, ?)",
-        (session_id, now(), now(), user_id),
-    )
-    return cursor.lastrowid
+        if user_id is not None and row.get("user_id") is None:
+            mongo_db["calls"].update_one({"session_id": session_id}, {"$set": {"user_id": user_id}})
+        return int(row["id"])
+    new_id = get_next_sequence_value("calls")
+    mongo_db["calls"].insert_one({
+        "id": new_id,
+        "session_id": session_id,
+        "started_at": now(),
+        "last_activity": now(),
+        "status": "active",
+        "outcome": "Resolved",
+        "total_messages": 0,
+        "user_id": user_id,
+        "summary": None,
+        "follow_up_status": "none",
+        "detected_intent": None,
+    })
+    return new_id
 
 
 def save_message(session_id: str, user_text: str, result: dict, user_id: int | None = None) -> None:
-    """Persist conversation turn to the database, update call summary and follow-up status."""
+    """Persist conversation turn to MongoDB, update call summary and follow-up status."""
     try:
-        with db() as conn:
-            call_id = get_or_create_call(conn, session_id, user_id)
-            intent = result.get("intent", "unknown")
-            outcome = result.get("outcome", "Resolved")
-            needs_handoff = result.get("needs_handoff", False) or outcome in ("Escalated", "Transferred")
+        call_id = get_or_create_call(session_id, user_id)
+        intent = result.get("intent", "unknown")
+        outcome = result.get("outcome", "Resolved")
+        needs_handoff = result.get("needs_handoff", False) or outcome in ("Escalated", "Transferred")
 
-            conn.execute(
-                "INSERT INTO call_messages (call_id, timestamp, user_transcript, ai_response, detected_intent, outcome) VALUES (?, ?, ?, ?, ?, ?)",
-                (
-                    call_id,
-                    now(),
-                    user_text,
-                    result.get("reply", ""),
-                    intent,
-                    outcome,
-                ),
-            )
+        msg_id = get_next_sequence_value("call_messages")
+        mongo_db["call_messages"].insert_one({
+            "id": msg_id,
+            "call_id": call_id,
+            "timestamp": now(),
+            "user_transcript": user_text,
+            "ai_response": result.get("reply", ""),
+            "detected_intent": intent,
+            "outcome": outcome,
+        })
 
-            # Auto-generate a clean, non-sensitive summary
-            clean_user = user_text[:80].replace("'", "").replace('"', '').strip()
-            summary = f"Caller inquiry ({intent}): {clean_user}" if clean_user else f"Inquiry about {intent}"
+        clean_user = user_text[:80].replace("'", "").replace('"', '').strip()
+        summary = f"Caller inquiry ({intent}): {clean_user}" if clean_user else f"Inquiry about {intent}"
 
-            follow_up = "needs_human" if needs_handoff else "none"
+        call_doc = mongo_db["calls"].find_one({"id": call_id})
+        current_follow_up = call_doc.get("follow_up_status") if call_doc else "none"
+        if needs_handoff and current_follow_up not in ('needs_human', 'pending_staff'):
+            new_follow_up = "needs_human"
+        else:
+            new_follow_up = current_follow_up or "none"
 
-            conn.execute(
-                """
-                UPDATE calls
-                SET last_activity = ?,
-                    total_messages = total_messages + 1,
-                    outcome = ?,
-                    detected_intent = COALESCE(NULLIF(detected_intent, 'general_inquiry'), ?),
-                    summary = ?,
-                    follow_up_status = CASE WHEN follow_up_status IN ('needs_human', 'pending_staff') THEN follow_up_status ELSE ? END
-                WHERE id = ?
-                """,
-                (now(), outcome, intent, summary, follow_up, call_id),
-            )
+        update_fields = {
+            "last_activity": now(),
+            "outcome": outcome,
+            "summary": summary,
+            "follow_up_status": new_follow_up,
+        }
+        if not call_doc or not call_doc.get("detected_intent") or call_doc.get("detected_intent") == "general_inquiry":
+            update_fields["detected_intent"] = intent
+
+        mongo_db["calls"].update_one(
+            {"id": call_id},
+            {"$set": update_fields, "$inc": {"total_messages": 1}},
+        )
     except Exception as exc:
         log.error("Failed to persist call message for session %s: %r", session_id, exc)
 
@@ -821,68 +646,32 @@ def now() -> str:
 # 5. Knowledge Base Loaders & Dynamic System Instructions
 # =====================================================================
 def load_faqs_context(user_id: int | None = None) -> str:
-    """Load platform FAQs + admin-created FAQs + custom user FAQs from database."""
-    with db() as conn:
-        if user_id:
-            rows = conn.execute(
-                """
-                SELECT question, answer FROM faqs
-                WHERE user_id IS NULL
-                   OR user_id IN (SELECT id FROM users WHERE role = 'admin')
-                   OR user_id = ?
-                ORDER BY id ASC
-                """,
-                (user_id,),
-            ).fetchall()
-        else:
-            rows = conn.execute(
-                """
-                SELECT question, answer FROM faqs
-                WHERE user_id IS NULL
-                   OR user_id IN (SELECT id FROM users WHERE role = 'admin')
-                ORDER BY id ASC
-                """
-            ).fetchall()
+    """Load platform FAQs + admin-created FAQs + custom user FAQs from MongoDB."""
+    admin_ids = [u["id"] for u in mongo_db["users"].find({"role": "admin"}, {"id": 1})]
+    if user_id:
+        filter_q = {"$or": [{"user_id": None}, {"user_id": {"$in": admin_ids}}, {"user_id": user_id}]}
+    else:
+        filter_q = {"$or": [{"user_id": None}, {"user_id": {"$in": admin_ids}}]}
+    rows = list(mongo_db["faqs"].find(filter_q).sort("id", 1))
     if not rows:
         return "(No FAQs available)"
-    return "\n\n".join(f"Q: {r['question']}\nA: {r['answer']}" for r in rows)
+    return "\n\n".join(f"Q: {r.get('question', '')}\nA: {r.get('answer', '')}" for r in rows)
 
 
 def load_products_context(user_id: int | None = None) -> str:
-    """Load platform products & services from database with item_type."""
-    with db() as conn:
-        if user_id:
-            rows = conn.execute(
-                """
-                SELECT id, name, category, brand, price, stock_status, description,
-                       COALESCE(item_type, 'product') AS item_type FROM products
-                WHERE user_id IS NULL
-                   OR user_id IN (SELECT id FROM users WHERE role = 'admin')
-                   OR user_id = ?
-                ORDER BY category ASC, id ASC
-                """,
-                (user_id,),
-            ).fetchall()
-        else:
-            rows = conn.execute(
-                """
-                SELECT id, name, category, brand, price, stock_status, description,
-                       COALESCE(item_type, 'product') AS item_type FROM products
-                WHERE user_id IS NULL
-                   OR user_id IN (SELECT id FROM users WHERE role = 'admin')
-                ORDER BY category ASC, id ASC
-                """
-            ).fetchall()
+    """Load platform and user products from MongoDB formatted for Gemini system prompt."""
+    admin_ids = [u["id"] for u in mongo_db["users"].find({"role": "admin"}, {"id": 1})]
+    if user_id:
+        filter_q = {"$or": [{"user_id": None}, {"user_id": {"$in": admin_ids}}, {"user_id": user_id}]}
+    else:
+        filter_q = {"$or": [{"user_id": None}, {"user_id": {"$in": admin_ids}}]}
+    rows = list(mongo_db["products"].find(filter_q).sort("id", 1))
     if not rows:
-        return "(No catalog items available)"
-    lines = [
-        f"- [{r['item_type'].upper()}] [{r['category']}] {r['name']} by {r['brand']} | "
-        f"Price: PKR {r['price']:,} | Availability: {r['stock_status']} | "
-        f"Details: {r['description']}"
+        return "(No products currently listed in catalog)"
+    return "\n".join(
+        f"- {r.get('name', '')} ({r.get('category', '')}, {r.get('brand', '')}): PKR {r.get('price', 0):,} - {r.get('stock_status', '')} - {r.get('description', '')}"
         for r in rows
-    ]
-    return "\n".join(lines)
-
+    )
 
 
 # =====================================================================
@@ -892,12 +681,11 @@ BUSINESS_SETTINGS_CACHE: dict[str, str] = {}
 
 
 def refresh_business_settings_cache() -> dict[str, str]:
-    """Load business settings from SQLite into memory cache."""
+    """Load business settings from MongoDB into memory cache."""
     global BUSINESS_SETTINGS_CACHE
     try:
-        with db() as conn:
-            rows = conn.execute("SELECT key, value FROM business_settings").fetchall()
-            BUSINESS_SETTINGS_CACHE = {r["key"]: r["value"] for r in rows}
+        rows = list(mongo_db["business_settings"].find({}, {"key": 1, "value": 1}))
+        BUSINESS_SETTINGS_CACHE = {r["key"]: str(r.get("value", "")) for r in rows}
     except Exception as exc:
         log.warning("Failed to refresh business settings cache: %r", exc)
     return BUSINESS_SETTINGS_CACHE
@@ -930,30 +718,31 @@ ORDER_TRANSITIONS = {
 
 
 def validate_and_apply_order_transition(
-    conn,
-    order_id: int,
-    target_status: str,
-    actor_user_id: int | None,
-    actor_role: str,
+    conn=None,
+    order_id: int | str = 0,
+    target_status: str = "",
+    actor_user_id: int | None = None,
+    actor_role: str = "user",
     note: str | None = None,
     event_type: str = "status_change",
+    **kwargs,
 ) -> dict:
     """
     Validate status transition rules for orders, enforce immutability on locked statuses,
     and append an immutable audit record in order_events.
     Raises HTTPException 404, 409 if invalid.
     """
-    order = conn.execute("SELECT * FROM orders WHERE id = ?", (order_id,)).fetchone()
+    order = mongo_db["orders"].find_one(make_id_query(order_id))
     if not order:
         raise HTTPException(status_code=404, detail="Order not found.")
 
-    current_status = order["status"]
-    is_locked = bool(order["is_locked"]) or (current_status in LOCKED_ORDER_STATUSES)
+    current_status = order.get("status", "")
+    is_locked = bool(order.get("is_locked")) or (current_status in LOCKED_ORDER_STATUSES)
 
     if is_locked:
         raise HTTPException(
             status_code=409,
-            detail=f"Order #{order['order_number']} is in terminal locked status '{current_status}' and cannot be altered.",
+            detail=f"Order #{order.get('order_number')} is in terminal locked status '{current_status}' and cannot be altered.",
         )
 
     allowed_targets = ORDER_TRANSITIONS.get(current_status, set())
@@ -972,144 +761,160 @@ def validate_and_apply_order_transition(
     new_is_locked = 1 if target_status in LOCKED_ORDER_STATUSES else 0
     now_str = now()
 
-    extra_updates = []
-    extra_params = []
+    update_fields = {
+        "status": target_status,
+        "is_locked": new_is_locked,
+        "updated_at": now_str,
+    }
 
     if target_status in ("confirmed", "rejected", "completed"):
-        extra_updates.extend(["decided_by = ?", "decided_at = ?", "admin_note = ?"])
-        extra_params.extend([actor_user_id, now_str, note or order["admin_note"]])
+        update_fields["decided_by"] = actor_user_id
+        update_fields["decided_at"] = now_str
+        update_fields["admin_note"] = note or order.get("admin_note")
     elif target_status == "cancel_requested":
-        extra_updates.extend(["cancel_requested_at = ?", "cancel_reason = ?"])
-        extra_params.extend([now_str, note or order["cancel_reason"]])
+        update_fields["cancel_requested_at"] = now_str
+        update_fields["cancel_reason"] = note or order.get("cancel_reason")
     elif target_status == "cancelled":
-        extra_updates.extend(["decided_by = ?", "decided_at = ?", "admin_note = ?"])
-        extra_params.extend([actor_user_id, now_str, note or order["admin_note"]])
+        update_fields["decided_by"] = actor_user_id
+        update_fields["decided_at"] = now_str
+        update_fields["admin_note"] = note or order.get("admin_note")
 
-    update_sql = f"""
-        UPDATE orders
-        SET status = ?, is_locked = ?, updated_at = ?
-        {', ' + ', '.join(extra_updates) if extra_updates else ''}
-        WHERE id = ?
-    """
-    params = [target_status, new_is_locked, now_str] + extra_params + [order_id]
-    conn.execute(update_sql, params)
-
-    conn.execute(
-        """
-        INSERT INTO order_events (order_id, actor_user_id, actor_role, event_type, old_status, new_status, note, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (order_id, actor_user_id, actor_role, event_type, current_status, target_status, note, now_str),
+    mongo_db["orders"].update_one(
+        {"_id": order["_id"]},
+        {"$set": update_fields},
     )
 
-    updated_order = conn.execute("SELECT * FROM orders WHERE id = ?", (order_id,)).fetchone()
-    return dict(updated_order)
+    eid = get_next_sequence_value("order_events")
+    mongo_db["order_events"].insert_one({
+        "id": eid,
+        "order_id": order.get("id"),
+        "actor_user_id": actor_user_id,
+        "actor_role": actor_role,
+        "event_type": event_type,
+        "old_status": current_status,
+        "new_status": target_status,
+        "note": note,
+        "created_at": now_str,
+    })
+
+    updated_order = mongo_db["orders"].find_one({"_id": order["_id"]})
+    return serialize_doc(updated_order)
 
 
-def check_service_conflict(conn, item_id: int, preferred_datetime: str | None, exclude_order_id: int | None = None) -> dict:
+def check_service_conflict(
+    conn=None,
+    item_id: int | str = 0,
+    preferred_datetime: str | None = None,
+    exclude_order_id: int | None = None,
+    **kwargs,
+) -> dict:
     """Check if a service booking at preferred_datetime conflicts with an existing booking."""
     if not preferred_datetime or not str(preferred_datetime).strip():
         return {"has_conflict": False}
 
-    prod = conn.execute(
-        "SELECT id, name, COALESCE(item_type, 'product') AS item_type FROM products WHERE id = ?",
-        (item_id,),
-    ).fetchone()
-    if not prod or prod["item_type"] != "service":
+    prod = mongo_db["products"].find_one(make_id_query(item_id))
+    if not prod or prod.get("item_type") != "service":
         return {"has_conflict": False}
 
-    query = """
-        SELECT id, order_number, customer_name, preferred_datetime, status
-        FROM orders
-        WHERE item_id = ?
-          AND preferred_datetime = ?
-          AND status IN ('pending_admin_confirmation', 'confirmed')
-    """
-    params = [item_id, str(preferred_datetime).strip()]
+    query_filter = {
+        "item_id": prod.get("id"),
+        "preferred_datetime": str(preferred_datetime).strip(),
+        "status": {"$in": ["pending_admin_confirmation", "confirmed"]},
+    }
     if exclude_order_id:
-        query += " AND id != ?"
-        params.append(exclude_order_id)
+        query_filter["id"] = {"$ne": int(exclude_order_id)}
 
-    conflicts = conn.execute(query, params).fetchall()
+    conflicts = list(mongo_db["orders"].find(query_filter))
     if conflicts:
-        conflict_list = [dict(c) for c in conflicts]
+        conflict_list = [serialize_doc(c) for c in conflicts]
         return {
             "has_conflict": True,
-            "warning": f"Double-booking detected: {len(conflicts)} other order(s) already scheduled for {prod['name']} at {preferred_datetime}.",
+            "warning": f"Double-booking detected: {len(conflicts)} other order(s) already scheduled for {prod.get('name')} at {preferred_datetime}.",
             "conflicts": conflict_list,
         }
     return {"has_conflict": False}
 
 
 def create_or_update_handoff_request(
-    conn,
-    session_id: str,
-    user_id: int | None,
-    trigger_type: str,
-    reason: str,
+    conn=None,
+    session_id: str = "",
+    user_id: int | None = None,
+    trigger_type: str = "user_requested",
+    reason: str = "",
     priority: str = "normal",
     language: str = "en",
     contact_name: str | None = None,
     contact_phone: str | None = None,
     last_user_message: str | None = None,
     summary: str | None = None,
+    **kwargs,
 ) -> int:
-    """Create or update exactly one open handoff request per call session (Phase 7)."""
+    """Create or update exactly one open handoff request per call session in MongoDB (Phase 7)."""
     now_str = now()
-    call = conn.execute("SELECT id FROM calls WHERE session_id = ?", (session_id,)).fetchone()
-    call_id = call["id"] if call else None
+    call = mongo_db["calls"].find_one({"session_id": session_id})
+    call_id = call.get("id") if call else None
 
     if not contact_name and user_id:
-        user_row = conn.execute("SELECT full_name, phone FROM users WHERE id = ?", (user_id,)).fetchone()
+        user_row = mongo_db["users"].find_one(make_id_query(user_id))
         if user_row:
-            contact_name = contact_name or user_row["full_name"]
-            contact_phone = contact_phone or user_row["phone"]
+            contact_name = contact_name or user_row.get("full_name")
+            contact_phone = contact_phone or user_row.get("phone")
 
-    existing = conn.execute(
-        "SELECT id, priority, status FROM handoff_requests WHERE session_id = ? AND status IN ('open', 'assigned')",
-        (session_id,),
-    ).fetchone()
+    existing = mongo_db["handoff_requests"].find_one(
+        {"session_id": session_id, "status": {"$in": ["open", "assigned"]}}
+    )
 
     priority_ranks = {"normal": 1, "high": 2, "urgent": 3}
 
     if existing:
-        curr_prio = existing["priority"]
+        curr_prio = existing.get("priority", "normal")
         new_prio = priority if priority_ranks.get(priority, 1) > priority_ranks.get(curr_prio, 1) else curr_prio
-        conn.execute(
-            """
-            UPDATE handoff_requests
-            SET trigger_type = ?, reason = ?, priority = ?, language = ?,
-                contact_name = COALESCE(?, contact_name),
-                contact_phone = COALESCE(?, contact_phone),
-                last_user_message = COALESCE(?, last_user_message),
-                summary = COALESCE(?, summary)
-            WHERE id = ?
-            """,
-            (trigger_type, reason, new_prio, language, contact_name, contact_phone, last_user_message, summary, existing["id"]),
-        )
-        handoff_id = existing["id"]
+        update_fields = {
+            "trigger_type": trigger_type,
+            "reason": reason,
+            "priority": new_prio,
+            "language": language,
+        }
+        if contact_name:
+            update_fields["contact_name"] = contact_name
+        if contact_phone:
+            update_fields["contact_phone"] = contact_phone
+        if last_user_message:
+            update_fields["last_user_message"] = last_user_message
+        if summary:
+            update_fields["summary"] = summary
+
+        mongo_db["handoff_requests"].update_one({"_id": existing["_id"]}, {"$set": update_fields})
+        handoff_id = existing.get("id")
     else:
-        cursor = conn.execute(
-            """
-            INSERT INTO handoff_requests (
-                call_id, session_id, user_id, contact_name, contact_phone,
-                trigger_type, reason, priority, language,
-                last_user_message, summary, status, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?)
-            """,
-            (
-                call_id, session_id, user_id, contact_name, contact_phone,
-                trigger_type, reason, priority, language,
-                last_user_message, summary, now_str,
-            ),
-        )
-        handoff_id = cursor.lastrowid
+        handoff_id = get_next_sequence_value("handoff_requests")
+        mongo_db["handoff_requests"].insert_one({
+            "id": handoff_id,
+            "call_id": call_id,
+            "session_id": session_id,
+            "user_id": user_id,
+            "contact_name": contact_name,
+            "contact_phone": contact_phone,
+            "trigger_type": trigger_type,
+            "reason": reason,
+            "priority": priority,
+            "language": language,
+            "last_user_message": last_user_message,
+            "summary": summary,
+            "status": "open",
+            "created_at": now_str,
+            "assigned_to": None,
+            "staff_note": None,
+            "assigned_at": None,
+            "resolved_at": None,
+            "resolved_by": None,
+        })
 
     if call_id:
-        conn.execute(
-            "UPDATE calls SET follow_up_status = 'needs_human', detected_intent = ?, summary = COALESCE(?, summary) WHERE id = ?",
-            (trigger_type, summary, call_id),
-        )
+        call_update = {"follow_up_status": "needs_human", "detected_intent": trigger_type}
+        if summary:
+            call_update["summary"] = summary
+        mongo_db["calls"].update_one({"id": call_id}, {"$set": call_update})
 
     return handoff_id
 
@@ -1259,7 +1064,7 @@ async def _call_gemini_once(session_id: str, user_text: str, user_id: int | None
             if not key_manager.client:
                 raise RuntimeError("GEMINI_API_KEY is not configured.")
 
-        contents: list[types.Content] = []
+        contents: list[Any] = []
         for turn in SESSIONS.get(session_id, []):
             role = "user" if turn.get("role") == "user" else "model"
             parts = turn.get("parts", [""])
@@ -1645,14 +1450,10 @@ async def get_optional_user(request: Request) -> dict | None:
     if not user_id:
         return None
 
-    with db() as conn:
-        row = conn.execute(
-            "SELECT id, email, phone, full_name, role, is_active FROM users WHERE id = ?",
-            (user_id,),
-        ).fetchone()
-        if not row or not row["is_active"]:
-            return None
-        return dict(row)
+    row = mongo_db["users"].find_one(make_id_query(user_id))
+    if not row or not row.get("is_active"):
+        return None
+    return serialize_doc(row)
 
 
 async def get_current_user(request: Request) -> dict:
@@ -1679,10 +1480,24 @@ async def require_admin(current_user: dict = Depends(get_current_user)) -> dict:
 # =====================================================================
 # 10. FastAPI Application Setup & Security Middleware
 # =====================================================================
+class MongoJSONResponse(JSONResponse):
+    """Custom JSONResponse ensuring any BSON ObjectId is serialized as a string."""
+    def render(self, content) -> bytes:
+        return json.dumps(
+            content,
+            ensure_ascii=False,
+            allow_nan=False,
+            indent=None,
+            separators=(",", ":"),
+            default=lambda o: str(o) if isinstance(o, ObjectId) else (o.isoformat() if isinstance(o, (datetime, date)) else str(o)),
+        ).encode("utf-8")
+
+
 app = FastAPI(
     title="DigiBuzz AI Calling Agent",
-    description="Multi-tenant Voice-based AI Customer Support Platform powered by Gemini and gTTS.",
+    description="Multi-tenant Voice-based AI Customer Support Platform powered by Gemini and MongoDB Atlas.",
     version="3.0.0",
+    default_response_class=MongoJSONResponse,
 )
 
 
@@ -1738,26 +1553,33 @@ async def register_user(req: UserRegister, response: Response):
             detail="Password must be at least 8 characters and contain both letters and numbers.",
         )
 
-    with db() as conn:
-        # Check duplicate email
-        if conn.execute("SELECT 1 FROM users WHERE LOWER(email) = ?", (clean_email,)).fetchone():
-            raise HTTPException(
-                status_code=409,
-                detail="An account with this email address already exists. Please sign in.",
-            )
-        # Check duplicate phone
-        if conn.execute("SELECT 1 FROM users WHERE phone = ?", (clean_phone,)).fetchone():
-            raise HTTPException(
-                status_code=409,
-                detail="An account with this phone number already exists. Please sign in.",
-            )
-
-        password_hash = hash_password(req.password)
-        cursor = conn.execute(
-            "INSERT INTO users (email, phone, full_name, password_hash, role, is_active, created_at) VALUES (?, ?, ?, ?, 'user', 1, ?)",
-            (clean_email, clean_phone, req.full_name.strip(), password_hash, now()),
+    # Check duplicate email
+    if mongo_db["users"].find_one({"email": clean_email}):
+        raise HTTPException(
+            status_code=409,
+            detail="An account with this email address already exists. Please sign in.",
         )
-        new_id = cursor.lastrowid
+    # Check duplicate phone
+    if mongo_db["users"].find_one({"phone": clean_phone}):
+        raise HTTPException(
+            status_code=409,
+            detail="An account with this phone number already exists. Please sign in.",
+        )
+
+    password_hash = hash_password(req.password)
+    new_id = get_next_sequence_value("users")
+    user_doc = {
+        "id": new_id,
+        "email": clean_email,
+        "phone": clean_phone,
+        "full_name": req.full_name.strip(),
+        "password_hash": password_hash,
+        "role": "user",
+        "is_active": 1,
+        "created_at": now(),
+        "last_login": None,
+    }
+    mongo_db["users"].insert_one(user_doc)
 
     token = create_access_token(new_id, "user", clean_email)
     response.set_cookie(
@@ -1794,20 +1616,16 @@ async def login_user(req: UserLogin, request: Request, response: Response):
     ident_email = ident.lower()
     ident_phone = re.sub(r"[\s\-()]", "", ident)
 
-    with db() as conn:
-        row = conn.execute(
-            "SELECT id, email, phone, full_name, password_hash, role, is_active FROM users WHERE LOWER(email) = ? OR phone = ? LIMIT 1",
-            (ident_email, ident_phone),
-        ).fetchone()
+    row = mongo_db["users"].find_one({"$or": [{"email": ident_email}, {"phone": ident_phone}]})
 
-    if not row or not verify_password(req.password, row["password_hash"]):
+    if not row or not verify_password(req.password, row.get("password_hash", "")):
         record_login_failure(rate_key)
         raise HTTPException(
             status_code=401,
             detail="Invalid credentials. Please verify your email/phone and password.",
         )
 
-    if not row["is_active"]:
+    if not row.get("is_active"):
         raise HTTPException(
             status_code=403,
             detail="Your account has been suspended. Please contact platform support.",
@@ -1816,10 +1634,10 @@ async def login_user(req: UserLogin, request: Request, response: Response):
     clear_login_failures(rate_key)
 
     # Update last login
-    with db() as conn:
-        conn.execute("UPDATE users SET last_login = ? WHERE id = ?", (now(), row["id"]))
+    mongo_db["users"].update_one({"_id": row["_id"]}, {"$set": {"last_login": now()}})
 
-    token = create_access_token(row["id"], row["role"], row["email"])
+    user_id = row.get("id") or str(row["_id"])
+    token = create_access_token(user_id, row.get("role", "user"), row.get("email", ""))
     response.set_cookie(
         key=COOKIE_NAME,
         value=token,
@@ -1833,11 +1651,11 @@ async def login_user(req: UserLogin, request: Request, response: Response):
     return {
         "status": "ok",
         "user": {
-            "id": row["id"],
-            "email": row["email"],
-            "phone": row["phone"],
-            "full_name": row["full_name"],
-            "role": row["role"],
+            "id": user_id,
+            "email": row.get("email"),
+            "phone": row.get("phone"),
+            "full_name": row.get("full_name"),
+            "role": row.get("role"),
         },
         "token": token,
     }
@@ -1871,13 +1689,12 @@ async def change_own_password(req: UserPasswordChange, current_user: dict = Depe
             detail="New password must be at least 8 characters and contain both letters and numbers.",
         )
 
-    with db() as conn:
-        row = conn.execute("SELECT password_hash FROM users WHERE id = ?", (current_user["id"],)).fetchone()
-        if not row or not verify_password(req.current_password, row["password_hash"]):
-            raise HTTPException(status_code=400, detail="Current password is incorrect.")
+    row = mongo_db["users"].find_one(make_id_query(current_user["id"]))
+    if not row or not verify_password(req.current_password, row.get("password_hash", "")):
+        raise HTTPException(status_code=400, detail="Current password is incorrect.")
 
-        new_hash = hash_password(req.new_password)
-        conn.execute("UPDATE users SET password_hash = ? WHERE id = ?", (new_hash, current_user["id"]))
+    new_hash = hash_password(req.new_password)
+    mongo_db["users"].update_one({"_id": row["_id"]}, {"$set": {"password_hash": new_hash}})
 
     return {"status": "ok", "message": "Your password has been changed successfully."}
 
@@ -1889,16 +1706,15 @@ async def change_own_password(req: UserPasswordChange, current_user: dict = Depe
 async def get_admin_metrics(_admin: dict = Depends(require_admin)):
     """System-wide SaaS metrics for Admin dashboard."""
     def query():
-        with db() as conn:
-            total_users = conn.execute("SELECT COUNT(*) AS n FROM users").fetchone()["n"]
-            active_users = conn.execute("SELECT COUNT(*) AS n FROM users WHERE is_active = 1").fetchone()["n"]
-            suspended_users = total_users - active_users
-            total_calls = conn.execute("SELECT COUNT(*) AS n FROM calls").fetchone()["n"]
-            total_messages = conn.execute("SELECT COUNT(*) AS n FROM call_messages").fetchone()["n"]
-            resolved = conn.execute("SELECT COUNT(*) AS n FROM calls WHERE outcome = 'Resolved'").fetchone()["n"]
-            escalated = conn.execute("SELECT COUNT(*) AS n FROM calls WHERE outcome = 'Escalated'").fetchone()["n"]
-            total_faqs = conn.execute("SELECT COUNT(*) AS n FROM faqs").fetchone()["n"]
-            total_products = conn.execute("SELECT COUNT(*) AS n FROM products").fetchone()["n"]
+        total_users = mongo_db["users"].count_documents({})
+        active_users = mongo_db["users"].count_documents({"is_active": 1})
+        suspended_users = total_users - active_users
+        total_calls = mongo_db["calls"].count_documents({})
+        total_messages = mongo_db["call_messages"].count_documents({})
+        resolved = mongo_db["calls"].count_documents({"outcome": "Resolved"})
+        escalated = mongo_db["calls"].count_documents({"outcome": "Escalated"})
+        total_faqs = mongo_db["faqs"].count_documents({})
+        total_products = mongo_db["products"].count_documents({})
         return {
             "total_users": total_users,
             "active_users": active_users,
@@ -1917,23 +1733,17 @@ async def get_admin_metrics(_admin: dict = Depends(require_admin)):
 async def list_all_users(_admin: dict = Depends(require_admin)):
     """List all registered users with activity stats and primary admin protection flag."""
     def query():
-        with db() as conn:
-            rows = conn.execute(
-                """
-                SELECT u.id, u.email, u.phone, u.full_name, u.role, u.is_active, u.created_at, u.last_login,
-                       (SELECT COUNT(*) FROM calls c WHERE c.user_id = u.id) AS call_count,
-                       (SELECT COUNT(*) FROM faqs f WHERE f.user_id = u.id) AS faq_count,
-                       (SELECT COUNT(*) FROM products p WHERE p.user_id = u.id) AS product_count
-                FROM users u
-                ORDER BY u.id ASC
-                """
-            ).fetchall()
-            user_list = []
-            for r in rows:
-                d = dict(r)
-                d["is_primary"] = is_primary_admin(user_id=d["id"], email=d["email"])
-                user_list.append(d)
-            return user_list
+        rows = list(mongo_db["users"].find({}, {"password_hash": 0}).sort("id", 1))
+        user_list = []
+        for r in rows:
+            d = serialize_doc(r)
+            uid = d.get("id")
+            d["call_count"] = mongo_db["calls"].count_documents({"user_id": uid})
+            d["faq_count"] = mongo_db["faqs"].count_documents({"user_id": uid})
+            d["product_count"] = mongo_db["products"].count_documents({"user_id": uid})
+            d["is_primary"] = is_primary_admin(user_id=uid, email=d.get("email"))
+            user_list.append(d)
+        return user_list
     return await asyncio.to_thread(query)
 
 
@@ -1950,25 +1760,29 @@ async def create_user_by_admin(req: AdminUserCreate, _admin: dict = Depends(requ
         )
 
     def query():
-        with db() as conn:
-            if conn.execute("SELECT 1 FROM users WHERE LOWER(email) = ?", (clean_email,)).fetchone():
-                return 409, "An account with this email address already exists."
-            if conn.execute("SELECT 1 FROM users WHERE phone = ?", (clean_phone,)).fetchone():
-                return 409, "An account with this phone number already exists."
+        if mongo_db["users"].find_one({"email": clean_email}):
+            return 409, "An account with this email address already exists."
+        if mongo_db["users"].find_one({"phone": clean_phone}):
+            return 409, "An account with this phone number already exists."
 
-            password_hash = hash_password(req.password)
-            cursor = conn.execute(
-                "INSERT INTO users (email, phone, full_name, password_hash, role, is_active, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (clean_email, clean_phone, req.full_name.strip(), password_hash, req.role, 1 if req.is_active else 0, now()),
-            )
-            new_id = cursor.lastrowid
-            row = conn.execute(
-                "SELECT id, email, phone, full_name, role, is_active, created_at, last_login FROM users WHERE id = ?",
-                (new_id,),
-            ).fetchone()
-            d = dict(row)
-            d["is_primary"] = is_primary_admin(user_id=d["id"], email=d["email"])
-            return 201, d
+        password_hash = hash_password(req.password)
+        new_id = get_next_sequence_value("users")
+        doc = {
+            "id": new_id,
+            "email": clean_email,
+            "phone": clean_phone,
+            "full_name": req.full_name.strip(),
+            "password_hash": password_hash,
+            "role": req.role,
+            "is_active": 1 if req.is_active else 0,
+            "created_at": now(),
+            "last_login": None,
+        }
+        mongo_db["users"].insert_one(doc)
+        res_doc = serialize_doc(doc)
+        res_doc.pop("password_hash", None)
+        res_doc["is_primary"] = is_primary_admin(user_id=new_id, email=clean_email)
+        return 201, res_doc
 
     status_code, result = await asyncio.to_thread(query)
     if status_code == 409:
@@ -1983,7 +1797,6 @@ async def update_user_by_admin(user_id: int, req: AdminUserUpdate, admin: dict =
     clean_phone = re.sub(r"[\s\-()]", "", req.phone.strip())
 
     if is_primary_admin(user_id=user_id):
-        # Primary Admin cannot be modified by secondary admins, and cannot be demoted or suspended
         if admin["id"] != user_id or req.role != "admin" or not req.is_active:
             raise HTTPException(
                 status_code=403,
@@ -1998,40 +1811,34 @@ async def update_user_by_admin(user_id: int, req: AdminUserUpdate, admin: dict =
             )
 
     def query():
-        with db() as conn:
-            existing = conn.execute("SELECT id, email, phone, role, is_active FROM users WHERE id = ?", (user_id,)).fetchone()
-            if not existing:
-                return 404, "User not found."
+        existing = mongo_db["users"].find_one(make_id_query(user_id))
+        if not existing:
+            return 404, "User not found."
 
-            # Check email uniqueness
-            email_conflict = conn.execute("SELECT 1 FROM users WHERE LOWER(email) = ? AND id != ?", (clean_email, user_id)).fetchone()
-            if email_conflict:
-                return 409, "An account with this email address already exists."
+        email_conflict = mongo_db["users"].find_one({"email": clean_email, "_id": {"$ne": existing["_id"]}})
+        if email_conflict:
+            return 409, "An account with this email address already exists."
 
-            # Check phone uniqueness
-            phone_conflict = conn.execute("SELECT 1 FROM users WHERE phone = ? AND id != ?", (clean_phone, user_id)).fetchone()
-            if phone_conflict:
-                return 409, "An account with this phone number already exists."
+        phone_conflict = mongo_db["users"].find_one({"phone": clean_phone, "_id": {"$ne": existing["_id"]}})
+        if phone_conflict:
+            return 409, "An account with this phone number already exists."
 
-            if req.password:
-                new_hash = hash_password(req.password)
-                conn.execute(
-                    "UPDATE users SET email = ?, phone = ?, full_name = ?, password_hash = ?, role = ?, is_active = ? WHERE id = ?",
-                    (clean_email, clean_phone, req.full_name.strip(), new_hash, req.role, 1 if req.is_active else 0, user_id),
-                )
-            else:
-                conn.execute(
-                    "UPDATE users SET email = ?, phone = ?, full_name = ?, role = ?, is_active = ? WHERE id = ?",
-                    (clean_email, clean_phone, req.full_name.strip(), req.role, 1 if req.is_active else 0, user_id),
-                )
+        update_fields = {
+            "email": clean_email,
+            "phone": clean_phone,
+            "full_name": req.full_name.strip(),
+            "role": req.role,
+            "is_active": 1 if req.is_active else 0,
+        }
+        if req.password:
+            update_fields["password_hash"] = hash_password(req.password)
 
-            row = conn.execute(
-                "SELECT id, email, phone, full_name, role, is_active, created_at, last_login FROM users WHERE id = ?",
-                (user_id,),
-            ).fetchone()
-            d = dict(row)
-            d["is_primary"] = is_primary_admin(user_id=d["id"], email=d["email"])
-            return 200, d
+        mongo_db["users"].update_one({"_id": existing["_id"]}, {"$set": update_fields})
+        updated = mongo_db["users"].find_one({"_id": existing["_id"]})
+        d = serialize_doc(updated)
+        d.pop("password_hash", None)
+        d["is_primary"] = is_primary_admin(user_id=d.get("id"), email=d.get("email"))
+        return 200, d
 
     status_code, result = await asyncio.to_thread(query)
     if status_code == 404:
@@ -2053,12 +1860,11 @@ async def update_user_status(user_id: int, req: UserStatusUpdate, admin: dict = 
         raise HTTPException(status_code=400, detail="Administrators cannot suspend their own active account.")
 
     def query():
-        with db() as conn:
-            user = conn.execute("SELECT id FROM users WHERE id = ?", (user_id,)).fetchone()
-            if not user:
-                return False
-            conn.execute("UPDATE users SET is_active = ? WHERE id = ?", (1 if req.is_active else 0, user_id))
-            return True
+        res = mongo_db["users"].update_one(
+            make_id_query(user_id),
+            {"$set": {"is_active": 1 if req.is_active else 0}},
+        )
+        return res.matched_count > 0
 
     updated = await asyncio.to_thread(query)
     if not updated:
@@ -2078,12 +1884,8 @@ async def update_user_role(user_id: int, req: UserRoleUpdate, admin: dict = Depe
         raise HTTPException(status_code=400, detail="Administrators cannot demote themselves.")
 
     def query():
-        with db() as conn:
-            user = conn.execute("SELECT id FROM users WHERE id = ?", (user_id,)).fetchone()
-            if not user:
-                return False
-            conn.execute("UPDATE users SET role = ? WHERE id = ?", (req.role, user_id))
-            return True
+        res = mongo_db["users"].update_one(make_id_query(user_id), {"$set": {"role": req.role}})
+        return res.matched_count > 0
 
     updated = await asyncio.to_thread(query)
     if not updated:
@@ -2111,12 +1913,8 @@ async def update_user_password_by_admin(
     new_hash = hash_password(req.password)
 
     def query():
-        with db() as conn:
-            user = conn.execute("SELECT id, email, full_name FROM users WHERE id = ?", (user_id,)).fetchone()
-            if not user:
-                return False
-            conn.execute("UPDATE users SET password_hash = ? WHERE id = ?", (new_hash, user_id))
-            return True
+        res = mongo_db["users"].update_one(make_id_query(user_id), {"$set": {"password_hash": new_hash}})
+        return res.matched_count > 0
 
     updated = await asyncio.to_thread(query)
     if not updated:
@@ -2136,21 +1934,19 @@ async def delete_user_by_admin(user_id: int, admin: dict = Depends(require_admin
         raise HTTPException(status_code=400, detail="Administrators cannot delete their own active session account.")
 
     def query():
-        with db() as conn:
-            user = conn.execute("SELECT id, email, full_name FROM users WHERE id = ?", (user_id,)).fetchone()
-            if not user:
-                return False
-            # Clean up calls and call_messages
-            user_calls = conn.execute("SELECT id FROM calls WHERE user_id = ?", (user_id,)).fetchall()
-            for c in user_calls:
-                conn.execute("DELETE FROM call_messages WHERE call_id = ?", (c["id"],))
-            conn.execute("DELETE FROM calls WHERE user_id = ?", (user_id,))
-            # Reassign faqs and products to null/platform so catalog integrity is maintained
-            conn.execute("UPDATE faqs SET user_id = NULL WHERE user_id = ?", (user_id,))
-            conn.execute("UPDATE products SET user_id = NULL WHERE user_id = ?", (user_id,))
-            # Delete user
-            conn.execute("DELETE FROM users WHERE id = ?", (user_id,))
-            return True
+        user = mongo_db["users"].find_one(make_id_query(user_id))
+        if not user:
+            return False
+        uid = user.get("id")
+        user_calls = list(mongo_db["calls"].find({"user_id": uid}))
+        call_ids = [c["id"] for c in user_calls if "id" in c]
+        if call_ids:
+            mongo_db["call_messages"].delete_many({"call_id": {"$in": call_ids}})
+        mongo_db["calls"].delete_many({"user_id": uid})
+        mongo_db["faqs"].update_many({"user_id": uid}, {"$set": {"user_id": None}})
+        mongo_db["products"].update_many({"user_id": uid}, {"$set": {"user_id": None}})
+        mongo_db["users"].delete_one({"_id": user["_id"]})
+        return True
 
     deleted = await asyncio.to_thread(query)
     if not deleted:
@@ -2163,20 +1959,21 @@ async def delete_user_by_admin(user_id: int, admin: dict = Depends(require_admin
 # =====================================================================
 @app.get("/api/health")
 async def health_check(request: Request):
-    """Return system health, current engine, and tenant-scoped counts."""
+    """Return system health, current engine, and tenant-scoped counts from MongoDB Atlas."""
     user = await get_optional_user(request)
 
     def query():
-        with db() as conn:
-            if user and user["role"] == "admin":
-                faq_count = conn.execute("SELECT COUNT(*) AS n FROM faqs").fetchone()["n"]
-                product_count = conn.execute("SELECT COUNT(*) AS n FROM products").fetchone()["n"]
-            elif user:
-                faq_count = conn.execute("SELECT COUNT(*) AS n FROM faqs WHERE user_id IS NULL OR user_id = ?", (user["id"],)).fetchone()["n"]
-                product_count = conn.execute("SELECT COUNT(*) AS n FROM products WHERE user_id IS NULL OR user_id = ?", (user["id"],)).fetchone()["n"]
-            else:
-                faq_count = conn.execute("SELECT COUNT(*) AS n FROM faqs WHERE user_id IS NULL").fetchone()["n"]
-                product_count = conn.execute("SELECT COUNT(*) AS n FROM products WHERE user_id IS NULL").fetchone()["n"]
+        if user and user.get("role") == "admin":
+            faq_count = mongo_db["faqs"].count_documents({})
+            product_count = mongo_db["products"].count_documents({})
+        elif user:
+            admin_ids = [u["id"] for u in mongo_db["users"].find({"role": "admin"}, {"id": 1})]
+            faq_count = mongo_db["faqs"].count_documents({"$or": [{"user_id": None}, {"user_id": {"$in": admin_ids}}, {"user_id": user["id"]}]})
+            product_count = mongo_db["products"].count_documents({"$or": [{"user_id": None}, {"user_id": {"$in": admin_ids}}, {"user_id": user["id"]}]})
+        else:
+            admin_ids = [u["id"] for u in mongo_db["users"].find({"role": "admin"}, {"id": 1})]
+            faq_count = mongo_db["faqs"].count_documents({"$or": [{"user_id": None}, {"user_id": {"$in": admin_ids}}]})
+            product_count = mongo_db["products"].count_documents({"$or": [{"user_id": None}, {"user_id": {"$in": admin_ids}}]})
         return faq_count, product_count
 
     faqs, products = await asyncio.to_thread(query)
@@ -2231,7 +2028,7 @@ def _expand_knowledge_keywords(words: set[str]) -> set[str]:
 
 
 def check_fast_knowledge_response(user_text: str, user_id: int | None = None) -> dict | None:
-    """Fast-path lookup against SQLite FAQs and Product Catalog for 0ms ultra-low latency response."""
+    """Fast-path lookup against MongoDB FAQs and Product Catalog for 0ms ultra-low latency response."""
     clean_query = user_text.lower().strip()
     clean_no_punc = re.sub(r"[^\w\s\u0600-\u06FF]", " ", clean_query).strip()
     words_all = set(clean_no_punc.split())
@@ -2240,74 +2037,64 @@ def check_fast_knowledge_response(user_text: str, user_id: int | None = None) ->
 
     # 1. First check FAQs (Direct exact & high-similarity normalized match)
     try:
-        with db() as conn:
-            conn.row_factory = sqlite3.Row
-            faq_rows = conn.execute(
-                """
-                SELECT id, question, answer, intent FROM faqs
-                WHERE user_id IS NULL OR user_id IN (SELECT id FROM users WHERE role = 'admin') OR user_id = ?
-                """,
-                (user_id or 0,),
-            ).fetchall()
+        admin_ids = [u["id"] for u in mongo_db["users"].find({"role": "admin"}, {"id": 1})]
+        faq_filter = {"$or": [{"user_id": None}, {"user_id": {"$in": admin_ids}}, {"user_id": user_id or 0}]}
+        faq_rows = list(mongo_db["faqs"].find(faq_filter))
 
-            norm_clean = re.sub(r"\s+", " ", clean_no_punc)
+        norm_clean = re.sub(r"\s+", " ", clean_no_punc)
 
-            # Direct exact question match (case/punctuation insensitive)
+        # Direct exact question match (case/punctuation insensitive)
+        for row in faq_rows:
+            q_norm = re.sub(r"[^\w\s\u0600-\u06FF]", " ", row.get("question", "").lower()).strip()
+            q_norm = re.sub(r"\s+", " ", q_norm)
+            if norm_clean == q_norm:
+                return {
+                    "type": "faq",
+                    "answer": row.get("answer", ""),
+                    "intent": row.get("intent") or "faq_inquiry",
+                }
+
+        q_words = words_all - FAST_KNOWLEDGE_STOP_WORDS
+        if q_words:
+            expanded_q = _expand_knowledge_keywords(q_words)
+            best_faq = None
+            best_score = 0.0
+
             for row in faq_rows:
-                q_norm = re.sub(r"[^\w\s\u0600-\u06FF]", " ", row["question"].lower()).strip()
-                q_norm = re.sub(r"\s+", " ", q_norm)
-                if norm_clean == q_norm:
+                f_words = set(re.findall(r"\b[a-z0-9]{3,}\b", row.get("question", "").lower())) - FAST_KNOWLEDGE_STOP_WORDS
+                f_expanded = _expand_knowledge_keywords(f_words)
+                common = expanded_q.intersection(f_expanded)
+                if len(common) >= 1:
+                    score = len(common) / max(len(q_words), 1)
+                    if score > best_score:
+                        best_score = score
+                        best_faq = (row.get("question", ""), row.get("answer", ""), row.get("intent"))
+
+            if best_faq and best_score >= 0.5:
+                return {
+                    "type": "faq",
+                    "answer": best_faq[1],
+                    "intent": best_faq[2] or "faq_inquiry",
+                }
+
+        # 2. Check Products
+        if q_words:
+            prod_filter = {"$or": [{"user_id": None}, {"user_id": {"$in": admin_ids}}, {"user_id": user_id or 0}]}
+            prod_rows = list(mongo_db["products"].find(prod_filter))
+
+            for row in prod_rows:
+                name_clean = row.get("name", "").lower()
+                name_words = set(re.findall(r"\b[a-z0-9]{3,}\b", name_clean)) - FAST_KNOWLEDGE_STOP_WORDS
+                common_name = q_words.intersection(name_words)
+                if len(common_name) >= 2 or (len(name_words) == 1 and len(common_name) == 1) or any(w in clean_query for w in name_words if len(w) >= 6):
+                    status = "in stock" if "in" in str(row.get("stock_status", "")).lower() else "currently out of stock"
+                    price_val = row.get("price", 0)
+                    reply = f"The {row.get('name')} is {status} at wholesale rate PKR {price_val:,.0f}. {row.get('description', '')}"
                     return {
-                        "type": "faq",
-                        "answer": row["answer"],
-                        "intent": row["intent"] or "faq_inquiry",
+                        "type": "product",
+                        "answer": reply,
+                        "intent": "product_inquiry",
                     }
-
-            q_words = words_all - FAST_KNOWLEDGE_STOP_WORDS
-            if q_words:
-                expanded_q = _expand_knowledge_keywords(q_words)
-                best_faq = None
-                best_score = 0.0
-
-                for row in faq_rows:
-                    f_words = set(re.findall(r"\b[a-z0-9]{3,}\b", row["question"].lower())) - FAST_KNOWLEDGE_STOP_WORDS
-                    f_expanded = _expand_knowledge_keywords(f_words)
-                    common = expanded_q.intersection(f_expanded)
-                    if len(common) >= 1:
-                        score = len(common) / max(len(q_words), 1)
-                        if score > best_score:
-                            best_score = score
-                            best_faq = (row["question"], row["answer"], row["intent"])
-
-                if best_faq and best_score >= 0.5:
-                    return {
-                        "type": "faq",
-                        "answer": best_faq[1],
-                        "intent": best_faq[2] or "faq_inquiry",
-                    }
-
-            # 2. Check Products
-            if q_words:
-                prod_rows = conn.execute(
-                    """
-                    SELECT name, category, price, stock_status, description FROM products
-                    WHERE user_id IS NULL OR user_id IN (SELECT id FROM users WHERE role = 'admin') OR user_id = ?
-                    """,
-                    (user_id or 0,),
-                ).fetchall()
-
-                for row in prod_rows:
-                    name_clean = row["name"].lower()
-                    name_words = set(re.findall(r"\b[a-z0-9]{3,}\b", name_clean)) - FAST_KNOWLEDGE_STOP_WORDS
-                    common_name = q_words.intersection(name_words)
-                    if len(common_name) >= 2 or (len(name_words) == 1 and len(common_name) == 1) or any(w in clean_query for w in name_words if len(w) >= 6):
-                        status = "in stock" if "in" in str(row["stock_status"]).lower() else "currently out of stock"
-                        reply = f"The {row['name']} is {status} at wholesale rate PKR {row['price']:,.0f}. {row['description']}"
-                        return {
-                            "type": "product",
-                            "answer": reply,
-                            "intent": "product_inquiry",
-                        }
     except Exception as exc:
         log.warning("Fast knowledge lookup error: %r", exc)
 
@@ -2377,13 +2164,12 @@ def parse_quantity(text: str) -> int | None:
 
 
 def get_business_hours(is_urdu: bool = False) -> str:
-    """Retrieve business hours from business_settings table."""
+    """Retrieve business hours from MongoDB business_settings collection."""
     key = "business_hours_ur" if is_urdu else "business_hours_en"
     try:
-        with db() as conn:
-            row = conn.execute("SELECT value FROM business_settings WHERE key = ?", (key,)).fetchone()
-            if row and row["value"]:
-                return row["value"]
+        row = mongo_db["business_settings"].find_one({"key": key})
+        if row and row.get("value"):
+            return str(row["value"])
     except Exception:
         pass
     if is_urdu:
@@ -2392,7 +2178,7 @@ def get_business_hours(is_urdu: bool = False) -> str:
 
 
 def lookup_order_status(text: str, user_id: int | None = None) -> dict | None:
-    """Direct database lookup for order status queries."""
+    """Direct database lookup for order status queries in MongoDB Atlas."""
     clean = text.lower().strip()
     order_keywords = ["order status", "track order", "where is my order", "mera order", "status of my order", "order kahan hai", "order track", "آرڈر", "ارڈر"]
     has_keyword = any(k in clean for k in order_keywords)
@@ -2407,115 +2193,57 @@ def lookup_order_status(text: str, user_id: int | None = None) -> dict | None:
     is_urdu = bool(ARABIC_SCRIPT.search(text)) or any(w in clean.split() for w in ["kahan", "mera", "batao", "hai", "hain", "karo"])
 
     try:
-        with db() as conn:
-            row = None
-            if order_num:
-                row = conn.execute(
-                    "SELECT order_number, status, tracking_number, total_pkr FROM orders WHERE order_number = ? OR order_number LIKE ?",
-                    (order_num, f"%{digits}%"),
-                ).fetchone()
+        row = None
+        if order_num:
+            row = mongo_db["orders"].find_one({
+                "$or": [
+                    {"order_number": order_num},
+                    {"order_number": {"$regex": re.escape(digits), "$options": "i"}}
+                ]
+            })
 
-            if not row and user_id:
-                row = conn.execute(
-                    "SELECT order_number, status, tracking_number, total_pkr FROM orders WHERE user_id = ? ORDER BY id DESC LIMIT 1",
-                    (user_id,),
-                ).fetchone()
+        if not row and user_id:
+            row = mongo_db["orders"].find_one({"user_id": user_id}, sort=[("id", -1)])
 
-            if not row and has_keyword and not order_num:
-                row = conn.execute(
-                    "SELECT order_number, status, tracking_number, total_pkr FROM orders ORDER BY id DESC LIMIT 1"
-                ).fetchone()
+        if not row and has_keyword and not order_num:
+            row = mongo_db["orders"].find_one({}, sort=[("id", -1)])
 
-            if row:
-                status_raw = row["status"]
-                status_map_en = {
-                    "pending_admin_confirmation": "waiting for admin confirmation",
-                    "confirmed": "confirmed by administrator",
-                    "completed": "completed",
-                    "rejected": "rejected by administrator",
-                    "cancel_requested": "under review for cancellation",
-                    "cancelled": "cancelled",
-                }
-                status_map_ur = {
-                    "pending_admin_confirmation": "ایڈمن کی تصدیق کا منتظر",
-                    "confirmed": "ایڈمن سے تصدیق شدہ",
-                    "completed": "مکمل ہو چکا",
-                    "rejected": "ایڈمن سے مسترد شدہ",
-                    "cancel_requested": "منسوخی کی درخواست کے زیرِ جائزہ",
-                    "cancelled": "منسوخ ہو چکا",
-                }
-                status_en = status_map_en.get(status_raw, status_raw.replace("_", " "))
-                status_ur = status_map_ur.get(status_raw, status_raw)
-                total_val = row["total_pkr"] or 0
-                if is_urdu:
-                    reply = f"آپ کا آرڈر نمبر {row['order_number']} اس وقت {status_ur} ہے اور کل رقم {total_val:,} روپے ہے۔"
-                    return {"reply": reply, "language": "ur", "intent": "order_status", "outcome": "Resolved", "confidence": 1.0}
-                reply = f"Your order {row['order_number']} has been received and is currently {status_en}. Total amount is PKR {total_val:,}."
-                return {"reply": reply, "language": "en", "intent": "order_status", "outcome": "Resolved", "confidence": 1.0}
-    except Exception as exc:
-        log.warning("Order lookup error: %r", exc)
-
-    if has_keyword:
-        if is_urdu:
+        if row:
+            status_raw = row.get("status", "")
+            status_map_en = {
+                "pending_admin_confirmation": "waiting for admin confirmation",
+                "confirmed": "confirmed by administrator",
+                "completed": "completed",
+                "rejected": "rejected by administrator",
+                "cancel_requested": "under review for cancellation",
+                "cancelled": "cancelled",
+            }
+            status_map_ur = {
+                "pending_admin_confirmation": "ایڈمن کی تصدیق کا منتظر",
+                "confirmed": "ایڈمن سے تصدیق شدہ",
+                "completed": "مکمل ہو چکا",
+                "rejected": "ایڈمن سے مسترد شدہ",
+                "cancel_requested": "منسوخی کی درخواست کے زیرِ جائزہ",
+                "cancelled": "منسوخ ہو چکا",
+            }
+            status_en = status_map_en.get(status_raw, status_raw.replace("_", " "))
+            status_ur = status_map_ur.get(status_raw, status_raw)
+            total_val = row.get("total_pkr") or 0
+            if is_urdu:
+                reply = f"آپ کے آرڈر {row.get('order_number')} کا سٹیٹس اس وقت '{status_ur}' ہے۔ کل رقم {total_val:,.0f} روپے ہے۔"
+            else:
+                reply = f"The status of order {row.get('order_number')} is currently {status_en}. Total amount is PKR {total_val:,.0f}."
             return {
-                "reply": "برائے مہربانی اپنا آرڈر نمبر بتائیے جیسے کہ ORD-1001، تاکہ میں تفصیلات چیک کر سکوں۔",
-                "language": "ur",
+                "reply": reply,
+                "language": "ur" if is_urdu else "en",
                 "intent": "order_status",
-                "outcome": "Inquiry",
+                "outcome": "Resolved",
+                "needs_handoff": False,
                 "confidence": 1.0,
             }
-        return {
-            "reply": "Please share your order number, for example ORD-1001, so I can look up your delivery status.",
-            "language": "en",
-            "intent": "order_status",
-            "outcome": "Inquiry",
-            "confidence": 1.0,
-        }
+    except Exception as exc:
+        log.warning("Order lookup error: %r", exc)
     return None
-
-
-async def get_stream_system_instruction(user_id: int | None = None) -> str:
-    """Retrieve cached stream system instruction or rebuild in parallel with asyncio.gather."""
-    if user_id in CACHED_STREAM_SYSTEM_INSTRUCTION:
-        return CACHED_STREAM_SYSTEM_INSTRUCTION[user_id]
-
-    async def _get_faqs():
-        if user_id in CACHED_FAQS:
-            return CACHED_FAQS[user_id]
-        faqs = await asyncio.to_thread(load_faqs_context, user_id)
-        CACHED_FAQS[user_id] = faqs
-        return faqs
-
-    async def _get_prods():
-        if user_id in CACHED_PRODUCTS:
-            return CACHED_PRODUCTS[user_id]
-        prods = await asyncio.to_thread(load_products_context, user_id)
-        CACHED_PRODUCTS[user_id] = prods
-        return prods
-
-    faq_ctx, prod_ctx = await asyncio.gather(_get_faqs(), _get_prods())
-
-    b_name = get_business_setting("business_name", "our business")
-    b_type = get_business_setting("business_type", "Products & Services")
-    instruction = f"""You are the automated AI Calling Assistant for {b_name} ({b_type}) speaking live on a phone call.
-KNOWLEDGE BASE:
-1. Operational FAQs:
-{faq_ctx}
-
-2. Product Catalog:
-{prod_ctx}
-
-CRITICAL RULES:
-1. Spoken voice response: First, output ONLY the plain conversational spoken reply (maximum 1 to 2 short sentences, natural spoken style).
-2. DO NOT include markdown asterisks (*), hashtags (#), bullet points, emojis, or lists in the spoken reply.
-3. Immediately on a new line after the spoken text, output EXACTLY the separator "###META###" followed on the next line by a single-line JSON metadata object:
-###META###
-{{"intent": "<greeting|faq_inquiry|product_inquiry|order_status|place_order|support|unknown>", "confidence": 0.95, "outcome": "<Resolved|Transferred|Inquiry>", "needs_handoff": false, "language": "en", "quantity": null, "item_id": null}}
-4. If the user speaks Urdu or Roman Urdu, reply spoken text in clear conversational Urdu and set "language": "ur".
-5. If the caller asks for a human agent or has an unresolvable complaint, set "needs_handoff": true and outcome "Transferred".
-"""
-    CACHED_STREAM_SYSTEM_INSTRUCTION[user_id] = instruction
-    return instruction
 
 
 def check_instant_fast_path(text: str, session_id: str, user_id: int | None = None) -> dict | None:
@@ -2554,18 +2282,16 @@ def check_instant_fast_path(text: str, session_id: str, user_id: int | None = No
         trigger_type = "emergency_legal_dispute" if is_urgent else ("complaint_escalation" if is_complaint else "human_agent_request")
         reason = f"User triggered human escalation: {clean[:100]}"
         try:
-            with db() as conn:
-                create_or_update_handoff_request(
-                    conn=conn,
-                    session_id=session_id,
-                    user_id=user_id,
-                    trigger_type=trigger_type,
-                    reason=reason,
-                    priority=priority,
-                    language="ur" if is_urdu else "en",
-                    last_user_message=text,
-                    summary=f"Caller requested human assistance ({priority} priority).",
-                )
+            create_or_update_handoff_request(
+                session_id=session_id,
+                user_id=user_id,
+                trigger_type=trigger_type,
+                reason=reason,
+                priority=priority,
+                language="ur" if is_urdu else "en",
+                last_user_message=text,
+                summary=f"Caller requested human assistance ({priority} priority).",
+            )
         except Exception as e:
             log.warning("Handoff record error: %r", e)
 
@@ -2603,116 +2329,78 @@ def check_instant_fast_path(text: str, session_id: str, user_id: int | None = No
         digits = m.group(1) if m else None
         order_num = f"ORD-{digits}" if digits else None
         try:
-            with db() as conn:
-                order_row = None
-                if order_num:
-                    order_row = conn.execute("SELECT * FROM orders WHERE order_number = ?", (order_num,)).fetchone()
-                elif user_id:
-                    order_row = conn.execute("SELECT * FROM orders WHERE user_id = ? ORDER BY id DESC LIMIT 1", (user_id,)).fetchone()
-                else:
-                    order_row = conn.execute("SELECT * FROM orders ORDER BY id DESC LIMIT 1").fetchone()
+            order_row = None
+            if order_num:
+                order_row = mongo_db["orders"].find_one({"order_number": order_num})
+            elif user_id:
+                order_row = mongo_db["orders"].find_one({"user_id": user_id}, sort=[("id", -1)])
+            else:
+                order_row = mongo_db["orders"].find_one({}, sort=[("id", -1)])
 
-                if order_row:
-                    o_num = order_row["order_number"]
-                    st = order_row["status"]
-                    if order_row["is_locked"] or st in LOCKED_ORDER_STATUSES:
-                        if is_urdu:
-                            reply = f"آرڈر نمبر {o_num} پہلے ہی {st} ہے اور اسے منسوخ نہیں کیا جا سکتا۔"
-                        else:
-                            reply = f"Order #{o_num} is already {st.replace('_', ' ')} and cannot be cancelled."
-                    elif st == "cancel_requested":
-                        if is_urdu:
-                            reply = f"آرڈر نمبر {o_num} کی منسوخی کی درخواست پہلے ہی ایڈمن کے پاس زیرِ جائزہ ہے۔"
-                        else:
-                            reply = f"A cancellation request for order #{o_num} is already pending admin review."
+            if order_row:
+                o_num = order_row.get("order_number")
+                st = order_row.get("status")
+                if order_row.get("is_locked") or st in LOCKED_ORDER_STATUSES:
+                    if is_urdu:
+                        reply = f"آرڈر نمبر {o_num} پہلے ہی {st} ہے اور اسے منسوخ نہیں کیا جا سکتا۔"
                     else:
-                        validate_and_apply_order_transition(
-                            conn=conn,
-                            order_id=order_row["id"],
-                            target_status="cancel_requested",
-                            actor_user_id=user_id,
-                            actor_role="customer",
-                            note="Customer requested cancellation via voice call",
-                            event_type="cancel_requested",
-                        )
-                        if is_urdu:
-                            reply = f"آپ کے آرڈر نمبر {o_num} کی منسوخی کی درخواست جمع کر دی گئی ہے اور ایڈمن کی منظوری کی منتظر ہے۔"
-                        else:
-                            reply = f"A cancellation request for order #{o_num} has been submitted and is waiting for admin approval."
-                    return {
-                        "reply": reply,
-                        "language": "ur" if is_urdu else "en",
-                        "intent": "cancel_order",
-                        "outcome": "Resolved",
-                        "needs_handoff": False,
-                        "confidence": 1.0,
-                    }
+                        reply = f"Order #{o_num} is already {st.replace('_', ' ')} and cannot be cancelled."
+                elif st == "cancel_requested":
+                    if is_urdu:
+                        reply = f"آرڈر نمبر {o_num} کی منسوخی کی درخواست پہلے ہی ایڈمن کے پاس زیرِ جائزہ ہے۔"
+                    else:
+                        reply = f"A cancellation request for order #{o_num} is already pending admin review."
+                else:
+                    validate_and_apply_order_transition(
+                        order_id=order_row.get("id"),
+                        target_status="cancel_requested",
+                        actor_user_id=user_id,
+                        actor_role="customer",
+                        note="Customer requested cancellation via voice call",
+                        event_type="cancel_requested",
+                    )
+                    if is_urdu:
+                        reply = f"آپ کے آرڈر نمبر {o_num} کی منسوخی کی درخواست جمع کر دی گئی ہے اور ایڈمن کی منظوری کی منتظر ہے۔"
+                    else:
+                        reply = f"A cancellation request for order #{o_num} has been submitted and is waiting for admin approval."
+                return {
+                    "reply": reply,
+                    "language": "ur" if is_urdu else "en",
+                    "intent": "cancel_order",
+                    "outcome": "Resolved",
+                    "needs_handoff": False,
+                    "confidence": 1.0,
+                }
         except Exception as exc:
-            log.warning("Voice order cancellation error: %r", exc)
+            log.warning("Fast path cancel order error: %r", exc)
 
-    order_res = lookup_order_status(text, user_id)
-    if order_res:
-        order_res["needs_handoff"] = False
-        return order_res
+    # 4. Check Order status direct match
+    order_status_result = lookup_order_status(text, user_id)
+    if order_status_result:
+        return order_status_result
 
-    # 4. Yes / No confirmations (checked before generic quantities)
-    confirm_words_en = {"yes", "yeah", "yep", "sure", "ok", "okay", "confirm", "proceed", "no", "nope", "cancel"}
-    confirm_words_ur = {"جی", "ہاں", "جی ہاں", "نہیں", "ٹھیک ہے", "ٹھیک", "بالکل", "کینسل", "theek", "haan", "jee", "nahi", "ہے"}
-    confirm_phrases = [
-        "theek hai", "confirm karo", "confirm it", "yes confirm", "no cancel", "cancel that",
-        "جی بالکل ٹھیک", "جی بالکل ٹھیک ہے", "ٹھیک ہے", "بالکل ٹھیک", "بالکل ٹھیک ہے", "جی ہاں", "جی بالکل"
-    ]
-    clean_no_punc = re.sub(r"[^\w\s\u0600-\u06FF]", "", clean).strip()
-    words_no_punc = set(clean_no_punc.split())
-
-    is_pure_confirm = (
-        clean_no_punc in confirm_words_en
-        or clean_no_punc in confirm_words_ur
-        or clean_no_punc in confirm_phrases
-        or (word_count <= 4 and clean_no_punc.startswith(("yes ", "no ", "sure ", "theek hai", "confirm ")))
-        or (word_count <= 4 and words_no_punc.issubset(confirm_words_en | confirm_words_ur))
-    )
-    if is_pure_confirm:
-        if any(w in ["no", "nope", "cancel", "نہیں"] for w in words):
-            reply = "کوئی مسئلہ نہیں، یہ کینسل کر دیا گیا ہے۔ کیا آپ کو مزید کچھ درکار ہے؟" if is_urdu else "No problem at all, I have cancelled that. How else can I assist you?"
-        else:
-            reply = "جی سمجھ گئی، بتائیے مزید کیا معلومات درکار ہیں؟" if is_urdu else "Understood. How would you like to proceed?"
+    # 5. Greetings
+    greeting_keywords = ["hello", "hi", "hey", "good morning", "good afternoon", "good evening", "salam", "assalam", "aoa", "slam", "اسلام علیکم", "سلام"]
+    if any(k in clean for k in greeting_keywords) and word_count <= 6:
+        default_greeting_en = f"Hello! Welcome to {b_name} automated customer assistance. How may I assist you with our catalog and services today?"
+        greeting_en = get_business_setting("greeting", default_greeting_en)
+        greeting_ur = f"اسلام علیکم! {b_name} میں خوش آمدید۔ آج میں آپ کی کیا مدد کر سکتی ہوں؟"
         return {
-            "reply": reply,
+            "reply": greeting_ur if is_urdu else greeting_en,
             "language": "ur" if is_urdu else "en",
-            "intent": "confirmation",
+            "intent": "greeting",
             "outcome": "Resolved",
             "needs_handoff": False,
             "confidence": 1.0,
         }
 
-    # 5. Quantity verification steps
-    if word_count <= 4:
-        qty = parse_quantity(text)
-        if qty is not None:
-            if is_urdu:
-                reply = f"میں نے {qty} عدد نوٹ کر لیے ہیں۔ کیا آپ اس آرڈر کی تصدیق کرنا چاہتے ہیں؟"
-            else:
-                reply = f"I have noted {qty} units. Would you like me to confirm this item for your order?"
-            return {
-                "reply": reply,
-                "language": "ur" if is_urdu else "en",
-                "intent": "quantity_verification",
-                "outcome": "Inquiry",
-                "needs_handoff": False,
-                "confidence": 1.0,
-                "quantity": qty,
-            }
-
-    # 6. Thank you / Bye
-    farewell_words = {"bye", "goodbye", "thanks", "thank", "shukriya", "jazakallah", "allah hafiz", "khuda hafiz", "شکریہ", "اللہ حافظ", "خدا حافظ"}
-    if any(w in clean for w in farewell_words) and word_count <= 6:
-        if is_urdu:
-            reply = f"{b_name} پر رابطہ کرنے کا بہت شکریہ۔ اپنا خیال رکھیے گا، اللہ حافظ!"
-        else:
-            reply = f"Thank you for contacting {b_name}. Have a wonderful day ahead! Goodbye."
+    # 6. Farewells
+    farewell_keywords = ["bye", "goodbye", "good bye", "see you", "take care", "allah hafiz", "khuda hafiz", "shukriya", "thanks", "thank you", "الله حافظ", "خدا حافظ", "شکریہ"]
+    if any(k in clean for k in farewell_keywords) and word_count <= 6:
+        farewell_en = f"Thank you for contacting {b_name}. Have a wonderful day ahead! Goodbye."
+        farewell_ur = f"{b_name} سے رابطہ کرنے کا بہت شکریہ۔ اپنا خیال رکھیے گا، اللہ حافظ!"
         return {
-            "reply": reply,
+            "reply": farewell_ur if is_urdu else farewell_en,
             "language": "ur" if is_urdu else "en",
             "intent": "farewell",
             "outcome": "Resolved",
@@ -2720,57 +2408,59 @@ def check_instant_fast_path(text: str, session_id: str, user_id: int | None = No
             "confidence": 1.0,
         }
 
-    # 7. Greetings
-    greeting_words = {"hi", "hello", "hey", "salam", "assalam", "aoa", "adaab", "صبح بخیر"}
-    greeting_phrases = ["اسلام علیکم", "السلام علیکم", "salam", "assalam", "hello", "hi there", "good morning"]
-    if (any(w in words for w in greeting_words) or any(p in clean_no_punc for p in greeting_phrases)) and word_count <= 8:
-        if is_urdu:
-            reply = f"اسلام علیکم! {b_name} میں خوش آمدید۔ میں آپ کی کیا مدد کر سکتی ہوں؟"
-        else:
-            default_greet = f"Hello! Welcome to {b_name} automated customer assistance. How may I assist you today?"
-            reply = get_business_setting("greeting", default_greet)
+    # 7. Affirmations / Confirmations
+    confirm_words = ["yes", "yeah", "yep", "sure", "ok", "okay", "theek", "theek hai", "haan", "jee", "ji", "confirm", "confirm karo", "جی", "ہاں", "ٹھیک ہے", "بالکل"]
+    negate_words = ["no", "nah", "cancel", "nahi", "na", "mat karo", "نہ", "نہیں", "کینسل"]
+    if clean in confirm_words:
+        reply_en = "Confirmed. I have noted that. What item or service would you like to proceed with?"
+        reply_ur = "جی بالکل، میں نے نوٹ کر لیا ہے۔ بتائیے کہ آپ کس چیز کا آرڈر دینا چاہتے ہیں؟"
         return {
-            "reply": reply,
+            "reply": reply_ur if is_urdu else reply_en,
             "language": "ur" if is_urdu else "en",
-            "intent": "greeting",
+            "intent": "confirmation",
+            "confirmed": True,
             "outcome": "Resolved",
             "needs_handoff": False,
             "confidence": 1.0,
         }
+    if clean in negate_words:
+        reply_en = "Understood. The action has been cancelled. How else can I assist you today?"
+        reply_ur = "سمجھ گئی، کارروائی منسوخ کر دی گئی ہے۔ بتائیے میں مزید کیا مدد کر سکتی ہوں؟"
         return {
-            "reply": reply,
+            "reply": reply_ur if is_urdu else reply_en,
             "language": "ur" if is_urdu else "en",
-            "intent": "greeting",
-            "outcome": "Resolved",
-            "needs_handoff": False,
-            "confidence": 1.0,
-        }
-
-    # 8. In-memory repeated FAQ cache
-    norm_query = re.sub(r"[^\w\s\u0600-\u06FF]", "", clean).strip()
-    if norm_query in CACHED_FAQ_ANSWERS:
-        cached = CACHED_FAQ_ANSWERS[norm_query]
-        return {
-            "reply": cached["answer"],
-            "language": "ur" if is_urdu else "en",
-            "intent": cached.get("intent", "faq_inquiry"),
+            "intent": "confirmation",
+            "confirmed": False,
             "outcome": "Resolved",
             "needs_handoff": False,
             "confidence": 1.0,
         }
 
-    # 9. Knowledge fast match (from check_fast_knowledge_response)
-    fast_match = check_fast_knowledge_response(text, user_id)
-    if fast_match:
-        if fast_match.get("type") == "faq" and norm_query:
-            CACHED_FAQ_ANSWERS[norm_query] = {"answer": fast_match["answer"], "intent": fast_match.get("intent", "faq_inquiry")}
+    # 8. Numeric Quantity Verification
+    qty = parse_quantity(text)
+    if qty is not None and word_count <= 4:
+        reply_en = f"I have noted {qty} units. Would you like me to submit this order request for administrator confirmation?"
+        reply_ur = f"میں نے {qty} عدد نوٹ کر لیے ہیں۔ کیا میں یہ آرڈر ایڈمن کی تصدیق کے لیے جمع کر دوں؟"
         return {
-            "reply": fast_match["answer"],
+            "reply": reply_ur if is_urdu else reply_en,
             "language": "ur" if is_urdu else "en",
-            "intent": fast_match.get("intent", "general_inquiry"),
+            "intent": "quantity_verification",
+            "quantity": qty,
             "outcome": "Resolved",
             "needs_handoff": False,
             "confidence": 1.0,
+        }
+
+    # 9. Fast Knowledge Base & FAQ Check
+    fast_kb = check_fast_knowledge_response(text, user_id)
+    if fast_kb:
+        return {
+            "reply": fast_kb["answer"],
+            "language": "ur" if is_urdu else "en",
+            "intent": fast_kb.get("intent", "faq_inquiry"),
+            "outcome": "Resolved",
+            "needs_handoff": False,
+            "confidence": 0.95,
         }
 
     return None
@@ -2869,6 +2559,50 @@ class StreamingSentenceEmitter:
         return " ".join(self.collected_spoken)
 
 
+async def get_stream_system_instruction(user_id: int | None = None) -> str:
+    """Retrieve cached stream system instruction or rebuild in parallel with asyncio.gather."""
+    if user_id in CACHED_STREAM_SYSTEM_INSTRUCTION:
+        return CACHED_STREAM_SYSTEM_INSTRUCTION[user_id]
+
+    async def _get_faqs():
+        if user_id in CACHED_FAQS:
+            return CACHED_FAQS[user_id]
+        faqs = await asyncio.to_thread(load_faqs_context, user_id)
+        CACHED_FAQS[user_id] = faqs
+        return faqs
+
+    async def _get_prods():
+        if user_id in CACHED_PRODUCTS:
+            return CACHED_PRODUCTS[user_id]
+        prods = await asyncio.to_thread(load_products_context, user_id)
+        CACHED_PRODUCTS[user_id] = prods
+        return prods
+
+    faq_ctx, prod_ctx = await asyncio.gather(_get_faqs(), _get_prods())
+
+    b_name = get_business_setting("business_name", "our business")
+    b_type = get_business_setting("business_type", "Products & Services")
+    instruction = f"""You are the automated AI Calling Assistant for {b_name} ({b_type}) speaking live on a phone call.
+KNOWLEDGE BASE:
+1. Operational FAQs:
+{faq_ctx}
+
+2. Product Catalog:
+{prod_ctx}
+
+CRITICAL RULES:
+1. Spoken voice response: First, output ONLY the plain conversational spoken reply (maximum 1 to 2 short sentences, natural spoken style).
+2. DO NOT include markdown asterisks (*), hashtags (#), bullet points, emojis, or lists in the spoken reply.
+3. Immediately on a new line after the spoken text, output EXACTLY the separator "###META###" followed on the next line by a single-line JSON metadata object:
+###META###
+{{"intent": "<greeting|faq_inquiry|product_inquiry|order_status|place_order|support|unknown>", "confidence": 0.95, "outcome": "<Resolved|Transferred|Inquiry>", "needs_handoff": false, "language": "en", "quantity": null, "item_id": null}}
+4. If the user speaks Urdu or Roman Urdu, reply spoken text in clear conversational Urdu and set "language": "ur".
+5. If the caller asks for a human agent or has an unresolvable complaint, set "needs_handoff": true and outcome "Transferred".
+"""
+    CACHED_STREAM_SYSTEM_INSTRUCTION[user_id] = instruction
+    return instruction
+
+
 def build_voice_system_instruction(user_id: int | None = None) -> str:
     """Build concise, conversational instructions tailored for low-latency live voice calls."""
     b_name = get_business_setting("business_name", "our business")
@@ -2916,7 +2650,7 @@ async def stream_gemini_voice_tokens(session_id: str, user_text: str, user_id: i
                 if not key_manager.client:
                     raise RuntimeError("GEMINI_API_KEY is not configured.")
 
-            contents: list[types.Content] = []
+            contents: list[Any] = []
             for turn in history_turns:
                 role = "user" if turn.get("role") == "user" else "model"
                 parts = turn.get("parts", [""])
@@ -2993,13 +2727,9 @@ async def websocket_ai_call_endpoint(websocket: WebSocket):
     if token:
         payload = decode_access_token(token)
         if payload and payload.get("sub"):
-            with db() as conn:
-                row = conn.execute(
-                    "SELECT id, email, full_name, role, is_active FROM users WHERE id = ?",
-                    (payload["sub"],),
-                ).fetchone()
-                if row and row["is_active"]:
-                    opt_user = dict(row)
+            row = mongo_db["users"].find_one(make_id_query(payload["sub"]))
+            if row and row.get("is_active"):
+                opt_user = serialize_doc(row)
     user_id = opt_user["id"] if opt_user else None
 
     # Track active streaming task to support graceful client interruption
@@ -3451,18 +3181,23 @@ class HandoffRequest(BaseModel):
 
 @app.post("/api/handoff")
 async def handoff_endpoint(req: HandoffRequest, request: Request):
-    """Register a human-agent handoff request."""
+    """Register a human-agent handoff request in MongoDB Atlas."""
     user = await get_optional_user(request)
     user_id = user["id"] if user else None
-    with db() as conn:
-        cursor = conn.execute(
-            """
-            INSERT INTO handoff_requests (session_id, user_id, trigger_type, reason, created_at, status)
-            VALUES (?, ?, ?, ?, ?, 'pending')
-            """,
-            (req.session_id, user_id, req.trigger_type, req.reason or "Live agent escalation", now()),
-        )
-        handoff_id = cursor.lastrowid
+    call = mongo_db["calls"].find_one({"session_id": req.session_id})
+    call_id = call.get("id") if call else None
+    handoff_id = get_next_sequence_value("handoff_requests")
+    mongo_db["handoff_requests"].insert_one({
+        "id": handoff_id,
+        "call_id": call_id,
+        "session_id": req.session_id,
+        "user_id": user_id,
+        "trigger_type": req.trigger_type,
+        "reason": req.reason or "Live agent escalation",
+        "priority": "normal",
+        "created_at": now(),
+        "status": "pending",
+    })
     return {"ok": True, "handoff_id": handoff_id, "message": "Handoff request registered."}
 
 
@@ -3517,32 +3252,25 @@ async def tts_endpoint(req: TTSRequest):
 # =====================================================================
 @app.get("/api/faqs")
 async def get_faq_chips(request: Request, limit: int = Query(default=18, ge=1, le=50)):
-    """Return top suggested questions as quick-click slider chips."""
+    """Return top suggested questions as quick-click slider chips from MongoDB."""
     user = await get_optional_user(request)
 
     def query():
-        with db() as conn:
-            if user and user["role"] == "admin":
-                rows = conn.execute("SELECT question, intent FROM faqs ORDER BY id ASC LIMIT ?", (limit,)).fetchall()
-            elif user:
-                rows = conn.execute(
-                    """
-                    SELECT question, intent FROM faqs
-                    WHERE user_id IS NULL OR user_id IN (SELECT id FROM users WHERE role = 'admin') OR user_id = ?
-                    ORDER BY id ASC LIMIT ?
-                    """,
-                    (user["id"], limit),
-                ).fetchall()
-            else:
-                rows = conn.execute(
-                    """
-                    SELECT question, intent FROM faqs
-                    WHERE user_id IS NULL OR user_id IN (SELECT id FROM users WHERE role = 'admin')
-                    ORDER BY id ASC LIMIT ?
-                    """,
-                    (limit,),
-                ).fetchall()
-            return [{"question": r["question"], "intent": r["intent"]} for r in rows]
+        if user and user.get("role") == "admin":
+            rows = list(mongo_db["faqs"].find({}, {"question": 1, "intent": 1}).sort("id", 1).limit(limit))
+        elif user:
+            admin_ids = [u["id"] for u in mongo_db["users"].find({"role": "admin"}, {"id": 1})]
+            rows = list(mongo_db["faqs"].find(
+                {"$or": [{"user_id": None}, {"user_id": {"$in": admin_ids}}, {"user_id": user["id"]}]},
+                {"question": 1, "intent": 1}
+            ).sort("id", 1).limit(limit))
+        else:
+            admin_ids = [u["id"] for u in mongo_db["users"].find({"role": "admin"}, {"id": 1})]
+            rows = list(mongo_db["faqs"].find(
+                {"$or": [{"user_id": None}, {"user_id": {"$in": admin_ids}}]},
+                {"question": 1, "intent": 1}
+            ).sort("id", 1).limit(limit))
+        return [{"question": r.get("question"), "intent": r.get("intent")} for r in rows]
 
     return {"questions": await asyncio.to_thread(query)}
 
@@ -3551,17 +3279,20 @@ async def get_faq_chips(request: Request, limit: int = Query(default=18, ge=1, l
 async def get_all_faqs(admin: dict = Depends(require_admin)):
     """Return FAQs: accessible only to Administrators."""
     def query():
-        with db() as conn:
-            rows = conn.execute(
-                """
-                SELECT f.id, f.intent, f.question, f.answer, f.user_id,
-                       COALESCE(u.full_name, 'Platform') AS owner_name, u.email AS owner_email
-                FROM faqs f
-                LEFT JOIN users u ON f.user_id = u.id
-                ORDER BY f.id ASC
-                """
-            ).fetchall()
-            return [dict(r) for r in rows]
+        rows = list(mongo_db["faqs"].find().sort("id", 1))
+        out = []
+        for r in rows:
+            d = serialize_doc(r)
+            uid = d.get("user_id")
+            if uid:
+                u = mongo_db["users"].find_one(make_id_query(uid))
+                d["owner_name"] = u.get("full_name", "Platform") if u else "Platform"
+                d["owner_email"] = u.get("email") if u else None
+            else:
+                d["owner_name"] = "Platform"
+                d["owner_email"] = None
+            out.append(d)
+        return out
 
     return await asyncio.to_thread(query)
 
@@ -3572,19 +3303,16 @@ async def create_faq(faq: FAQCreate, admin: dict = Depends(require_admin)):
     user_id = admin["id"]
 
     def query():
-        with db() as conn:
-            max_id = conn.execute("SELECT COALESCE(MAX(id), 0) FROM faqs").fetchone()[0]
-            conn.execute("DELETE FROM sqlite_sequence WHERE name = 'faqs'")
-            conn.execute("INSERT INTO sqlite_sequence (name, seq) VALUES ('faqs', ?)", (max_id,))
-            cursor = conn.execute(
-                "INSERT INTO faqs (intent, question, answer, user_id) VALUES (?, ?, ?, ?)",
-                (faq.intent.strip(), faq.question.strip(), faq.answer.strip(), user_id),
-            )
-            row = conn.execute(
-                "SELECT id, intent, question, answer, user_id FROM faqs WHERE id = ?",
-                (cursor.lastrowid,),
-            ).fetchone()
-            return dict(row)
+        new_id = get_next_sequence_value("faqs")
+        doc = {
+            "id": new_id,
+            "intent": faq.intent.strip(),
+            "question": faq.question.strip(),
+            "answer": faq.answer.strip(),
+            "user_id": user_id,
+        }
+        mongo_db["faqs"].insert_one(doc)
+        return serialize_doc(doc)
 
     res = await asyncio.to_thread(query)
     try:
@@ -3598,19 +3326,20 @@ async def create_faq(faq: FAQCreate, admin: dict = Depends(require_admin)):
 async def update_faq(faq_id: int, faq: FAQUpdate, admin: dict = Depends(require_admin)):
     """Update FAQ entry in platform knowledge base (Admin only)."""
     def query():
-        with db() as conn:
-            existing = conn.execute("SELECT id, user_id FROM faqs WHERE id = ?", (faq_id,)).fetchone()
-            if not existing:
-                return 404
+        existing = mongo_db["faqs"].find_one(make_id_query(faq_id))
+        if not existing:
+            return 404
 
-            conn.execute(
-                "UPDATE faqs SET intent = ?, question = ?, answer = ? WHERE id = ?",
-                (faq.intent.strip(), faq.question.strip(), faq.answer.strip(), faq_id),
-            )
-            row = conn.execute(
-                "SELECT id, intent, question, answer, user_id FROM faqs WHERE id = ?", (faq_id,)
-            ).fetchone()
-            return dict(row)
+        mongo_db["faqs"].update_one(
+            {"_id": existing["_id"]},
+            {"$set": {
+                "intent": faq.intent.strip(),
+                "question": faq.question.strip(),
+                "answer": faq.answer.strip(),
+            }}
+        )
+        updated = mongo_db["faqs"].find_one({"_id": existing["_id"]})
+        return serialize_doc(updated)
 
     result = await asyncio.to_thread(query)
     if result == 404:
@@ -3625,21 +3354,17 @@ async def update_faq(faq_id: int, faq: FAQUpdate, admin: dict = Depends(require_
 
 @app.delete("/api/faqs/{faq_id}", status_code=204)
 async def delete_faq(faq_id: int, admin: dict = Depends(require_admin)):
-    """Delete FAQ entry and re-sequence database IDs (Admin only)."""
+    """Delete FAQ entry from MongoDB (Admin only)."""
     def query():
-        with db() as conn:
-            existing = conn.execute("SELECT id, user_id FROM faqs WHERE id = ?", (int(faq_id),)).fetchone()
-            if not existing:
-                return 404
-            conn.execute("DELETE FROM faqs WHERE id = ?", (int(faq_id),))
-            resequence_table(conn, "faqs")
-            return 204
+        existing = mongo_db["faqs"].find_one(make_id_query(faq_id))
+        if not existing:
+            return 404
+        mongo_db["faqs"].delete_one({"_id": existing["_id"]})
+        return 204
 
     code = await asyncio.to_thread(query)
     if code == 404:
         raise HTTPException(status_code=404, detail="FAQ not found.")
-    if code == 403:
-        raise HTTPException(status_code=403, detail="You do not have permission to delete this FAQ.")
 
     try:
         refresh_knowledge_base()
@@ -3658,32 +3383,30 @@ async def get_products(request: Request, category: str | None = Query(default=No
     user = await get_optional_user(request)
 
     def query():
-        with db() as conn:
-            params = []
-            where_clauses = []
+        query_filter = {}
+        if not user:
+            admin_ids = [u["id"] for u in mongo_db["users"].find({"role": "admin"}, {"id": 1})]
+            query_filter["$or"] = [{"user_id": None}, {"user_id": {"$in": admin_ids}}]
+        elif user.get("role") != "admin":
+            admin_ids = [u["id"] for u in mongo_db["users"].find({"role": "admin"}, {"id": 1})]
+            query_filter["$or"] = [{"user_id": None}, {"user_id": {"$in": admin_ids}}, {"user_id": user["id"]}]
 
-            if not user:
-                where_clauses.append("(p.user_id IS NULL OR p.user_id IN (SELECT id FROM users WHERE role = 'admin'))")
-            elif user["role"] != "admin":
-                where_clauses.append("(p.user_id IS NULL OR p.user_id IN (SELECT id FROM users WHERE role = 'admin') OR p.user_id = ?)")
-                params.append(user["id"])
+        if category and category.strip():
+            query_filter["category"] = {"$regex": f"^{re.escape(category.strip())}$", "$options": "i"}
 
-            if category and category.strip():
-                where_clauses.append("LOWER(p.category) = LOWER(?)")
-                params.append(category.strip())
-
-            where_sql = f"WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
-            query_sql = f"""
-                SELECT p.id, p.name, p.category, p.brand, p.price, p.stock_status, p.description,
-                       COALESCE(p.item_type, 'product') AS item_type, p.user_id,
-                       COALESCE(u.full_name, 'Platform') AS owner_name
-                FROM products p
-                LEFT JOIN users u ON p.user_id = u.id
-                {where_sql}
-                ORDER BY p.id ASC
-            """
-            rows = conn.execute(query_sql, params).fetchall()
-            return [dict(r) for r in rows]
+        rows = list(mongo_db["products"].find(query_filter).sort("id", 1))
+        out = []
+        for r in rows:
+            d = serialize_doc(r)
+            uid = d.get("user_id")
+            if uid:
+                u = mongo_db["users"].find_one(make_id_query(uid))
+                d["owner_name"] = u.get("full_name", "Platform") if u else "Platform"
+            else:
+                d["owner_name"] = "Platform"
+            d["item_type"] = d.get("item_type") or "product"
+            out.append(d)
+        return out
 
     return await asyncio.to_thread(query)
 
@@ -3694,30 +3417,21 @@ async def create_product(product: ProductCreate, current_user: dict = Depends(ge
     user_id = current_user["id"]
 
     def query():
-        with db() as conn:
-            # Sync sequence to current max(id) so new insertion gets max(id) + 1
-            max_id = conn.execute("SELECT COALESCE(MAX(id), 0) FROM products").fetchone()[0]
-            conn.execute("DELETE FROM sqlite_sequence WHERE name = 'products'")
-            conn.execute("INSERT INTO sqlite_sequence (name, seq) VALUES ('products', ?)", (max_id,))
-            item_type = getattr(product, "item_type", "product") or "product"
-            cursor = conn.execute(
-                "INSERT INTO products (name, category, brand, price, stock_status, description, item_type, user_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                (
-                    product.name.strip(),
-                    product.category.strip(),
-                    product.brand.strip(),
-                    product.price,
-                    product.stock_status.strip(),
-                    product.description.strip(),
-                    item_type,
-                    user_id,
-                ),
-            )
-            row = conn.execute(
-                "SELECT id, name, category, brand, price, stock_status, description, item_type, user_id FROM products WHERE id = ?",
-                (cursor.lastrowid,),
-            ).fetchone()
-            return dict(row)
+        new_id = get_next_sequence_value("products")
+        item_type = getattr(product, "item_type", "product") or "product"
+        doc = {
+            "id": new_id,
+            "name": product.name.strip(),
+            "category": product.category.strip(),
+            "brand": product.brand.strip(),
+            "price": product.price,
+            "stock_status": product.stock_status.strip(),
+            "description": product.description.strip(),
+            "item_type": item_type,
+            "user_id": user_id,
+        }
+        mongo_db["products"].insert_one(doc)
+        return serialize_doc(doc)
 
     res = await asyncio.to_thread(query)
     try:
@@ -3731,32 +3445,25 @@ async def create_product(product: ProductCreate, current_user: dict = Depends(ge
 async def update_product(product_id: int, product: ProductUpdate, current_user: dict = Depends(get_current_user)):
     """Update product: users can only update their own; Admins can update any."""
     def query():
-        with db() as conn:
-            existing = conn.execute("SELECT id, user_id FROM products WHERE id = ?", (int(product_id),)).fetchone()
-            if not existing:
-                return 404
-            if current_user["role"] != "admin" and existing["user_id"] != current_user["id"]:
-                return 403
+        existing = mongo_db["products"].find_one(make_id_query(product_id))
+        if not existing:
+            return 404
+        if current_user["role"] != "admin" and existing.get("user_id") != current_user["id"]:
+            return 403
 
-            item_type = getattr(product, "item_type", "product") or "product"
-            conn.execute(
-                "UPDATE products SET name = ?, category = ?, brand = ?, price = ?, stock_status = ?, description = ?, item_type = ? WHERE id = ?",
-                (
-                    product.name.strip(),
-                    product.category.strip(),
-                    product.brand.strip(),
-                    product.price,
-                    product.stock_status.strip(),
-                    product.description.strip(),
-                    item_type,
-                    int(product_id),
-                ),
-            )
-            row = conn.execute(
-                "SELECT id, name, category, brand, price, stock_status, description, item_type, user_id FROM products WHERE id = ?",
-                (int(product_id),),
-            ).fetchone()
-            return dict(row)
+        item_type = getattr(product, "item_type", "product") or "product"
+        update_fields = {
+            "name": product.name.strip(),
+            "category": product.category.strip(),
+            "brand": product.brand.strip(),
+            "price": product.price,
+            "stock_status": product.stock_status.strip(),
+            "description": product.description.strip(),
+            "item_type": item_type,
+        }
+        mongo_db["products"].update_one({"_id": existing["_id"]}, {"$set": update_fields})
+        updated = mongo_db["products"].find_one({"_id": existing["_id"]})
+        return serialize_doc(updated)
 
     result = await asyncio.to_thread(query)
     if result == 404:
@@ -3773,17 +3480,15 @@ async def update_product(product_id: int, product: ProductUpdate, current_user: 
 
 @app.delete("/api/products/{product_id}", status_code=204)
 async def delete_product(product_id: int, current_user: dict = Depends(get_current_user)):
-    """Delete product and re-sequence database IDs so sequence remains contiguous."""
+    """Delete product from MongoDB Atlas."""
     def query():
-        with db() as conn:
-            existing = conn.execute("SELECT id, user_id FROM products WHERE id = ?", (int(product_id),)).fetchone()
-            if not existing:
-                return 404
-            if current_user["role"] != "admin" and existing["user_id"] != current_user["id"]:
-                return 403
-            conn.execute("DELETE FROM products WHERE id = ?", (int(product_id),))
-            resequence_table(conn, "products")
-            return 204
+        existing = mongo_db["products"].find_one(make_id_query(product_id))
+        if not existing:
+            return 404
+        if current_user["role"] != "admin" and existing.get("user_id") != current_user["id"]:
+            return 403
+        mongo_db["products"].delete_one({"_id": existing["_id"]})
+        return 204
 
     code = await asyncio.to_thread(query)
     if code == 404:
@@ -3807,54 +3512,33 @@ async def get_recent_calls(
     limit: int = Query(default=50, ge=1, le=100),
     target_user_id: int | None = Query(default=None),
 ):
-    """Return recent calls: Regular users strictly see their own; Admins can see all."""
+    """Return recent calls from MongoDB: Regular users strictly see their own; Admins can see all."""
     user = await get_optional_user(request)
 
     def query():
-        with db() as conn:
-            if user and user["role"] == "admin":
-                if target_user_id:
-                    rows = conn.execute(
-                        """
-                        SELECT c.session_id, c.started_at, c.last_activity, c.status, c.outcome, c.total_messages,
-                               u.full_name AS caller_name, u.email AS caller_email
-                        FROM calls c
-                        LEFT JOIN users u ON c.user_id = u.id
-                        WHERE c.user_id = ?
-                        ORDER BY c.id DESC LIMIT ?
-                        """,
-                        (target_user_id, limit),
-                    ).fetchall()
-                else:
-                    rows = conn.execute(
-                        """
-                        SELECT c.session_id, c.started_at, c.last_activity, c.status, c.outcome, c.total_messages,
-                               u.full_name AS caller_name, u.email AS caller_email
-                        FROM calls c
-                        LEFT JOIN users u ON c.user_id = u.id
-                        ORDER BY c.id DESC LIMIT ?
-                        """,
-                        (limit,),
-                    ).fetchall()
-            elif user:
-                # Regular authenticated user — strictly isolated to their own user_id
-                rows = conn.execute(
-                    """
-                    SELECT session_id, started_at, last_activity, status, outcome, total_messages
-                    FROM calls
-                    WHERE user_id = ?
-                    ORDER BY id DESC LIMIT ?
-                    """,
-                    (user["id"], limit),
-                ).fetchall()
-            else:
-                # Unauthenticated guest — return empty or recent guest calls without leak
-                rows = conn.execute(
-                    "SELECT session_id, started_at, last_activity, status, outcome, total_messages FROM calls WHERE user_id IS NULL ORDER BY id DESC LIMIT ?",
-                    (limit,),
-                ).fetchall()
+        query_filter = {}
+        if user and user.get("role") == "admin":
+            if target_user_id:
+                query_filter["user_id"] = target_user_id
+        elif user:
+            query_filter["user_id"] = user["id"]
+        else:
+            query_filter["user_id"] = None
 
-            return [dict(r) for r in rows]
+        rows = list(mongo_db["calls"].find(query_filter).sort("id", -1).limit(limit))
+        out = []
+        for r in rows:
+            d = serialize_doc(r)
+            uid = d.get("user_id")
+            if uid:
+                u = mongo_db["users"].find_one(make_id_query(uid))
+                d["caller_name"] = u.get("full_name") if u else None
+                d["caller_email"] = u.get("email") if u else None
+            else:
+                d["caller_name"] = None
+                d["caller_email"] = None
+            out.append(d)
+        return out
 
     return await asyncio.to_thread(query)
 
@@ -3868,21 +3552,16 @@ async def get_conversation_history(
     user = await get_optional_user(request)
 
     def query():
-        with db() as conn:
-            call = conn.execute("SELECT id, user_id FROM calls WHERE session_id = ?", (session_id,)).fetchone()
-            if not call:
-                return 404, []
+        call = mongo_db["calls"].find_one({"session_id": session_id})
+        if not call:
+            return 404, []
 
-            # OWASP A01: Prevent IDOR (Insecure Direct Object Reference)
-            if call["user_id"] is not None:
-                if not user or (user["role"] != "admin" and user["id"] != call["user_id"]):
-                    return 403, []
+        if call.get("user_id") is not None:
+            if not user or (user.get("role") != "admin" and user.get("id") != call.get("user_id")):
+                return 403, []
 
-            rows = conn.execute(
-                "SELECT id, timestamp, user_transcript, ai_response, detected_intent, outcome FROM call_messages WHERE call_id = ? ORDER BY id ASC",
-                (call["id"],),
-            ).fetchall()
-            return 200, [dict(r) for r in rows]
+        rows = list(mongo_db["call_messages"].find({"call_id": call.get("id")}).sort("id", 1))
+        return 200, serialize_docs(rows)
 
     status_code, data = await asyncio.to_thread(query)
     if status_code == 404:
@@ -3895,33 +3574,43 @@ async def get_conversation_history(
 
 @app.post("/api/calls/sync")
 async def sync_client_calls(req: SyncCallRequest, request: Request):
-    """Sync client-side recorded session logs into SQLite database with user binding."""
+    """Sync client-side recorded session logs into MongoDB database with user binding."""
     user = await get_optional_user(request)
     user_id = user["id"] if user else None
 
     def _sync():
-        with db() as conn:
-            # OWASP A01: Prevent IDOR - Verify session ownership if session exists
-            existing = conn.execute("SELECT id, user_id FROM calls WHERE session_id = ?", (req.session_id,)).fetchone()
-            if existing and existing["user_id"] is not None:
-                if user_id != existing["user_id"] and (not user or user.get("role") != "admin"):
-                    return {"status": "error", "detail": "Access denied. Cannot sync to another user's session."}
-            call_id = get_or_create_call(conn, req.session_id, user_id)
-            for m in req.messages:
-                exists = conn.execute(
-                    "SELECT 1 FROM call_messages WHERE call_id = ? AND timestamp = ? AND user_transcript = ?",
-                    (call_id, m.timestamp, m.user_transcript),
-                ).fetchone()
-                if not exists:
-                    conn.execute(
-                        "INSERT INTO call_messages (call_id, timestamp, user_transcript, ai_response, detected_intent, outcome) VALUES (?, ?, ?, ?, ?, ?)",
-                        (call_id, m.timestamp, m.user_transcript, m.ai_response, m.detected_intent, m.outcome),
-                    )
-            msg_count = conn.execute("SELECT COUNT(*) AS n FROM call_messages WHERE call_id = ?", (call_id,)).fetchone()["n"]
-            conn.execute(
-                "UPDATE calls SET last_activity = ?, total_messages = ?, outcome = ? WHERE id = ?",
-                (req.last_activity or now(), msg_count, req.outcome, call_id),
-            )
+        existing = mongo_db["calls"].find_one({"session_id": req.session_id})
+        if existing and existing.get("user_id") is not None:
+            if user_id != existing.get("user_id") and (not user or user.get("role") != "admin"):
+                return {"status": "error", "detail": "Access denied. Cannot sync to another user's session."}
+
+        call_id = get_or_create_call(req.session_id, user_id)
+        for m in req.messages:
+            exists = mongo_db["call_messages"].find_one({
+                "call_id": call_id,
+                "timestamp": m.timestamp,
+                "user_transcript": m.user_transcript,
+            })
+            if not exists:
+                msg_id = get_next_sequence_value("call_messages")
+                mongo_db["call_messages"].insert_one({
+                    "id": msg_id,
+                    "call_id": call_id,
+                    "timestamp": m.timestamp,
+                    "user_transcript": m.user_transcript,
+                    "ai_response": m.ai_response,
+                    "detected_intent": m.detected_intent,
+                    "outcome": m.outcome,
+                })
+        msg_count = mongo_db["call_messages"].count_documents({"call_id": call_id})
+        mongo_db["calls"].update_one(
+            {"id": call_id},
+            {"$set": {
+                "last_activity": req.last_activity or now(),
+                "total_messages": msg_count,
+                "outcome": req.outcome,
+            }},
+        )
         return {"status": "synced", "session_id": req.session_id}
 
     try:
@@ -3932,7 +3621,7 @@ async def sync_client_calls(req: SyncCallRequest, request: Request):
 
 
 # =====================================================================
-# 17. Business Settings Endpoints (Phase 4 Generic Store & Services)
+# 17B. Business Settings Endpoints (Phase 4 Generic Store & Services)
 # =====================================================================
 @app.get("/api/business-settings")
 async def get_business_settings_endpoint():
@@ -3947,15 +3636,12 @@ async def update_business_settings_endpoint(settings: BusinessSettingsUpdate, ad
         updates = {k: v for k, v in settings.model_dump().items() if v is not None}
         if not updates:
             return get_all_business_settings()
-        with db() as conn:
-            for k, v in updates.items():
-                conn.execute(
-                    """
-                    INSERT INTO business_settings (key, value) VALUES (?, ?)
-                    ON CONFLICT(key) DO UPDATE SET value = excluded.value
-                    """,
-                    (k, str(v)),
-                )
+        for k, v in updates.items():
+            mongo_db["business_settings"].update_one(
+                {"key": k},
+                {"$set": {"key": k, "value": str(v)}},
+                upsert=True,
+            )
         refresh_business_settings_cache()
         CACHED_STREAM_SYSTEM_INSTRUCTION.clear()
         return get_all_business_settings()
@@ -3969,60 +3655,72 @@ async def update_business_settings_endpoint(settings: BusinessSettingsUpdate, ad
 @app.post("/api/orders")
 async def create_order_endpoint(req: CreateOrderRequest, request: Request):
     """
-    Create a new order / appointment booking.
+    Create a new order / appointment booking in MongoDB Atlas.
     Order is ALWAYS created with status='pending_admin_confirmation'.
     """
     user = await get_optional_user(request)
     user_id = user["id"] if user else None
 
     def _create():
-        with db() as conn:
-            prod = conn.execute("SELECT * FROM products WHERE id = ?", (req.item_id,)).fetchone()
-            if not prod:
-                raise HTTPException(status_code=404, detail="Item not found.")
+        prod = mongo_db["products"].find_one(make_id_query(req.item_id))
+        if not prod:
+            raise HTTPException(status_code=404, detail="Item not found.")
 
-            c_name = req.customer_name or (user["full_name"] if user else "Customer")
-            c_phone = req.customer_phone or (user["phone"] if user else "")
+        c_name = req.customer_name or (user["full_name"] if user else "Customer")
+        c_phone = req.customer_phone or (user["phone"] if user else "")
 
-            # Generate unique order number ORD-XXXX
+        order_num = f"ORD-{random.randint(1000, 9999)}"
+        while mongo_db["orders"].find_one({"order_number": order_num}):
             order_num = f"ORD-{random.randint(1000, 9999)}"
-            while conn.execute("SELECT 1 FROM orders WHERE order_number = ?", (order_num,)).fetchone():
-                order_num = f"ORD-{random.randint(1000, 9999)}"
 
-            unit_price = prod["price"]
-            total_pkr = unit_price * req.quantity
-            now_str = now()
+        unit_price = prod.get("price", 0)
+        total_pkr = unit_price * req.quantity
+        now_str = now()
 
-            conflict_info = check_service_conflict(conn, req.item_id, req.preferred_datetime)
+        conflict_info = check_service_conflict(None, req.item_id, req.preferred_datetime)
 
-            cursor = conn.execute(
-                """
-                INSERT INTO orders (
-                    order_number, user_id, call_session_id, customer_name, customer_phone,
-                    item_id, item_name_snapshot, unit_price_snapshot, quantity,
-                    preferred_datetime, total_pkr, status, is_locked, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending_admin_confirmation', 0, ?, ?)
-                """,
-                (
-                    order_num, user_id, req.call_session_id, c_name, c_phone,
-                    req.item_id, prod["name"], unit_price, req.quantity,
-                    req.preferred_datetime, total_pkr, now_str, now_str,
-                ),
-            )
-            order_id = cursor.lastrowid
+        order_id = get_next_sequence_value("orders")
+        order_doc = {
+            "id": order_id,
+            "order_number": order_num,
+            "user_id": user_id,
+            "call_session_id": req.call_session_id,
+            "customer_name": c_name,
+            "customer_phone": c_phone,
+            "item_id": prod.get("id"),
+            "item_name_snapshot": prod.get("name", "Item"),
+            "unit_price_snapshot": unit_price,
+            "quantity": req.quantity,
+            "preferred_datetime": req.preferred_datetime,
+            "total_pkr": total_pkr,
+            "status": "pending_admin_confirmation",
+            "is_locked": 0,
+            "created_at": now_str,
+            "updated_at": now_str,
+            "cancel_requested_at": None,
+            "cancel_reason": None,
+            "decided_by": None,
+            "decided_at": None,
+            "admin_note": None,
+        }
+        mongo_db["orders"].insert_one(order_doc)
 
-            # Append initial audit event
-            conn.execute(
-                """
-                INSERT INTO order_events (order_id, actor_user_id, actor_role, event_type, old_status, new_status, note, created_at)
-                VALUES (?, ?, 'customer', 'order_created', NULL, 'pending_admin_confirmation', 'Order request submitted waiting for admin confirmation', ?)
-                """,
-                (order_id, user_id, now_str),
-            )
+        event_id = get_next_sequence_value("order_events")
+        mongo_db["order_events"].insert_one({
+            "id": event_id,
+            "order_id": order_id,
+            "actor_user_id": user_id,
+            "actor_role": "customer",
+            "event_type": "order_created",
+            "old_status": None,
+            "new_status": "pending_admin_confirmation",
+            "note": "Order request submitted waiting for admin confirmation",
+            "created_at": now_str,
+        })
 
-            created_order = dict(conn.execute("SELECT * FROM orders WHERE id = ?", (order_id,)).fetchone())
-            created_order["service_conflict"] = conflict_info
-            return created_order
+        created_order = serialize_doc(order_doc)
+        created_order["service_conflict"] = conflict_info
+        return created_order
 
     return await asyncio.to_thread(_create)
 
@@ -4031,18 +3729,20 @@ async def create_order_endpoint(req: CreateOrderRequest, request: Request):
 async def get_my_orders(current_user: dict = Depends(get_current_user)):
     """Return all orders belonging to authenticated customer with BOLA protection."""
     def _query():
-        with db() as conn:
-            rows = conn.execute(
-                """
-                SELECT o.*, p.category, COALESCE(p.item_type, 'product') AS item_type
-                FROM orders o
-                LEFT JOIN products p ON o.item_id = p.id
-                WHERE o.user_id = ?
-                ORDER BY o.id DESC
-                """,
-                (current_user["id"],),
-            ).fetchall()
-            return [dict(r) for r in rows]
+        rows = list(mongo_db["orders"].find({"user_id": current_user["id"]}).sort("id", -1))
+        out = []
+        for r in rows:
+            d = serialize_doc(r)
+            item_id = d.get("item_id")
+            if item_id:
+                p = mongo_db["products"].find_one(make_id_query(item_id))
+                d["category"] = p.get("category") if p else None
+                d["item_type"] = p.get("item_type", "product") if p else "product"
+            else:
+                d["category"] = None
+                d["item_type"] = "product"
+            out.append(d)
+        return out
 
     return await asyncio.to_thread(_query)
 
@@ -4051,37 +3751,34 @@ async def get_my_orders(current_user: dict = Depends(get_current_user)):
 async def request_order_cancellation(order_id: int, req: OrderCancelRequest, current_user: dict = Depends(get_current_user)):
     """Request order cancellation for a customer's order."""
     def _cancel():
-        with db() as conn:
-            order = conn.execute("SELECT * FROM orders WHERE id = ?", (order_id,)).fetchone()
-            if not order:
-                raise HTTPException(status_code=404, detail="Order not found.")
+        order = mongo_db["orders"].find_one(make_id_query(order_id))
+        if not order:
+            raise HTTPException(status_code=404, detail="Order not found.")
 
-            # BOLA check: only order owner or admin can request cancel
-            if current_user["role"] != "admin" and order["user_id"] != current_user["id"]:
-                raise HTTPException(status_code=403, detail="Access denied. You do not own this order.")
+        if current_user.get("role") != "admin" and order.get("user_id") != current_user["id"]:
+            raise HTTPException(status_code=403, detail="Access denied. You do not own this order.")
 
-            if order["is_locked"] or order["status"] in LOCKED_ORDER_STATUSES:
-                raise HTTPException(
-                    status_code=409,
-                    detail=f"Order #{order['order_number']} is in locked status '{order['status']}' and cannot be cancelled.",
-                )
-
-            if order["status"] == "cancel_requested":
-                raise HTTPException(
-                    status_code=409,
-                    detail=f"A cancellation request is already pending for order #{order['order_number']}.",
-                )
-
-            reason_str = req.reason.strip() if req.reason else "Customer requested cancellation via portal"
-            return validate_and_apply_order_transition(
-                conn=conn,
-                order_id=order_id,
-                target_status="cancel_requested",
-                actor_user_id=current_user["id"],
-                actor_role=current_user["role"],
-                note=reason_str,
-                event_type="cancel_requested",
+        if order.get("is_locked") or order.get("status") in LOCKED_ORDER_STATUSES:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Order #{order.get('order_number')} is in locked status '{order.get('status')}' and cannot be cancelled.",
             )
+
+        if order.get("status") == "cancel_requested":
+            raise HTTPException(
+                status_code=409,
+                detail=f"A cancellation request is already pending for order #{order.get('order_number')}.",
+            )
+
+        reason_str = req.reason.strip() if req.reason else "Customer requested cancellation via portal"
+        return validate_and_apply_order_transition(
+            order_id=order_id,
+            target_status="cancel_requested",
+            actor_user_id=current_user["id"],
+            actor_role=current_user.get("role", "customer"),
+            note=reason_str,
+            event_type="cancel_requested",
+        )
 
     return await asyncio.to_thread(_cancel)
 
@@ -4104,67 +3801,68 @@ async def list_admin_orders(
 ):
     """Admin view: List all orders with filters, search, and double-booking warning."""
     def _query():
-        with db() as conn:
-            where_clauses = []
-            params = []
+        query_filter = {}
+        if status_filter and status_filter.strip():
+            query_filter["status"] = status_filter.strip()
+        if customer_id:
+            query_filter["user_id"] = customer_id
+        if search and search.strip():
+            s = re.escape(search.strip())
+            query_filter["$or"] = [
+                {"order_number": {"$regex": s, "$options": "i"}},
+                {"customer_name": {"$regex": s, "$options": "i"}},
+                {"customer_phone": {"$regex": s, "$options": "i"}},
+                {"item_name_snapshot": {"$regex": s, "$options": "i"}},
+            ]
 
-            if status_filter and status_filter.strip():
-                where_clauses.append("o.status = ?")
-                params.append(status_filter.strip())
+        rows = list(mongo_db["orders"].find(query_filter))
+        # Custom status sort: pending_admin_confirmation first, then cancel_requested, then others, by id desc
+        def sort_key(doc):
+            st = doc.get("status")
+            priority = 1 if st == "pending_admin_confirmation" else (2 if st == "cancel_requested" else 3)
+            return (priority, -int(doc.get("id") or 0))
 
-            if customer_id:
-                where_clauses.append("o.user_id = ?")
-                params.append(customer_id)
+        rows.sort(key=sort_key)
+        result = []
+        for r in rows:
+            d = serialize_doc(r)
+            uid = d.get("user_id")
+            if uid:
+                u = mongo_db["users"].find_one(make_id_query(uid))
+                d["user_email"] = u.get("email") if u else None
+            else:
+                d["user_email"] = None
 
-            if search and search.strip():
-                s = f"%{search.strip()}%"
-                where_clauses.append("(o.order_number LIKE ? OR o.customer_name LIKE ? OR o.customer_phone LIKE ? OR o.item_name_snapshot LIKE ?)")
-                params.extend([s, s, s, s])
+            item_id = d.get("item_id")
+            prod = mongo_db["products"].find_one(make_id_query(item_id)) if item_id else None
+            d["item_type"] = prod.get("item_type", "product") if prod else "product"
 
-            where_sql = f"WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
-            sql = f"""
-                SELECT o.*, u.email AS user_email, COALESCE(p.item_type, 'product') AS item_type
-                FROM orders o
-                LEFT JOIN users u ON o.user_id = u.id
-                LEFT JOIN products p ON o.item_id = p.id
-                {where_sql}
-                ORDER BY
-                    CASE WHEN o.status = 'pending_admin_confirmation' THEN 1
-                         WHEN o.status = 'cancel_requested' THEN 2
-                         ELSE 3 END,
-                    o.id DESC
-            """
-            rows = conn.execute(sql, params).fetchall()
-            result = []
-            for r in rows:
-                d = dict(r)
-                if d.get("item_type") == "service" and d.get("preferred_datetime"):
-                    d["double_booking_warning"] = check_service_conflict(
-                        conn, d["item_id"], d["preferred_datetime"], exclude_order_id=d["id"]
-                    )
-                else:
-                    d["double_booking_warning"] = {"has_conflict": False}
-                result.append(d)
-            return result
+            if d.get("item_type") == "service" and d.get("preferred_datetime"):
+                d["double_booking_warning"] = check_service_conflict(
+                    None, d["item_id"], d["preferred_datetime"], exclude_order_id=d.get("id")
+                )
+            else:
+                d["double_booking_warning"] = {"has_conflict": False}
+            result.append(d)
+        return result
 
     return await asyncio.to_thread(_query)
 
 
 @app.get("/api/admin/orders/summary")
 async def get_admin_orders_summary(admin: dict = Depends(require_admin)):
-    """Return summary counts of pending confirmation, cancel requests, and totals."""
+    """Return summary counts of pending confirmation, cancel requests, and totals from MongoDB."""
     def _summary():
-        with db() as conn:
-            pending = conn.execute("SELECT COUNT(*) AS c FROM orders WHERE status = 'pending_admin_confirmation'").fetchone()["c"]
-            cancel_req = conn.execute("SELECT COUNT(*) AS c FROM orders WHERE status = 'cancel_requested'").fetchone()["c"]
-            confirmed = conn.execute("SELECT COUNT(*) AS c FROM orders WHERE status = 'confirmed'").fetchone()["c"]
-            total = conn.execute("SELECT COUNT(*) AS c FROM orders").fetchone()["c"]
-            return {
-                "pending_confirmation_count": pending,
-                "cancel_requested_count": cancel_req,
-                "confirmed_count": confirmed,
-                "total_count": total,
-            }
+        pending = mongo_db["orders"].count_documents({"status": "pending_admin_confirmation"})
+        cancel_req = mongo_db["orders"].count_documents({"status": "cancel_requested"})
+        confirmed = mongo_db["orders"].count_documents({"status": "confirmed"})
+        total = mongo_db["orders"].count_documents({})
+        return {
+            "pending_confirmation_count": pending,
+            "cancel_requested_count": cancel_req,
+            "confirmed_count": confirmed,
+            "total_count": total,
+        }
 
     return await asyncio.to_thread(_summary)
 
@@ -4173,112 +3871,106 @@ async def get_admin_orders_summary(admin: dict = Depends(require_admin)):
 async def decide_order(order_id: int, req: OrderDecisionRequest, admin: dict = Depends(require_admin)):
     """Admin confirms, rejects, approves cancel, rejects cancel, or completes an order."""
     def _decide():
-        with db() as conn:
-            order = conn.execute("SELECT * FROM orders WHERE id = ?", (order_id,)).fetchone()
-            if not order:
-                raise HTTPException(status_code=404, detail="Order not found.")
+        order = mongo_db["orders"].find_one(make_id_query(order_id))
+        if not order:
+            raise HTTPException(status_code=404, detail="Order not found.")
 
-            curr = order["status"]
-            action = req.action
+        curr = order.get("status")
+        action = req.action
 
-            if action == "confirm":
-                if curr != "pending_admin_confirmation":
-                    raise HTTPException(status_code=409, detail=f"Cannot confirm order in status '{curr}'.")
-                return validate_and_apply_order_transition(
-                    conn=conn,
-                    order_id=order_id,
-                    target_status="confirmed",
-                    actor_user_id=admin["id"],
-                    actor_role="admin",
-                    note=req.admin_note,
-                    event_type="admin_confirmed",
-                )
+        if action == "confirm":
+            if curr != "pending_admin_confirmation":
+                raise HTTPException(status_code=409, detail=f"Cannot confirm order in status '{curr}'.")
+            return validate_and_apply_order_transition(
+                order_id=order_id,
+                target_status="confirmed",
+                actor_user_id=admin["id"],
+                actor_role="admin",
+                note=req.admin_note,
+                event_type="admin_confirmed",
+            )
 
-            elif action == "reject":
-                if curr != "pending_admin_confirmation":
-                    raise HTTPException(status_code=409, detail=f"Cannot reject order in status '{curr}'.")
-                if not req.admin_note or not req.admin_note.strip():
-                    raise HTTPException(status_code=400, detail="Rejection requires an explanatory admin note.")
-                return validate_and_apply_order_transition(
-                    conn=conn,
-                    order_id=order_id,
-                    target_status="rejected",
-                    actor_user_id=admin["id"],
-                    actor_role="admin",
-                    note=req.admin_note.strip(),
-                    event_type="admin_rejected",
-                )
+        elif action == "reject":
+            if curr != "pending_admin_confirmation":
+                raise HTTPException(status_code=409, detail=f"Cannot reject order in status '{curr}'.")
+            if not req.admin_note or not req.admin_note.strip():
+                raise HTTPException(status_code=400, detail="Rejection requires an explanatory admin note.")
+            return validate_and_apply_order_transition(
+                order_id=order_id,
+                target_status="rejected",
+                actor_user_id=admin["id"],
+                actor_role="admin",
+                note=req.admin_note.strip(),
+                event_type="admin_rejected",
+            )
 
-            elif action == "approve_cancel":
-                if curr != "cancel_requested":
-                    raise HTTPException(status_code=409, detail=f"Cannot approve cancellation for status '{curr}'.")
-                return validate_and_apply_order_transition(
-                    conn=conn,
-                    order_id=order_id,
-                    target_status="cancelled",
-                    actor_user_id=admin["id"],
-                    actor_role="admin",
-                    note=req.admin_note,
-                    event_type="cancel_approved",
-                )
+        elif action == "approve_cancel":
+            if curr != "cancel_requested":
+                raise HTTPException(status_code=409, detail=f"Cannot approve cancellation for status '{curr}'.")
+            return validate_and_apply_order_transition(
+                order_id=order_id,
+                target_status="cancelled",
+                actor_user_id=admin["id"],
+                actor_role="admin",
+                note=req.admin_note,
+                event_type="cancel_approved",
+            )
 
-            elif action == "reject_cancel":
-                if curr != "cancel_requested":
-                    raise HTTPException(status_code=409, detail=f"Cannot reject cancellation for status '{curr}'.")
-                last_event = conn.execute(
-                    """
-                    SELECT old_status FROM order_events
-                    WHERE order_id = ? AND new_status = 'cancel_requested'
-                    ORDER BY id DESC LIMIT 1
-                    """,
-                    (order_id,),
-                ).fetchone()
-                revert_status = last_event["old_status"] if last_event and last_event["old_status"] else "confirmed"
-                return validate_and_apply_order_transition(
-                    conn=conn,
-                    order_id=order_id,
-                    target_status=revert_status,
-                    actor_user_id=admin["id"],
-                    actor_role="admin",
-                    note=req.admin_note or "Admin rejected cancellation request",
-                    event_type="cancel_rejected",
-                )
+        elif action == "reject_cancel":
+            if curr != "cancel_requested":
+                raise HTTPException(status_code=409, detail=f"Cannot reject cancellation for status '{curr}'.")
+            last_event = mongo_db["order_events"].find_one(
+                {"order_id": order.get("id"), "new_status": "cancel_requested"},
+                sort=[("id", -1)],
+            )
+            revert_status = last_event.get("old_status") if last_event and last_event.get("old_status") else "confirmed"
+            return validate_and_apply_order_transition(
+                order_id=order_id,
+                target_status=revert_status,
+                actor_user_id=admin["id"],
+                actor_role="admin",
+                note=req.admin_note or "Admin rejected cancellation request",
+                event_type="cancel_rejected",
+            )
 
-            elif action == "complete":
-                if curr != "confirmed":
-                    raise HTTPException(status_code=409, detail=f"Only confirmed orders can be marked completed.")
-                return validate_and_apply_order_transition(
-                    conn=conn,
-                    order_id=order_id,
-                    target_status="completed",
-                    actor_user_id=admin["id"],
-                    actor_role="admin",
-                    note=req.admin_note,
-                    event_type="order_completed",
-                )
+        elif action == "complete":
+            if curr != "confirmed":
+                raise HTTPException(status_code=409, detail="Only confirmed orders can be marked completed.")
+            return validate_and_apply_order_transition(
+                order_id=order_id,
+                target_status="completed",
+                actor_user_id=admin["id"],
+                actor_role="admin",
+                note=req.admin_note,
+                event_type="order_completed",
+            )
 
-            else:
-                raise HTTPException(status_code=400, detail=f"Unknown decision action '{action}'.")
+        else:
+            raise HTTPException(status_code=400, detail=f"Unknown decision action '{action}'.")
 
     return await asyncio.to_thread(_decide)
 
 
 @app.get("/api/admin/orders/{order_id}/events")
 async def get_order_audit_events(order_id: int, admin: dict = Depends(require_admin)):
-    """Return append-only audit trail for an order."""
+    """Return append-only audit trail for an order from MongoDB."""
     def _query():
-        with db() as conn:
-            rows = conn.execute(
-                """
-                SELECT e.*, u.email AS actor_email, u.full_name AS actor_name
-                FROM order_events e
-                LEFT JOIN users u ON e.actor_user_id = u.id
-                WHERE e.order_id = ?
-                ORDER BY e.id ASC
-                """,
-                (order_id,),
-            ).fetchall()
-            return [dict(r) for r in rows]
+        order = mongo_db["orders"].find_one(make_id_query(order_id))
+        oid = order.get("id") if order else order_id
+        rows = list(mongo_db["order_events"].find({"order_id": oid}).sort("id", 1))
+        out = []
+        for r in rows:
+            d = serialize_doc(r)
+            actor_uid = d.get("actor_user_id")
+            if actor_uid:
+                u = mongo_db["users"].find_one(make_id_query(actor_uid))
+                d["actor_email"] = u.get("email") if u else None
+                d["actor_name"] = u.get("full_name") if u else None
+            else:
+                d["actor_email"] = None
+                d["actor_name"] = None
+            out.append(d)
+        return out
 
     return await asyncio.to_thread(_query)
 
@@ -4291,48 +3983,63 @@ async def list_admin_handoffs(
     status_filter: str | None = Query(default=None, alias="status"),
     admin: dict = Depends(require_admin),
 ):
-    """Admin view: List all human handoff requests ordered by priority."""
+    """Admin view: List all human handoff requests ordered by priority from MongoDB."""
     def _query():
-        with db() as conn:
-            where_sql = ""
-            params = []
-            if status_filter and status_filter.strip() and status_filter != "all":
-                where_sql = "WHERE h.status = ?"
-                params.append(status_filter.strip())
+        query_filter = {}
+        if status_filter and status_filter.strip() and status_filter != "all":
+            query_filter["status"] = status_filter.strip()
 
-            sql = f"""
-                SELECT h.*, c.session_id, c.customer_name AS call_customer_name,
-                       c.contact_phone AS call_customer_phone, u.email AS user_email
-                FROM handoff_requests h
-                LEFT JOIN calls c ON h.call_id = c.id
-                LEFT JOIN users u ON h.user_id = u.id
-                {where_sql}
-                ORDER BY
-                    CASE h.priority WHEN 'urgent' THEN 1 WHEN 'high' THEN 2 ELSE 3 END,
-                    CASE h.status WHEN 'open' THEN 1 WHEN 'assigned' THEN 2 ELSE 3 END,
-                    h.id DESC
-            """
-            rows = conn.execute(sql, params).fetchall()
-            return [dict(r) for r in rows]
+        rows = list(mongo_db["handoff_requests"].find(query_filter))
+
+        # Sort priority: urgent -> high -> normal, status: open -> assigned -> others, id desc
+        priority_order = {"urgent": 1, "high": 2, "normal": 3}
+        status_order = {"open": 1, "assigned": 2, "resolved": 3}
+
+        def sort_key(doc):
+            p = priority_order.get(doc.get("priority", "normal"), 4)
+            s = status_order.get(doc.get("status", "open"), 4)
+            return (p, s, -int(doc.get("id") or 0))
+
+        rows.sort(key=sort_key)
+        out = []
+        for r in rows:
+            d = serialize_doc(r)
+            call_id = d.get("call_id")
+            if call_id:
+                c = mongo_db["calls"].find_one({"id": call_id})
+                d["session_id"] = c.get("session_id") if c else d.get("session_id")
+                d["call_customer_name"] = c.get("customer_name") if c else None
+                d["call_customer_phone"] = c.get("contact_phone") if c else None
+            else:
+                d["call_customer_name"] = None
+                d["call_customer_phone"] = None
+
+            uid = d.get("user_id")
+            if uid:
+                u = mongo_db["users"].find_one(make_id_query(uid))
+                d["user_email"] = u.get("email") if u else None
+            else:
+                d["user_email"] = None
+            out.append(d)
+        return out
 
     return await asyncio.to_thread(_query)
 
 
 @app.get("/api/admin/handoffs/summary")
 async def get_admin_handoffs_summary(admin: dict = Depends(require_admin)):
-    """Return summary counts of open, urgent, and assigned handoffs."""
+    """Return summary counts of open, urgent, and assigned handoffs from MongoDB."""
     def _summary():
-        with db() as conn:
-            open_c = conn.execute("SELECT COUNT(*) AS c FROM handoff_requests WHERE status = 'open'").fetchone()["c"]
-            urgent_c = conn.execute("SELECT COUNT(*) AS c FROM handoff_requests WHERE status = 'open' AND priority = 'urgent'").fetchone()["c"]
-            assigned_c = conn.execute("SELECT COUNT(*) AS c FROM handoff_requests WHERE status = 'assigned'").fetchone()["c"]
-            total_c = conn.execute("SELECT COUNT(*) AS c FROM handoff_requests").fetchone()["c"]
-            return {
-                "open_count": open_c,
-                "urgent_count": urgent_c,
-                "assigned_count": assigned_c,
-                "total_count": total_c,
-            }
+        open_c = mongo_db["handoff_requests"].count_documents({"status": "open"})
+        urgent_c = mongo_db["handoff_requests"].count_documents({"status": "open", "priority": "urgent"})
+        assigned_c = mongo_db["handoff_requests"].count_documents({"status": "assigned"})
+        total_c = mongo_db["handoff_requests"].count_documents({})
+        return {
+            "open_count": open_c,
+            "urgent_count": urgent_c,
+            "assigned_count": assigned_c,
+            "total_count": total_c,
+        }
 
     return await asyncio.to_thread(_summary)
 
@@ -4341,22 +4048,22 @@ async def get_admin_handoffs_summary(admin: dict = Depends(require_admin)):
 async def assign_handoff(handoff_id: int, admin: dict = Depends(require_admin)):
     """Assign handoff request to current administrator."""
     def _assign():
-        with db() as conn:
-            h = conn.execute("SELECT * FROM handoff_requests WHERE id = ?", (handoff_id,)).fetchone()
-            if not h:
-                raise HTTPException(status_code=404, detail="Handoff request not found.")
-            now_str = now()
-            conn.execute(
-                """
-                UPDATE handoff_requests
-                SET assigned_to = ?, assigned_at = ?, status = 'assigned'
-                WHERE id = ?
-                """,
-                (admin["email"], now_str, handoff_id),
-            )
-            if h["call_id"]:
-                conn.execute("UPDATE calls SET follow_up_status = 'pending_staff' WHERE id = ?", (h["call_id"],))
-            return dict(conn.execute("SELECT * FROM handoff_requests WHERE id = ?", (handoff_id,)).fetchone())
+        h = mongo_db["handoff_requests"].find_one(make_id_query(handoff_id))
+        if not h:
+            raise HTTPException(status_code=404, detail="Handoff request not found.")
+        now_str = now()
+        mongo_db["handoff_requests"].update_one(
+            {"_id": h["_id"]},
+            {"$set": {
+                "assigned_to": admin.get("email"),
+                "assigned_at": now_str,
+                "status": "assigned",
+            }},
+        )
+        if h.get("call_id"):
+            mongo_db["calls"].update_one({"id": h["call_id"]}, {"$set": {"follow_up_status": "pending_staff"}})
+        updated = mongo_db["handoff_requests"].find_one({"_id": h["_id"]})
+        return serialize_doc(updated)
 
     return await asyncio.to_thread(_assign)
 
@@ -4365,22 +4072,23 @@ async def assign_handoff(handoff_id: int, admin: dict = Depends(require_admin)):
 async def resolve_handoff(handoff_id: int, req: HandoffResolveRequest, admin: dict = Depends(require_admin)):
     """Resolve handoff request with staff notes."""
     def _resolve():
-        with db() as conn:
-            h = conn.execute("SELECT * FROM handoff_requests WHERE id = ?", (handoff_id,)).fetchone()
-            if not h:
-                raise HTTPException(status_code=404, detail="Handoff request not found.")
-            now_str = now()
-            conn.execute(
-                """
-                UPDATE handoff_requests
-                SET status = 'resolved', resolved_at = ?, resolved_by = ?, staff_note = ?
-                WHERE id = ?
-                """,
-                (now_str, admin["email"], req.staff_note, handoff_id),
-            )
-            if h["call_id"]:
-                conn.execute("UPDATE calls SET follow_up_status = 'closed' WHERE id = ?", (h["call_id"],))
-            return dict(conn.execute("SELECT * FROM handoff_requests WHERE id = ?", (handoff_id,)).fetchone())
+        h = mongo_db["handoff_requests"].find_one(make_id_query(handoff_id))
+        if not h:
+            raise HTTPException(status_code=404, detail="Handoff request not found.")
+        now_str = now()
+        mongo_db["handoff_requests"].update_one(
+            {"_id": h["_id"]},
+            {"$set": {
+                "status": "resolved",
+                "resolved_at": now_str,
+                "resolved_by": admin.get("email"),
+                "staff_note": req.staff_note,
+            }},
+        )
+        if h.get("call_id"):
+            mongo_db["calls"].update_one({"id": h["call_id"]}, {"$set": {"follow_up_status": "closed"}})
+        updated = mongo_db["handoff_requests"].find_one({"_id": h["_id"]})
+        return serialize_doc(updated)
 
     return await asyncio.to_thread(_resolve)
 
@@ -4389,12 +4097,15 @@ async def resolve_handoff(handoff_id: int, req: HandoffResolveRequest, admin: di
 async def update_handoff_priority(handoff_id: int, req: HandoffPriorityRequest, admin: dict = Depends(require_admin)):
     """Update priority level of a handoff request."""
     def _prio():
-        with db() as conn:
-            h = conn.execute("SELECT * FROM handoff_requests WHERE id = ?", (handoff_id,)).fetchone()
-            if not h:
-                raise HTTPException(status_code=404, detail="Handoff request not found.")
-            conn.execute("UPDATE handoff_requests SET priority = ? WHERE id = ?", (req.priority, handoff_id))
-            return dict(conn.execute("SELECT * FROM handoff_requests WHERE id = ?", (handoff_id,)).fetchone())
+        h = mongo_db["handoff_requests"].find_one(make_id_query(handoff_id))
+        if not h:
+            raise HTTPException(status_code=404, detail="Handoff request not found.")
+        mongo_db["handoff_requests"].update_one(
+            {"_id": h["_id"]},
+            {"$set": {"priority": req.priority}},
+        )
+        updated = mongo_db["handoff_requests"].find_one({"_id": h["_id"]})
+        return serialize_doc(updated)
 
     return await asyncio.to_thread(_prio)
 
@@ -4403,27 +4114,21 @@ async def update_handoff_priority(handoff_id: int, req: HandoffPriorityRequest, 
 async def get_session_handoff_status(session_id: str):
     """Check customer handoff status for the active call session."""
     def _query():
-        with db() as conn:
-            h = conn.execute(
-                """
-                SELECT id, trigger_type, priority, status, assigned_to, created_at
-                FROM handoff_requests
-                WHERE session_id = ?
-                ORDER BY id DESC LIMIT 1
-                """,
-                (session_id,),
-            ).fetchone()
-            if not h:
-                return {"has_handoff": False, "status": "none"}
-            return {
-                "has_handoff": True,
-                "handoff_id": h["id"],
-                "trigger_type": h["trigger_type"],
-                "priority": h["priority"],
-                "status": h["status"],
-                "assigned_to": h["assigned_to"],
-                "created_at": h["created_at"],
-            }
+        h = mongo_db["handoff_requests"].find_one(
+            {"session_id": session_id},
+            sort=[("id", -1)],
+        )
+        if not h:
+            return {"has_handoff": False, "status": "none"}
+        return {
+            "has_handoff": True,
+            "handoff_id": h.get("id"),
+            "trigger_type": h.get("trigger_type"),
+            "priority": h.get("priority"),
+            "status": h.get("status"),
+            "assigned_to": h.get("assigned_to"),
+            "created_at": h.get("created_at"),
+        }
 
     return await asyncio.to_thread(_query)
 
@@ -4473,9 +4178,8 @@ async def telephony_inbound_voice(request: Request):
 
     # Register call session in database
     def _reg():
-        with db() as conn:
-            call_id = get_or_create_call(conn, session_id, user_id=None)
-            conn.execute("UPDATE calls SET status = 'in-progress' WHERE id = ?", (call_id,))
+        call_id = get_or_create_call(session_id, user_id=None)
+        mongo_db["calls"].update_one({"id": call_id}, {"$set": {"status": "in-progress"}})
     await asyncio.to_thread(_reg)
 
     b_name = get_business_setting("business_name", "our business")
@@ -4575,11 +4279,10 @@ async def telephony_status_callback(request: Request):
     if call_sid:
         session_id = f"tel_{call_sid}"
         def _update():
-            with db() as conn:
-                conn.execute(
-                    "UPDATE calls SET status = ?, last_activity = ? WHERE session_id = ?",
-                    (call_status, now(), session_id),
-                )
+            mongo_db["calls"].update_one(
+                {"session_id": session_id},
+                {"$set": {"status": call_status, "last_activity": now()}},
+            )
         await asyncio.to_thread(_update)
 
     return {"status": "ok", "call_sid": call_sid, "call_status": call_status}
