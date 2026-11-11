@@ -1657,7 +1657,7 @@ async def favicon():
     favicon_path = BASE_DIR / "favicon.ico"
     if favicon_path.exists():
         return FileResponse(favicon_path)
-    raise HTTPException(status_code=404)
+    return Response(status_code=204)
 
 
 # =====================================================================
