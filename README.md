@@ -20,8 +20,10 @@ Powered by **FastAPI**, **Google Gemini 2.0 / Flash-Lite**, **Microsoft Edge-TTS
 ### 1. 🔒 Strict Authentication & Role-Based Access Control (RBAC)
 * **Call Logs Route Guard (OWASP Top 10 A01):** Unauthenticated guest callers have strictly **zero access** to view, edit, or delete call logs. All call log endpoints (`GET /api/calls`, `GET /api/history`, `POST /api/calls/sync`, `DELETE /api/calls/{id}`) enforce HTTP 401 Unauthorized for guests.
 * **Tenant Isolation:** Regular members see only their own call history, recordings, and orders. Platform Administrators can inspect all records or filter by user.
-* **Guest Quota Wall:** Unauthenticated guest users are limited to a maximum of **3 interactions** (calls/messages). Exceeding this quota immediately triggers a mandatory Sign-In/Sign-Up wall modal, locking inputs until authenticated.
-* **Session Hardening:** HTTP-only secure JWT cookies, timing-attack resistant password hashing, brute-force rate-limiting, and comprehensive security headers (`X-Content-Type-Options`, `X-Frame-Options`, `Permissions-Policy`, `Referrer-Policy`).
+* **Guest Quota Wall & Full Admin Bypass:** Unauthenticated guest users are limited to a maximum of **3 interactions** (calls/messages) before triggering a mandatory Sign-In modal. Authenticated users and Administrators completely bypass all quota barriers with unlimited turns.
+* **Prompt & FAQ Latency Optimization:** Stored FAQs are compressed into dense policy directives and dynamically chunked via semantic relevance scoring, reducing prompt token payload by **>85%** for ultra-fast TTFT.
+* **Security & Injection Hardening:** Query builder rejects NoSQL injection vectors (operators, null-bytes, objects), while all dynamic DOM elements are escaped against Cross-Site Scripting (XSS).
+* **Session Hardening:** HTTP-only secure JWT cookies (auto-detecting HTTPS schemes), timing-attack resistant password hashing, brute-force rate-limiting, and comprehensive security headers (`X-Content-Type-Options`, `X-Frame-Options`, `Permissions-Policy`, `Referrer-Policy`).
 
 ### 2. 🏢 Dynamic Branding & Whitelabeling (Centralized Business Profile)
 * **Brand-Neutral Base:** Zero hardcoded brand names across prompts, UI elements, and templates.
@@ -153,7 +155,7 @@ Open **[http://127.0.0.1:8000](http://127.0.0.1:8000)** in Google Chrome or Micr
 The repository includes comprehensive automated test suites:
 
 ```bash
-# 1. Run all pytest unit and integration tests (13 tests)
+# 1. Run all pytest unit and integration tests (16 tests)
 python -m pytest tests/
 
 # 2. Run the 45-case benchmark evaluation suite

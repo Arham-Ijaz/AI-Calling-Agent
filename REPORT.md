@@ -1,6 +1,6 @@
 # AI Calling Agent Benchmark & Verification Report
 
-**Evaluation Timestamp:** 2026-11-11 23:40:17  
+**Evaluation Timestamp:** 2026-11-12 00:21:28  
 **Total Evaluated Queries:** 45  
 **Pipeline Coverage:** Phase 4 (Orders & Admin Confirmation), Phase 7 (Compliance & Human Handoff), Phase 9 (Low-Latency Voice Stream).
 

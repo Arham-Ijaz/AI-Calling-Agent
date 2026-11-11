@@ -52,3 +52,13 @@ Thumbs.db
 # Audio / temporary cache
 temp_*.mp3
 *.mp3
+
+# Test and coverage caches
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Logs & data exports
+*.log
+logs/
+*.csv
