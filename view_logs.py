@@ -4,9 +4,9 @@
     python view_logs.py --export logs.csv
 """
 import argparse
+import csv
 import os
 from dotenv import load_dotenv
-import pandas as pd
 from pymongo import MongoClient
 
 load_dotenv()
@@ -38,25 +38,42 @@ if not messages:
 
 # Join session_id from calls collection
 records = []
+resolved_count = 0
+escalated_count = 0
 for m in messages:
     call = db["calls"].find_one({"id": m.get("call_id")})
+    outcome = m.get("outcome", "Resolved")
+    if outcome == "Resolved":
+        resolved_count += 1
+    elif outcome == "Escalated":
+        escalated_count += 1
     records.append({
         "id": m.get("id"),
         "session_id": call.get("session_id") if call else "unknown",
         "timestamp": m.get("timestamp"),
         "detected_intent": m.get("detected_intent"),
-        "outcome": m.get("outcome"),
+        "outcome": outcome,
         "user_transcript": m.get("user_transcript"),
         "ai_response": m.get("ai_response"),
     })
 
-df = pd.DataFrame(records)
+# Format and display table cleanly using built-in string formatting
+header = f"{'ID':<6} | {'SESSION':<22} | {'INTENT':<18} | {'OUTCOME':<10} | {'TRANSCRIPT':<32} | {'REPLY'}"
+print(header)
+print("-" * len(header))
+for r in records:
+    sid = str(r["session_id"] or "")[:20]
+    intent = str(r["detected_intent"] or "")[:16]
+    out = str(r["outcome"] or "")[:9]
+    trans = str(r["user_transcript"] or "").replace("\n", " ")[:30]
+    rep = str(r["ai_response"] or "").replace("\n", " ")[:45]
+    print(f"{r['id']:<6} | {sid:<22} | {intent:<18} | {out:<10} | {trans:<32} | {rep}")
 
-pd.set_option("display.max_colwidth", 60, "display.width", 200)
-print(df.to_string(index=False))
-resolved_count = (df.outcome == "Resolved").sum() if "outcome" in df.columns else 0
-escalated_count = (df.outcome == "Escalated").sum() if "outcome" in df.columns else 0
-print(f"\nRows: {len(df)} | Resolved: {resolved_count} | Escalated: {escalated_count}")
+print(f"\nRows: {len(records)} | Resolved: {resolved_count} | Escalated: {escalated_count}")
+
 if args.export:
-    df.to_csv(args.export, index=False, encoding="utf-8-sig")
+    with open(args.export, mode="w", newline="", encoding="utf-8-sig") as f:
+        writer = csv.DictWriter(f, fieldnames=["id", "session_id", "timestamp", "detected_intent", "outcome", "user_transcript", "ai_response"])
+        writer.writeheader()
+        writer.writerows(records)
     print(f"Exported to {args.export}")

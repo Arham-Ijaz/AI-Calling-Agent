@@ -69,7 +69,10 @@ try:
     from google.genai import types, errors
     NEW_GENAI_AVAILABLE = True
 except ImportError:
-    import google.generativeai as genai  # type: ignore[no-redef]
+    try:
+        import google.generativeai as genai  # type: ignore[no-redef]
+    except ImportError:
+        genai = None  # type: ignore[assignment]
     types = None  # type: ignore[assignment]
     errors = None  # type: ignore[assignment]
     NEW_GENAI_AVAILABLE = False
@@ -1299,9 +1302,13 @@ async def synthesize_edge_tts(text: str, voice: str | None = None) -> bytes:
     try:
         communicate = edge_tts.Communicate(clean_text, selected_voice)
         audio_chunks: list[bytes] = []
-        async for chunk in communicate.stream():
-            if chunk["type"] == "audio":
-                audio_chunks.append(chunk["data"])
+
+        async def _collect():
+            async for chunk in communicate.stream():
+                if chunk["type"] == "audio":
+                    audio_chunks.append(chunk["data"])
+
+        await asyncio.wait_for(_collect(), timeout=4.0)
         if audio_chunks:
             audio_data = b"".join(audio_chunks)
             if len(TTS_AUDIO_CACHE) < 500:
