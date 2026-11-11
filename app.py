@@ -97,8 +97,19 @@ if not MONGODB_URI:
 MONGODB_DB_NAME = os.getenv("MONGODB_DB_NAME", "ai_calling_db")
 
 # The MongoClient MUST be initialized globally (outside the FastAPI route functions)
-# so Vercel caches the connection pool across serverless invocations.
-mongo_client: MongoClient = MongoClient(MONGODB_URI) if MONGODB_URI else None
+# with proper pooling and connection timeouts so Vercel caches the connection pool cleanly.
+mongo_client: MongoClient = (
+    MongoClient(
+        MONGODB_URI,
+        maxPoolSize=30,
+        minPoolSize=0,
+        serverSelectionTimeoutMS=5000,
+        connectTimeoutMS=5000,
+        socketTimeoutMS=10000,
+    )
+    if MONGODB_URI
+    else None
+)
 mongo_db = mongo_client[MONGODB_DB_NAME] if mongo_client is not None else None
 FAQ_PATH = BASE_DIR / "faq.json"
 PRODUCTS_PATH = BASE_DIR / "products.json"
@@ -527,53 +538,69 @@ def seed_sample_orders() -> None:
     log.info("Seeded %d sample orders with audit events.", len(sample_orders))
 
 
-def init_db() -> None:
-    """Initialize MongoDB Atlas collections, indexes, sequence counters, and seed initial data."""
-    try:
-        mongo_db["users"].create_index("email", unique=True)
-        mongo_db["users"].create_index("phone")
-        mongo_db["users"].create_index("id")
-        mongo_db["calls"].create_index("session_id", unique=True)
-        mongo_db["calls"].create_index("user_id")
-        mongo_db["calls"].create_index("id")
-        mongo_db["call_messages"].create_index("call_id")
-        mongo_db["call_messages"].create_index("id")
-        mongo_db["products"].create_index("user_id")
-        mongo_db["products"].create_index("id")
-        mongo_db["faqs"].create_index("user_id")
-        mongo_db["faqs"].create_index("id")
-        mongo_db["business_settings"].create_index("key", unique=True)
-        mongo_db["handoff_requests"].create_index("session_id")
-        mongo_db["handoff_requests"].create_index("status")
-        mongo_db["handoff_requests"].create_index("priority")
-        mongo_db["handoff_requests"].create_index("id")
-        mongo_db["orders"].create_index("order_number", unique=True)
-        mongo_db["orders"].create_index("user_id")
-        mongo_db["orders"].create_index("status")
-        mongo_db["orders"].create_index("id")
-        mongo_db["order_events"].create_index("order_id")
-        mongo_db["order_events"].create_index("id")
+_DB_INITIALIZED: bool = False
 
-        for coll_name in ["users", "calls", "call_messages", "products", "faqs", "handoff_requests", "orders", "order_events"]:
-            max_doc = mongo_db[coll_name].find_one(sort=[("id", -1)])
-            max_id = int(max_doc["id"]) if max_doc and "id" in max_doc and max_doc["id"] is not None else 0
-            mongo_db["counters"].update_one(
-                {"_id": coll_name},
-                {"$max": {"seq": max_id}},
-                upsert=True,
+
+def init_db(force: bool = False) -> None:
+    """Initialize MongoDB Atlas collections, indexes, sequence counters, and seed initial data once per process."""
+    global _DB_INITIALIZED
+    if _DB_INITIALIZED and not force:
+        return
+    if mongo_db is None:
+        return
+    try:
+        colls = mongo_db.list_collection_names()
+        is_fresh_db = "users" not in colls
+
+        # Only execute index creation and seeding on fresh database setup or forced rebuild
+        if is_fresh_db or force:
+            mongo_db["users"].create_index("email", unique=True)
+            mongo_db["users"].create_index("phone")
+            mongo_db["users"].create_index("id")
+            mongo_db["calls"].create_index("session_id", unique=True)
+            mongo_db["calls"].create_index("user_id")
+            mongo_db["calls"].create_index("id")
+            mongo_db["call_messages"].create_index("call_id")
+            mongo_db["call_messages"].create_index("id")
+            mongo_db["products"].create_index("user_id")
+            mongo_db["products"].create_index("id")
+            mongo_db["faqs"].create_index("user_id")
+            mongo_db["faqs"].create_index("id")
+            mongo_db["business_settings"].create_index("key", unique=True)
+            mongo_db["handoff_requests"].create_index("session_id")
+            mongo_db["handoff_requests"].create_index("status")
+            mongo_db["handoff_requests"].create_index("priority")
+            mongo_db["handoff_requests"].create_index("id")
+            mongo_db["orders"].create_index("order_number", unique=True)
+            mongo_db["orders"].create_index("user_id")
+            mongo_db["orders"].create_index("status")
+            mongo_db["orders"].create_index("id")
+            mongo_db["order_events"].create_index("order_id")
+            mongo_db["order_events"].create_index("id")
+
+            for coll_name in ["users", "calls", "call_messages", "products", "faqs", "handoff_requests", "orders", "order_events"]:
+                max_doc = mongo_db[coll_name].find_one(sort=[("id", -1)])
+                max_id = int(max_doc["id"]) if max_doc and "id" in max_doc and max_doc["id"] is not None else 0
+                mongo_db["counters"].update_one(
+                    {"_id": coll_name},
+                    {"$max": {"seq": max_id}},
+                    upsert=True,
+                )
+
+            seed_products()
+            seed_faqs()
+            seed_default_admin()
+            seed_business_settings()
+            seed_sample_orders()
+
+            valid_statuses = ['pending_admin_confirmation', 'confirmed', 'completed', 'cancel_requested', 'cancelled', 'rejected']
+            mongo_db["orders"].update_many(
+                {"status": {"$nin": valid_statuses}},
+                {"$set": {"status": "pending_admin_confirmation"}},
             )
 
-        seed_products()
-        seed_faqs()
-        seed_default_admin()
-        seed_business_settings()
-        seed_sample_orders()
-
-        valid_statuses = ['pending_admin_confirmation', 'confirmed', 'completed', 'cancel_requested', 'cancelled', 'rejected']
-        mongo_db["orders"].update_many(
-            {"status": {"$nin": valid_statuses}},
-            {"$set": {"status": "pending_admin_confirmation"}},
-        )
+        _DB_INITIALIZED = True
+        log.info("MongoDB Atlas initialized (fresh=%s).", is_fresh_db)
     except Exception as exc:
         log.error("Notice during MongoDB initialization: %r", exc)
 
@@ -1093,6 +1120,9 @@ def check_guest_limit(session_id: str, user_id: int | None = None, is_urdu: bool
     """Enforce guest turn limit strictly for unauthenticated callers without account sign-up."""
     if user_id is not None or user is not None:
         return None
+    if len(GUEST_TURNS) > 2000:
+        for k in list(GUEST_TURNS.keys())[:-500]:
+            GUEST_TURNS.pop(k, None)
     turns = GUEST_TURNS.get(session_id, 0) + 1
     GUEST_TURNS[session_id] = turns
     if turns > GUEST_CALL_LIMIT:

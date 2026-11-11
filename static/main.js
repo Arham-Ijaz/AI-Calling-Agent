@@ -1366,6 +1366,12 @@ function stopAudio() {
 // WebSocket Ultra-Low Latency Streaming Connection
 // =====================================================================
 function initAiWebSocket() {
+  // On Vercel serverless domains, persistent WebSockets are not supported by the platform;
+  // the app uses native low-latency HTTP Server-Sent Events (/api/chat/stream) seamlessly.
+  if (window.location.hostname.endsWith(".vercel.app") || window.location.hostname.includes("vercel")) {
+    return null;
+  }
+
   if (state.ws && (state.ws.readyState === WebSocket.OPEN || state.ws.readyState === WebSocket.CONNECTING)) {
     return state.ws;
   }
