@@ -72,7 +72,7 @@ async function loadAdminUsers() {
     adminState.users = await res.json();
     applyAdminFilters();
   } catch (err) {
-    tbody.innerHTML = `<tr><td colspan="8" class="loading-row" style="color:var(--red)">Failed to load users: ${err.message}</td></tr>`;
+    tbody.innerHTML = `<tr><td colspan="8" class="loading-row" style="color:var(--red)">Failed to load users: ${escapeHtml(err.message)}</td></tr>`;
   }
 }
 
@@ -810,7 +810,7 @@ async function loadAdminHandoffs() {
 
   } catch (err) {
     console.error("Failed to load handoffs:", err);
-    container.innerHTML = `<div style="grid-column: 1 / -1; color: var(--red); padding: 1rem;">Failed to load handoff requests: ${err.message}</div>`;
+    container.innerHTML = `<div style="grid-column: 1 / -1; color: var(--red); padding: 1rem;">Failed to load handoff requests: ${escapeHtml(err.message)}</div>`;
   }
 }
 
@@ -925,7 +925,7 @@ async function loadAdminPendingOrders() {
 
   } catch (err) {
     console.error("Failed to load pending orders:", err);
-    tbody.innerHTML = `<tr><td colspan="8" class="loading-row" style="color:var(--red)">Failed to load: ${err.message}</td></tr>`;
+    tbody.innerHTML = `<tr><td colspan="8" class="loading-row" style="color:var(--red)">Failed to load: ${escapeHtml(err.message)}</td></tr>`;
   }
 }
 
@@ -1052,7 +1052,7 @@ async function loadAdminCancelRequests() {
 
   } catch (err) {
     console.error("Failed to load cancel requests:", err);
-    tbody.innerHTML = `<tr><td colspan="7" class="loading-row" style="color:var(--red)">Failed to load: ${err.message}</td></tr>`;
+    tbody.innerHTML = `<tr><td colspan="7" class="loading-row" style="color:var(--red)">Failed to load: ${escapeHtml(err.message)}</td></tr>`;
   }
 }
 
@@ -1178,7 +1178,7 @@ async function loadAdminAllOrders() {
 
   } catch (err) {
     console.error("Failed to load all orders:", err);
-    tbody.innerHTML = `<tr><td colspan="10" class="loading-row" style="color:var(--red)">Failed to load orders: ${err.message}</td></tr>`;
+    tbody.innerHTML = `<tr><td colspan="10" class="loading-row" style="color:var(--red)">Failed to load orders: ${escapeHtml(err.message)}</td></tr>`;
   }
 }
 
@@ -1236,7 +1236,7 @@ async function openOrderAuditModal(orderId, orderNum) {
     }).join("");
 
   } catch (err) {
-    timeline.innerHTML = `<div style="color:var(--red); font-size:0.85rem;">Failed to load audit events: ${err.message}</div>`;
+    timeline.innerHTML = `<div style="color:var(--red); font-size:0.85rem;">Failed to load audit events: ${escapeHtml(err.message)}</div>`;
   }
 }
 
@@ -1366,7 +1366,7 @@ function showAdminToast(msg, type = "normal") {
 
   const toast = document.createElement("div");
   toast.className = `notification-toast ${type === "urgent" ? "urgent" : ""}`;
-  toast.innerHTML = `<span>${msg}</span>`;
+  toast.innerHTML = `<span>${escapeHtml(msg)}</span>`;
   container.appendChild(toast);
 
   setTimeout(() => {

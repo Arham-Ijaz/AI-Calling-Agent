@@ -370,9 +370,17 @@ window.resetGuestUsageCount = function() {
   } catch (_) {}
 };
 
+function isUserAuthenticated() {
+  if (typeof window.isUserAuthenticated === "function") {
+    return window.isUserAuthenticated();
+  }
+  const auth = window.authState || (typeof authState !== "undefined" ? authState : null);
+  return Boolean(auth && auth.isLoggedIn && auth.user);
+}
+
 function recordClientCallTurn(sessionId, userText, botReply, intent, outcome) {
   // Call logs are strictly protected: unauthenticated guests have NO access to store or view logs!
-  if (!window.authState || !window.authState.user) {
+  if (!isUserAuthenticated()) {
     return;
   }
   try {
@@ -420,8 +428,10 @@ function recordClientCallTurn(sessionId, userText, botReply, intent, outcome) {
 async function startCall() {
   if (state.isOnCall) return;
 
-  // Guest Quota: 3 interactions max for unauthenticated guests
-  if (!window.authState?.user && (state.guestLimitReached || getGuestUsageCount() >= 3)) {
+  // Guest Quota: 3 interactions max strictly for unauthenticated guests
+  if (isUserAuthenticated()) {
+    state.guestLimitReached = false;
+  } else if (state.guestLimitReached || getGuestUsageCount() >= 3) {
     state.guestLimitReached = true;
     showGuestLimitNotice("You have reached the free guest limit of 3 interactions. Please sign in or create an account to start a call.");
     return;
@@ -1386,6 +1396,10 @@ function initAiWebSocket() {
         const data = JSON.parse(event.data);
         switch (data.type) {
           case "guest_limit":
+            if (isUserAuthenticated()) {
+              state.guestLimitReached = false;
+              break;
+            }
             state.guestLimitReached = true;
             setTimeout(() => {
               if (state.isOnCall) endCall();
@@ -1563,8 +1577,10 @@ async function sendMessage(text) {
   text = (text || $("chatInput").value).trim();
   if (!text || !state.isOnCall || state.isBusy) return;
 
-  // Guest Quota: 3 interactions max for unauthenticated guests
-  if (!window.authState?.user) {
+  // Guest Quota: 3 interactions max strictly for unauthenticated guests
+  if (isUserAuthenticated()) {
+    state.guestLimitReached = false;
+  } else {
     if (state.guestLimitReached || getGuestUsageCount() >= 3) {
       state.guestLimitReached = true;
       if (state.isOnCall) endCall();
@@ -1724,10 +1740,14 @@ async function sendStreamingMessage(text) {
               state.speechQueue.enqueue(event.text, event.idx);
             }
           } else if (event.type === "guest_limit") {
-            state.guestLimitReached = true;
-            setTimeout(() => {
-              showGuestLimitNotice(event.message);
-            }, 600);
+            if (isUserAuthenticated()) {
+              state.guestLimitReached = false;
+            } else {
+              state.guestLimitReached = true;
+              setTimeout(() => {
+                showGuestLimitNotice(event.message);
+              }, 600);
+            }
           } else if (event.type === "meta") {
             metaData = event;
           } else if (event.type === "done") {
@@ -2485,7 +2505,7 @@ async function loadMyOrders() {
 
   } catch (err) {
     console.error("Failed to load customer orders:", err);
-    tbody.innerHTML = `<tr><td colspan="9" class="loading-row" style="color:var(--red)">Failed to load orders: ${err.message}</td></tr>`;
+    tbody.innerHTML = `<tr><td colspan="9" class="loading-row" style="color:var(--red)">Failed to load orders: ${escapeHtml(err.message)}</td></tr>`;
   }
 }
 
@@ -2541,12 +2561,16 @@ async function handleConfirmCustomerCancel() {
 }
 
 function showGuestLimitNotice(msg) {
+  if (isUserAuthenticated()) {
+    state.guestLimitReached = false;
+    return;
+  }
   state.guestLimitReached = true;
   const container = document.getElementById("toastNotificationContainer") || document.body;
   const toast = document.createElement("div");
   toast.className = "notification-toast urgent";
   toast.style.cssText = "position:fixed;top:20px;right:20px;z-index:9999;background:var(--red);color:#fff;padding:14px 20px;border-radius:10px;box-shadow:0 6px 18px rgba(0,0,0,0.35);font-size:0.92rem;max-width:400px;line-height:1.4;";
-  toast.innerHTML = `<strong>⚠️ Free Guest Quota Reached</strong><br>${msg || "You have reached the free guest limit of 3 interactions. Please sign in or create an account to continue."}`;
+  toast.innerHTML = `<strong>⚠️ Free Guest Quota Reached</strong><br>${escapeHtml(msg || "You have reached the free guest limit of 3 interactions. Please sign in or create an account to continue.")}`;
   container.appendChild(toast);
   setTimeout(() => {
     toast.style.opacity = "0";

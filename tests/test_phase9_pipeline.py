@@ -9,7 +9,19 @@ if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
 from fastapi.testclient import TestClient
-from app import app, mongo_db, db, check_instant_fast_path, synthesize_edge_tts, TTS_AUDIO_CACHE, CACHED_FAQ_ANSWERS
+from app import (
+    app,
+    mongo_db,
+    db,
+    check_instant_fast_path,
+    synthesize_edge_tts,
+    TTS_AUDIO_CACHE,
+    CACHED_FAQ_ANSWERS,
+    create_access_token,
+    COOKIE_NAME,
+    make_id_query,
+    load_faqs_context,
+)
 
 client = TestClient(app)
 
@@ -188,6 +200,62 @@ def test_dynamic_branding_public():
     assert len(settings["business_name"]) > 0
     print(f"[OK] test_dynamic_branding_public passed (business_name: '{settings['business_name']}')")
 
+def test_authenticated_admin_bypasses_guest_quota():
+    """Verify that authenticated users (especially Admin) completely bypass the 3-interaction guest limit."""
+    admin_row = mongo_db["users"].find_one({"role": "admin"})
+    assert admin_row is not None, "Admin user must exist in MongoDB"
+    admin_token = create_access_token(admin_row.get("id"), "admin", admin_row.get("email"))
+
+    session_id = f"admin_bypass_session_{int(time.time())}"
+    # Set the cookie on TestClient
+    client.cookies.set(COOKIE_NAME, admin_token)
+
+    # Perform 5 interactions (well over the guest limit of 3)
+    queries = ["hello", "working hours", "laptop price", "refund policy", "thank you"]
+    for idx, q in enumerate(queries, 1):
+        res = client.post("/api/chat/stream", json={"session_id": session_id, "message": q})
+        assert res.status_code == 200
+        events = parse_sse_events(res.text)
+        assert not any(e.get("type") == "guest_limit" for e in events), f"Admin incorrectly blocked at turn {idx}!"
+        assert not any(e.get("intent") == "guest_limit_reached" for e in events), f"Admin triggered guest_limit_reached at turn {idx}!"
+
+    # Clean up cookies for subsequent tests
+    client.cookies.clear()
+    print("[OK] test_authenticated_admin_bypasses_guest_quota passed (Admin bypassed guest quota on 5 turns)")
+
+def test_nosql_injection_protection():
+    """Verify make_id_query safely rejects MongoDB operator injection attempts."""
+    # Dict injection
+    q1 = make_id_query({"$gt": ""})
+    assert q1 == {"id": None}
+
+    # Dollar prefix injection
+    q2 = make_id_query("$where")
+    assert q2 == {"id": None}
+
+    # Null byte injection
+    q3 = make_id_query("admin\0inject")
+    assert q3 == {"id": None}
+
+    # Valid string and int still work
+    q4 = make_id_query(42)
+    assert q4.get("id") == 42 or "$or" in q4
+    print("[OK] test_nosql_injection_protection passed (operator injections safely rejected)")
+
+def test_faq_optimization_latency_compression():
+    """Verify FAQs are compressed and relevance-chunked to minimize token overhead."""
+    # Test without query_text: returns compact bullet summaries
+    ctx_general = load_faqs_context(query_text=None, max_faqs=5)
+    assert "• [" in ctx_general
+    assert "→" in ctx_general
+    # Verify it does not dump all 24 verbose items
+    assert ctx_general.count("• [") <= 5
+
+    # Test with query_text: returns targeted top-matching FAQ
+    ctx_delivery = load_faqs_context(query_text="How long does delivery take to Lahore?", max_faqs=3)
+    assert "delivery" in ctx_delivery.lower()
+    print("[OK] test_faq_optimization_latency_compression passed (compact high-speed prompt context)")
+
 if __name__ == "__main__":
     print("\n--- Running Phase 9 Automated Verification ---")
     test_fillers_endpoint()
@@ -202,4 +270,7 @@ if __name__ == "__main__":
     test_unauthenticated_call_logs_protection()
     test_guest_quota_enforcement()
     test_dynamic_branding_public()
+    test_authenticated_admin_bypasses_guest_quota()
+    test_nosql_injection_protection()
+    test_faq_optimization_latency_compression()
     print("\nALL VERIFICATION TESTS PASSED SUCCESSFULLY!\n")

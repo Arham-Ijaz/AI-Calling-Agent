@@ -26,7 +26,7 @@ async function loadProducts() {
     renderProductTable(productState.allProducts);
   } catch (err) {
     if (tbody) {
-      tbody.innerHTML = `<tr><td colspan="8" class="loading-row" style="color:var(--red)">Failed to load products: ${err.message}</td></tr>`;
+      tbody.innerHTML = `<tr><td colspan="8" class="loading-row" style="color:var(--red)">Failed to load products: ${window.escapeHtml ? window.escapeHtml(err.message) : err.message}</td></tr>`;
     }
   }
 }

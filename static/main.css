@@ -1556,14 +1556,31 @@ button, input, select, textarea {
   border: none;
   font-size: 1rem;
   cursor: pointer;
-  padding: 0.2rem 0.3rem;
+  padding: 0.3rem 0.4rem;
   border-radius: 6px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--text-muted);
   transition: var(--transition);
 }
 
 .btn-logout-icon:hover {
   background: var(--red-light);
-  transform: scale(1.1);
+  color: var(--red);
+  transform: scale(1.08);
+}
+
+.logout-power-icon {
+  display: inline-block;
+  vertical-align: middle;
+  stroke: currentColor;
+  flex-shrink: 0;
+  transition: transform 0.15s ease, stroke 0.15s ease;
+}
+
+.btn-logout-icon:hover .logout-power-icon {
+  stroke: var(--red);
 }
 
 /* ---- Mobile Auth Drawer Block ---- */

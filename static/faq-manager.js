@@ -26,7 +26,7 @@ async function loadFAQs() {
     renderFAQTable(faqState.allFaqs);
   } catch (err) {
     if (tbody) {
-      tbody.innerHTML = `<tr><td colspan="6" class="loading-row" style="color:var(--red)">Failed to load FAQs: ${err.message}</td></tr>`;
+      tbody.innerHTML = `<tr><td colspan="6" class="loading-row" style="color:var(--red)">Failed to load FAQs: ${window.escapeHtml ? window.escapeHtml(err.message) : err.message}</td></tr>`;
     }
   }
 }

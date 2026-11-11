@@ -4,10 +4,26 @@
 // AI Calling Agent — Authentication & RBAC Module
 // =====================================================================
 
-const authState = {
+window.escapeHtml = function(str) {
+  if (str === null || str === undefined) return "";
+  return String(str)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#039;");
+};
+
+window.authState = window.authState || {
   user: null,
   isLoggedIn: false,
   isAdmin: false,
+  token: null,
+};
+const authState = window.authState;
+
+window.isUserAuthenticated = function() {
+  return Boolean(window.authState && window.authState.isLoggedIn && window.authState.user);
 };
 
 // =====================================================================
@@ -21,6 +37,14 @@ async function checkAuthStatus() {
       authState.user = data.user;
       authState.isLoggedIn = true;
       authState.isAdmin = data.user.role === "admin";
+      try {
+        localStorage.removeItem("guest_turn_count");
+      } catch (_) {}
+      if (window.state) {
+        window.state.guestLimitReached = false;
+      }
+      const banner = document.getElementById("authGuestLimitBanner");
+      if (banner) banner.classList.add("hidden");
     } else {
       authState.user = null;
       authState.isLoggedIn = false;
