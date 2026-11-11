@@ -78,6 +78,9 @@ except ImportError:
 # =====================================================================
 load_dotenv()
 
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("ai_calling_agent")
+
 BASE_DIR = Path(__file__).resolve().parent
 
 
@@ -134,9 +137,6 @@ SESSION_ID_PATTERN = r"^[A-Za-z0-9_-]{1,64}$"
 PHONE_PATTERN = r"^\+?[0-9\s\-()]{10,20}$"
 EMAIL_PATTERN = r"^[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+$"
 ARABIC_SCRIPT = re.compile(r"[\u0600-\u06FF]")
-
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-log = logging.getLogger("ai_calling_agent")
 
 
 # =====================================================================
