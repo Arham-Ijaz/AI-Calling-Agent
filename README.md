@@ -150,19 +150,13 @@ Open **[http://127.0.0.1:8000](http://127.0.0.1:8000)** in Google Chrome or Micr
 
 ---
 
-## 🧪 Testing & Verification
+## 🩺 System Health & Verification
 
-The repository includes comprehensive automated test suites:
+The application provides a built-in health check and inspection endpoint:
 
 ```bash
-# 1. Run all pytest unit and integration tests (16 tests)
-python -m pytest tests/
-
-# 2. Run the 45-case benchmark evaluation suite
-python scripts/evaluate.py
-
-# 3. Run client echo-cancellation unit tests
-node tests/test_echo_filter.js
+# Verify system status, database connectivity & active Gemini API key:
+curl http://127.0.0.1:8000/api/health
 ```
 
 ---
