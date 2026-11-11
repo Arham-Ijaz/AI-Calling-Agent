@@ -1,7 +1,7 @@
 "use strict";
 
 // =====================================================================
-// DigiBuzz AI Calling Agent — Call Logs
+// AI Calling Agent — Call Logs (Role-Based Access Guarded)
 // =====================================================================
 
 const logsState = {
@@ -9,29 +9,69 @@ const logsState = {
 };
 
 // =====================================================================
-// Load & Render
+// Load & Render with Strict Guest Route Guard
 // =====================================================================
 async function loadCallLogs() {
   const tbody = document.getElementById("logsTableBody");
+
+  // 1. ROUTE GUARD: Ensure unauthenticated guests have strictly NO access to view call logs
+  if (!window.authState || !window.authState.user) {
+    if (tbody) {
+      tbody.innerHTML = `
+        <tr>
+          <td colspan="7" style="text-align:center;padding:3.5rem 1rem;">
+            <div class="auth-gate-card" role="alert" style="max-width:460px;margin:0 auto;background:var(--surface-card);border:2px dashed var(--border-strong);border-radius:var(--radius-lg);padding:2.5rem 1.5rem;box-shadow:var(--shadow);">
+              <div style="font-size:3rem;margin-bottom:0.75rem;" aria-hidden="true">🔒</div>
+              <h3 style="font-size:1.3rem;margin-bottom:0.5rem;color:var(--text);font-weight:700;">Call Logs Protected</h3>
+              <p style="color:var(--text-muted);font-size:0.92rem;line-height:1.5;margin-bottom:1.5rem;">
+                Unauthenticated guest users have strictly no access to view, edit, or delete call logs. Please sign in or create an account to view your conversation history and call metrics.
+              </p>
+              <div style="display:flex;gap:0.75rem;justify-content:center;flex-wrap:wrap;">
+                <button class="btn btn-brand" onclick="if(typeof openAuthModal==='function')openAuthModal('login');">🔐 Sign In</button>
+                <button class="btn btn-outline" onclick="if(typeof openAuthModal==='function')openAuthModal('register');">✨ Create Account</button>
+              </div>
+            </div>
+          </td>
+        </tr>`;
+    }
+    renderLogsStats([]);
+    return;
+  }
+
   if (tbody) {
     tbody.innerHTML = '<tr><td colspan="7" class="loading-row">Loading call logs…</td></tr>';
   }
 
   try {
     let serverCalls = [];
-    try {
-      const res = await fetch("/api/calls?limit=50", { credentials: "same-origin" });
-      if (res.ok) {
-        serverCalls = await res.json();
+    const res = await fetch("/api/calls?limit=50", { credentials: "same-origin" });
+    if (res.status === 401) {
+      // Session expired or unauthenticated
+      if (tbody) {
+        tbody.innerHTML = `
+          <tr>
+            <td colspan="7" style="text-align:center;padding:3rem 1rem;">
+              <div class="auth-gate-card" style="max-width:440px;margin:0 auto;">
+                <div style="font-size:2.5rem;margin-bottom:0.5rem;">🔒</div>
+                <h3>Authentication Required</h3>
+                <p style="color:var(--text-muted);margin-bottom:1rem;">Your session has expired. Please sign in to view call logs.</p>
+                <button class="btn btn-brand" onclick="if(typeof openAuthModal==='function')openAuthModal('login');">Sign In</button>
+              </div>
+            </td>
+          </tr>`;
       }
-    } catch (e) {
-      console.warn("Could not fetch server calls:", e);
+      renderLogsStats([]);
+      return;
     }
 
-    // Load client localStorage calls
+    if (res.ok) {
+      serverCalls = await res.json();
+    }
+
+    // Load client localStorage calls only for authenticated user
     let clientCalls = {};
     try {
-      const raw = localStorage.getItem("digibuzz_call_logs");
+      const raw = localStorage.getItem("calling_agent_logs");
       if (raw) clientCalls = JSON.parse(raw);
     } catch (e) {}
 
@@ -41,6 +81,7 @@ async function loadCallLogs() {
     // 1. Add server calls first
     for (const c of serverCalls) {
       mergedMap.set(c.session_id, {
+        id: c.id,
         session_id: c.session_id,
         started_at: c.started_at,
         last_activity: c.last_activity,
@@ -49,10 +90,11 @@ async function loadCallLogs() {
         total_messages: c.total_messages ?? 0,
         caller_name: c.caller_name || null,
         caller_email: c.caller_email || null,
+        user_id: c.user_id || null,
       });
     }
 
-    // 2. Overlay client calls (ensuring calls on serverless Vercel are never lost)
+    // 2. Overlay client calls
     for (const [sid, c] of Object.entries(clientCalls)) {
       if (mergedMap.has(sid)) {
         const existing = mergedMap.get(sid);
@@ -61,6 +103,7 @@ async function loadCallLogs() {
         existing.outcome = c.outcome || existing.outcome;
       } else {
         mergedMap.set(sid, {
+          id: c.id || null,
           session_id: sid,
           started_at: c.started_at || "—",
           last_activity: c.last_activity || "—",
@@ -72,7 +115,6 @@ async function loadCallLogs() {
     }
 
     const mergedList = Array.from(mergedMap.values());
-    // Sort by last_activity descending
     mergedList.sort((a, b) => (b.last_activity || "").localeCompare(a.last_activity || ""));
 
     logsState.calls = mergedList;
@@ -80,7 +122,7 @@ async function loadCallLogs() {
     renderLogsStats(logsState.calls);
   } catch (err) {
     if (tbody) {
-      tbody.innerHTML = `<tr><td colspan="7" class="loading-row" style="color:var(--red)">Failed to load logs: ${err.message}</td></tr>`;
+      tbody.innerHTML = `<tr><td colspan="7" class="loading-row" style="color:var(--red)">Failed to load logs: ${escLog(err.message)}</td></tr>`;
     }
   }
 }
@@ -99,16 +141,19 @@ function renderLogsTable(calls) {
       (c) => `
       <tr>
         <td>
-          <span class="mono" style="font-size:.8rem;">${escLog(c.session_id)}</span>
-          ${c.caller_name ? `<div style="font-size:.72rem;color:var(--brand);font-weight:600;">👤 ${escLog(c.caller_name)}</div>` : ""}
+          <span class="mono" style="font-size:.82rem;">${escLog(c.session_id)}</span>
+          ${c.caller_name ? `<div style="font-size:.74rem;color:var(--brand);font-weight:600;">👤 ${escLog(c.caller_name)}</div>` : ""}
         </td>
         <td>${escLog(c.started_at || "—")}</td>
         <td>${escLog(c.last_activity || "—")}</td>
         <td>${statusBadgeLog(c.status)}</td>
         <td>${outcomeBadge(c.outcome)}</td>
-        <td>${c.total_messages ?? 0}</td>
+        <td><strong>${c.total_messages ?? 0}</strong></td>
         <td>
-          <button class="btn btn-sm btn-edit-sm" onclick="viewSession('${escLog(c.session_id)}')">📄 View</button>
+          <div style="display:flex;gap:0.4rem;align-items:center;">
+            <button class="btn btn-sm btn-edit-sm" onclick="viewSession('${escLog(c.session_id)}')" aria-label="View transcript for session ${escLog(c.session_id)}">📄 View</button>
+            ${c.id ? `<button class="btn btn-sm btn-outline-danger" onclick="deleteSessionLog(${c.id}, '${escLog(c.session_id)}')" aria-label="Delete call log ${c.id}" title="Delete Call Log">🗑️</button>` : ""}
+          </div>
         </td>
       </tr>`
     )
@@ -133,27 +178,32 @@ function renderLogsStats(calls) {
 }
 
 function statusBadgeLog(status) {
-  if (status === "active") return '<span class="badge active">Active</span>';
+  if (status === "active") return '<span class="badge active" role="status">Active</span>';
   return `<span class="badge" style="background:var(--surface-card);color:var(--text-muted);">${escLog(status || "—")}</span>`;
 }
 
 function outcomeBadge(outcome) {
-  if (outcome === "Resolved") return '<span class="badge resolved">Resolved</span>';
-  if (outcome === "Escalated") return '<span class="badge escalated">Escalated</span>';
-  return `<span class="badge">${escLog(outcome || "—")}</span>`;
+  if (outcome === "Resolved") return '<span class="badge resolved" role="status">Resolved</span>';
+  if (outcome === "Escalated") return '<span class="badge escalated" role="status">Escalated</span>';
+  return `<span class="badge" role="status">${escLog(outcome || "—")}</span>`;
 }
 
 // =====================================================================
 // View Session Transcript
 // =====================================================================
 async function viewSession(sessionId) {
+  if (!window.authState || !window.authState.user) {
+    alert("Authentication required. Please sign in to view transcripts.");
+    return;
+  }
+
   const modal = document.getElementById("transcriptModal");
   const title = document.getElementById("transcriptModalTitle");
   const body = document.getElementById("transcriptModalBody");
 
   if (!modal || !body) return;
 
-  if (title) title.textContent = `Transcript — ${sessionId}`;
+  if (title) title.textContent = `Call Transcript — ${sessionId}`;
   body.innerHTML = '<div class="loading-row">Loading transcript…</div>';
   modal.classList.remove("hidden");
 
@@ -167,10 +217,10 @@ async function viewSession(sessionId) {
     console.warn("Server history fetch failed:", err);
   }
 
-  // Fallback to client localStorage if server has no messages for this session
+  // Fallback to client storage
   if (!messages || messages.length === 0) {
     try {
-      const raw = localStorage.getItem("digibuzz_call_logs");
+      const raw = localStorage.getItem("calling_agent_logs");
       if (raw) {
         const clientCalls = JSON.parse(raw);
         if (clientCalls[sessionId] && clientCalls[sessionId].messages) {
@@ -183,10 +233,48 @@ async function viewSession(sessionId) {
   renderTranscript(body, messages);
 }
 
+// =====================================================================
+// Delete Session Log
+// =====================================================================
+async function deleteSessionLog(callId, sessionId) {
+  if (!callId) return;
+  if (!confirm(`Are you sure you want to delete call log #${callId}? This action cannot be undone.`)) {
+    return;
+  }
+
+  try {
+    const res = await fetch(`/api/calls/${callId}`, {
+      method: "DELETE",
+      credentials: "same-origin",
+    });
+
+    if (!res.ok) {
+      const err = await res.json();
+      throw new Error(err.detail || `HTTP ${res.status}`);
+    }
+
+    // Clean up local cache
+    try {
+      const raw = localStorage.getItem("calling_agent_logs");
+      if (raw) {
+        const parsed = JSON.parse(raw);
+        if (parsed[sessionId]) {
+          delete parsed[sessionId];
+          localStorage.setItem("calling_agent_logs", JSON.stringify(parsed));
+        }
+      }
+    } catch (_) {}
+
+    await loadCallLogs();
+  } catch (err) {
+    alert(`Failed to delete call log: ${err.message}`);
+  }
+}
+
 function renderTranscript(container, messages) {
   if (!container) return;
   if (!messages || messages.length === 0) {
-    container.innerHTML = '<div class="loading-row">No messages in this session.</div>';
+    container.innerHTML = '<div class="loading-row">No messages recorded in this session.</div>';
     return;
   }
 
@@ -207,7 +295,7 @@ function renderTranscript(container, messages) {
 }
 
 // =====================================================================
-// Escape helper (local scope)
+// Escape helper
 // =====================================================================
 function escLog(str) {
   return String(str || "")

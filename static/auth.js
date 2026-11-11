@@ -1,7 +1,7 @@
 "use strict";
 
 // =====================================================================
-// DigiBuzz AI Calling Agent — Authentication & RBAC Module
+// AI Calling Agent — Authentication & RBAC Module
 // =====================================================================
 
 const authState = {
@@ -379,8 +379,15 @@ async function handleLogin(e) {
     authState.isLoggedIn = true;
     authState.isAdmin = data.user.role === "admin";
 
-    // Clean purge of any leftover client logs and start fresh session
-    try { localStorage.removeItem("digibuzz_call_logs"); } catch (_) {}
+    // Clean purge of any leftover client logs and unlock guest quota limits
+    try { 
+      localStorage.removeItem("calling_agent_logs"); 
+      localStorage.removeItem("digibuzz_call_logs"); 
+      localStorage.removeItem("guest_turn_count");
+    } catch (_) {}
+    if (window.state) window.state.guestLimitReached = false;
+    const guestBanner = document.getElementById("authGuestLimitBanner");
+    if (guestBanner) guestBanner.classList.add("hidden");
     if (typeof startNewSession === "function") startNewSession();
     if (typeof clearChat === "function") clearChat();
     if (window.logsState) logsState.calls = [];
@@ -444,8 +451,15 @@ async function handleRegister(e) {
     authState.isLoggedIn = true;
     authState.isAdmin = data.user.role === "admin";
 
-    // Clean purge of any leftover client logs and start fresh session
-    try { localStorage.removeItem("digibuzz_call_logs"); } catch (_) {}
+    // Clean purge of any leftover client logs and unlock guest quota limits
+    try { 
+      localStorage.removeItem("calling_agent_logs"); 
+      localStorage.removeItem("digibuzz_call_logs"); 
+      localStorage.removeItem("guest_turn_count");
+    } catch (_) {}
+    if (window.state) window.state.guestLimitReached = false;
+    const guestBanner = document.getElementById("authGuestLimitBanner");
+    if (guestBanner) guestBanner.classList.add("hidden");
     if (typeof startNewSession === "function") startNewSession();
     if (typeof clearChat === "function") clearChat();
     if (window.logsState) logsState.calls = [];
@@ -474,8 +488,11 @@ async function handleLogout() {
   authState.isLoggedIn = false;
   authState.isAdmin = false;
 
-  // Complete session wipe so no admin or previous user data bleeds
-  try { localStorage.removeItem("digibuzz_call_logs"); } catch (_) {}
+  // Complete session wipe so no user data bleeds across accounts
+  try { 
+    localStorage.removeItem("calling_agent_logs"); 
+    localStorage.removeItem("digibuzz_call_logs"); 
+  } catch (_) {}
   if (typeof endCall === "function") endCall();
   if (typeof startNewSession === "function") startNewSession();
   if (typeof clearChat === "function") clearChat();

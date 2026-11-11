@@ -1,7 +1,7 @@
 "use strict";
 
 // =====================================================================
-// DigiBuzz AI Calling Agent — Admin Management Panel
+// AI Calling Agent — Admin Management Panel
 // =====================================================================
 
 const adminState = {
@@ -126,7 +126,7 @@ function renderAdminUsersTable(users) {
         .slice(0, 2);
 
       const isCurrentAdmin = authState.user && authState.user.id === u.id;
-      const isPrimary = Boolean(u.is_primary) || u.id === 1 || (u.email && u.email.toLowerCase() === "admin@digibuzz.com");
+      const isPrimary = Boolean(u.is_primary) || u.id === 1 || (u.email && (u.email.toLowerCase() === "admin@digibuzz.com" || u.email.toLowerCase().startsWith("admin@")));
       const statusClass = u.is_active ? "badge-success" : "badge-danger";
       const statusText = u.is_active ? "Active" : "Suspended";
 
@@ -1295,13 +1295,17 @@ async function handleSaveBusinessSettings() {
     });
 
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const updated = await res.json().catch(() => payload);
+    if (typeof window.applyGlobalBranding === "function") {
+      window.applyGlobalBranding(updated);
+    }
     if (feedback) {
-      feedback.textContent = "✅ Business settings saved and voice prompt cache updated successfully.";
+      feedback.textContent = "✅ Business settings saved. Global branding and voice prompts updated dynamically.";
       feedback.style.color = "var(--emerald)";
       feedback.classList.remove("hidden");
       setTimeout(() => feedback.classList.add("hidden"), 4000);
     }
-    showAdminToast("Business settings updated successfully.");
+    showAdminToast("Business settings and branding updated globally.");
   } catch (err) {
     if (feedback) {
       feedback.textContent = `❌ Error saving settings: ${err.message}`;

@@ -3,17 +3,17 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=5.0" />
-  <title>DigiBuzz AI Calling Agent — Voice Customer Support SaaS</title>
+  <title id="docTitle">AI Calling Agent — Voice Customer Support SaaS</title>
   <link rel="stylesheet" href="/static/main.css" />
   <link rel="icon" href="/favicon.ico" type="image/x-icon" />
 </head>
 <body>
   <!-- ===== Top Navigation ===== -->
-  <nav class="navbar">
+  <nav class="navbar" role="navigation" aria-label="Main Navigation">
     <div class="navbar-brand">
-      <span class="brand-icon">📞</span>
-      <span class="brand-name">DigiBuzz <span class="brand-accent">AI</span></span>
-      <button class="key-status-badge" id="keyStatusBadge" title="API Key Status — click to view Settings" style="display:none;">🟢</button>
+      <span class="brand-icon" aria-hidden="true">📞</span>
+      <span class="brand-name" id="navBrandName">AI Calling <span class="brand-accent">Agent</span></span>
+      <button class="key-status-badge" id="keyStatusBadge" title="API Key Status — click to view Settings" style="display:none;" aria-label="API Key Status">🟢</button>
     </div>
     
     <ul class="nav-links" id="navLinks">
@@ -71,8 +71,8 @@
     <section id="page-home" class="page active">
       <div class="page-header">
         <div>
-          <h1>DigiBuzz AI Calling Agent</h1>
-          <p class="page-subtitle">Voice-first AI Customer Support Agent — Ask anything about wholesale products and orders</p>
+          <h1 id="pageHomeTitle">AI Calling Agent</h1>
+          <p class="page-subtitle" id="pageHomeSubtitle">Voice-first AI Customer Support Agent — Ask anything about products, catalog, and orders</p>
         </div>
       </div>
 
@@ -82,35 +82,35 @@
           <!-- Status Bar -->
           <div class="call-status-bar">
             <div class="status-indicator" id="statusIndicator">
-              <span class="status-dot idle" id="statusDot"></span>
-              <span id="statusText">Ready to connect</span>
+              <span class="status-dot idle" id="statusDot" aria-hidden="true"></span>
+              <span id="statusText" role="status" aria-live="polite">Ready to connect</span>
             </div>
             <!-- Tap to Interrupt Button (Phase 9B: Visible during agent speaking) -->
-            <button class="btn btn-outline btn-sm hidden interrupt-pill" id="btnTapInterrupt" title="Interrupt the agent and speak">✋ Tap to interrupt</button>
+            <button class="btn btn-outline btn-sm hidden interrupt-pill" id="btnTapInterrupt" title="Interrupt the agent and speak" aria-label="Interrupt agent and speak">✋ Tap to interrupt</button>
             <!-- Live Voice Tip Hint Banner -->
-            <div id="callHintBanner" class="call-hint-banner" style="display:none;">
+            <div id="callHintBanner" class="call-hint-banner" style="display:none;" role="note">
               <span>💡 Tip:</span> Say <em>"End Call"</em> or <em>"Bye"</em> anytime to finish the call
             </div>
             <div class="call-controls">
-              <button class="btn btn-success" id="btnStartCall">📞 Start Call</button>
-              <button class="btn btn-danger hidden" id="btnEndCall">📵 End Call</button>
-              <button class="btn btn-outline" id="btnNewSession" title="Start a new session">🔄 New Session</button>
+              <button class="btn btn-success" id="btnStartCall" aria-label="Start Call">📞 Start Call</button>
+              <button class="btn btn-danger hidden" id="btnEndCall" aria-label="End Call">📵 End Call</button>
+              <button class="btn btn-outline" id="btnNewSession" title="Start a new session" aria-label="Start New Session">🔄 New Session</button>
             </div>
           </div>
 
           <!-- Chat Window -->
-          <div class="chat-window" id="chatWindow">
+          <div class="chat-window" id="chatWindow" role="log" aria-live="polite" aria-label="Conversation messages">
             <div class="chat-placeholder" id="chatPlaceholder">
-              <div class="placeholder-icon">🎙️</div>
-              <p>Click <strong>Start Call</strong> to connect with the DigiBuzz AI Calling Agent.</p>
+              <div class="placeholder-icon" aria-hidden="true">🎙️</div>
+              <p id="chatPlaceholderMsg">Click <strong>Start Call</strong> to connect with the AI Calling Agent.</p>
               <p class="text-muted">You can speak via your microphone or type messages. The AI answers in real-time with live voice.</p>
             </div>
           </div>
 
           <!-- Typing Indicator -->
-          <div class="typing-indicator hidden" id="typingIndicator">
-            <span></span><span></span><span></span>
-            <span class="typing-label">DigiBuzz AI is responding…</span>
+          <div class="typing-indicator hidden" id="typingIndicator" role="status" aria-live="polite">
+            <span aria-hidden="true"></span><span aria-hidden="true"></span><span aria-hidden="true"></span>
+            <span class="typing-label" id="typingLabel">AI Assistant is responding…</span>
           </div>
 
           <!-- Input Bar -->
@@ -588,7 +588,7 @@
         <div style="padding: 1.5rem; display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 1rem;">
           <div class="form-group">
             <label for="setBizName">Business / Clinic / Store Name *</label>
-            <input type="text" id="setBizName" class="form-input" placeholder="e.g. Apex Health & Support" />
+            <input type="text" id="setBizName" class="form-input" placeholder="e.g. Acme Corporation or Arham Support" />
           </div>
           <div class="form-group">
             <label for="setBizType">Business Domain / Industry *</label>
@@ -709,7 +709,7 @@
           </div>
           <div class="info-row">
             <span class="info-label">Platform Edition</span>
-            <span class="info-value">DigiBuzz SaaS v3.0</span>
+            <span class="info-value" id="settingsPlatformEdition">AI Calling SaaS v3.0</span>
           </div>
           <div class="info-row">
             <span class="info-label">Data Privacy</span>
@@ -792,7 +792,7 @@
             </div>
             <div class="info-row">
               <span class="info-label">Database Engine</span>
-              <span class="info-value" id="settingsDbPath">SQLite WAL (Multi-Tenant)</span>
+              <span class="info-value" id="settingsDbPath">MongoDB Atlas (Cloud Multi-Tenant)</span>
             </div>
           </div>
         </div>
@@ -814,7 +814,14 @@
       </div>
 
       <div class="modal-body">
-        <div class="auth-error-box hidden" id="authErrorBox"></div>
+        <div id="authGuestLimitBanner" class="auth-guest-banner hidden" role="alert">
+          <div class="guest-banner-icon">🔒</div>
+          <div class="guest-banner-text">
+            <strong>Free Guest Quota Reached</strong>
+            <p>You have reached the free guest limit of 3 interactions. Sign in or register to continue calls, place orders, and view call transcripts.</p>
+          </div>
+        </div>
+        <div class="auth-error-box hidden" id="authErrorBox" role="alert" aria-live="assertive"></div>
 
         <!-- Login Form -->
         <form id="authFormLogin" autocomplete="on">
@@ -826,7 +833,7 @@
             <label for="loginPassword">Password</label>
             <div class="password-input-wrapper">
               <input type="password" id="loginPassword" class="form-input" placeholder="Enter your password" required />
-              <button type="button" class="password-toggle-btn" data-target="loginPassword">🔒</button>
+              <button type="button" class="password-toggle-btn" data-target="loginPassword" aria-label="Toggle password visibility">🔒</button>
             </div>
           </div>
           <button type="submit" class="btn btn-brand btn-block mt-2" id="btnLoginSubmit">Sign In</button>
@@ -840,7 +847,7 @@
           </div>
           <div class="form-group">
             <label for="regEmail">Email Address</label>
-            <input type="email" id="regEmail" class="form-input" placeholder="e.g. arham@digibuzz.com" required />
+            <input type="email" id="regEmail" class="form-input" placeholder="e.g. user@example.com" required />
           </div>
           <div class="form-group">
             <label for="regPhone">Mobile Phone Number</label>
@@ -850,14 +857,14 @@
             <label for="regPassword">Password</label>
             <div class="password-input-wrapper">
               <input type="password" id="regPassword" class="form-input" placeholder="Min. 8 chars (letters & numbers)" minlength="8" required />
-              <button type="button" class="password-toggle-btn" data-target="regPassword">🔒</button>
+              <button type="button" class="password-toggle-btn" data-target="regPassword" aria-label="Toggle password visibility">🔒</button>
             </div>
           </div>
           <div class="form-group">
             <label for="regPasswordConfirm">Confirm Password</label>
             <div class="password-input-wrapper">
               <input type="password" id="regPasswordConfirm" class="form-input" placeholder="Confirm your password" minlength="8" required />
-              <button type="button" class="password-toggle-btn" data-target="regPasswordConfirm">🔒</button>
+              <button type="button" class="password-toggle-btn" data-target="regPasswordConfirm" aria-label="Toggle password visibility">🔒</button>
             </div>
           </div>
           <button type="submit" class="btn btn-brand btn-block mt-2" id="btnRegisterSubmit">Create Account</button>

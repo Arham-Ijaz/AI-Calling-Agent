@@ -84,16 +84,15 @@ BASE_DIR = Path(__file__).resolve().parent
 # =====================================================================
 # MongoDB Atlas Database Configuration & Vercel Connection Caching
 # =====================================================================
-MONGODB_URI = os.getenv(
-    "MONGODB_URI",
-    "mongodb://sheikh66752_db_user:NEmB6MVobQzWfBL9@ac-zlwkrvq-shard-00-00.ksuapus.mongodb.net:27017,ac-zlwkrvq-shard-00-01.ksuapus.mongodb.net:27017,ac-zlwkrvq-shard-00-02.ksuapus.mongodb.net:27017/?ssl=true&replicaSet=atlas-tgmsyx-shard-0&authSource=admin",
-)
+MONGODB_URI = os.getenv("MONGODB_URI", "").strip()
+if not MONGODB_URI:
+    log.error("MONGODB_URI environment variable is missing. Please set MONGODB_URI in your .env or platform secrets.")
 MONGODB_DB_NAME = os.getenv("MONGODB_DB_NAME", "ai_calling_db")
 
 # The MongoClient MUST be initialized globally (outside the FastAPI route functions)
 # so Vercel caches the connection pool across serverless invocations.
-mongo_client: MongoClient = MongoClient(MONGODB_URI)
-mongo_db = mongo_client[MONGODB_DB_NAME]
+mongo_client: MongoClient = MongoClient(MONGODB_URI) if MONGODB_URI else None
+mongo_db = mongo_client[MONGODB_DB_NAME] if mongo_client is not None else None
 FAQ_PATH = BASE_DIR / "faq.json"
 PRODUCTS_PATH = BASE_DIR / "products.json"
 INDEX_HTML = BASE_DIR / "index.html"
@@ -104,10 +103,10 @@ GEMINI_TIMEOUT_S = 25
 MAX_HISTORY_TURNS = 6
 MAX_SESSIONS = 500
 
-JWT_SECRET = os.getenv("JWT_SECRET", "digibuzz_saas_secure_jwt_secret_key_2026_super_safe_and_random")
+JWT_SECRET = os.getenv("JWT_SECRET", "ai_calling_secure_jwt_secret_key_super_safe_and_random_2026")
 JWT_ALGORITHM = "HS256"
 JWT_EXPIRATION_DAYS = 7
-COOKIE_NAME = "digibuzz_session"
+COOKIE_NAME = os.getenv("SESSION_COOKIE_NAME", "calling_session")
 IS_PRODUCTION = bool(os.getenv("VERCEL") == "1" or os.getenv("ENVIRONMENT") == "production")
 
 ESCALATION_REPLY = "I am transferring your call to a dedicated Human Support Agent. Please hold on."
@@ -413,18 +412,18 @@ def seed_faqs() -> None:
     log.info("Seeded %d platform FAQs into MongoDB.", seeded)
 
 
-PRIMARY_ADMIN_EMAIL = os.getenv("DEFAULT_ADMIN_EMAIL", "admin@digibuzz.com").strip().lower()
+PRIMARY_ADMIN_EMAIL = os.getenv("DEFAULT_ADMIN_EMAIL", "admin@callingagent.com").strip().lower()
 
 
 def is_primary_admin(user_id: int | str | None = None, email: str | None = None) -> bool:
     """Check if the given user_id or email corresponds to the Primary Super Admin."""
     if user_id in (1, "1"):
         return True
-    if email and email.strip().lower() == PRIMARY_ADMIN_EMAIL:
+    if email and email.strip().lower() in (PRIMARY_ADMIN_EMAIL, "admin@callingagent.com", "admin@digibuzz.com"):
         return True
     try:
         row = mongo_db["users"].find_one(
-            {"$or": [{"email": PRIMARY_ADMIN_EMAIL}, {"role": "admin"}]},
+            {"$or": [{"email": PRIMARY_ADMIN_EMAIL}, {"email": "admin@digibuzz.com"}, {"role": "admin"}]},
             sort=[("id", 1)],
         )
         if row:
@@ -467,8 +466,8 @@ def seed_default_admin() -> None:
 def seed_business_settings() -> None:
     """Seed default business settings if not already present."""
     defaults = {
-        "business_name": "Apex Support Services",
-        "business_type": "Products & Healthcare/Consulting Services",
+        "business_name": "AI Calling Support",
+        "business_type": "Products & Customer Support Services",
         "greeting": "Hello! Welcome to our automated customer assistance. How may I assist you with our catalog and services today?",
         "working_hours": "Monday to Saturday from 9:00 AM to 6:00 PM",
         "language_default": "en",
@@ -1000,7 +999,7 @@ init_db()
 SESSIONS: OrderedDict[str, list[dict]] = OrderedDict()
 CONSECUTIVE_ERRORS: int = 0
 GUEST_TURNS: dict[str, int] = {}
-GUEST_CALL_LIMIT = 5
+GUEST_CALL_LIMIT = int(os.getenv("GUEST_CALL_LIMIT", "3"))
 
 
 def check_guest_limit(session_id: str, user_id: int | None, is_urdu: bool = False) -> dict | None:
@@ -1012,9 +1011,9 @@ def check_guest_limit(session_id: str, user_id: int | None, is_urdu: bool = Fals
     if turns > GUEST_CALL_LIMIT:
         b_name = get_business_setting("business_name", "our business")
         if is_urdu:
-            msg = f"آپ نے مفت گیسٹ کال کی حد ({GUEST_CALL_LIMIT} سوالات) مکمل کر لی ہے۔ مزید گفتگو جاری رکھنے اور آرڈرز کے لیے برائے مہربانی اکاؤنٹ بنائیں یا لاگ ان کریں۔"
+            msg = f"آپ نے مفت گیسٹ کال کی حد ({GUEST_CALL_LIMIT} سوالات) مکمل کر لی ہے۔ مزید گفتگو جاری رکھنے، کال لاگز دیکھنے اور آرڈرز کے لیے برائے مہربانی اکاؤنٹ بنائیں یا لاگ ان کریں۔"
         else:
-            msg = f"You have reached the free guest call limit of {GUEST_CALL_LIMIT} questions. Please sign up or log in to your account to continue placing orders and speaking with our AI assistant at {b_name}."
+            msg = f"You have reached the free guest limit of {GUEST_CALL_LIMIT} interactions. Please sign in or create an account to view call logs, place orders, and continue speaking with our AI assistant at {b_name}."
         return {
             "reply": msg,
             "speech": msg,
@@ -1434,7 +1433,7 @@ class HandoffPriorityRequest(BaseModel):
 # =====================================================================
 async def get_optional_user(request: Request) -> dict | None:
     """Extract authenticated user if session cookie or Bearer token is present, else None."""
-    token = request.cookies.get(COOKIE_NAME)
+    token = request.cookies.get(COOKIE_NAME) or request.cookies.get("digibuzz_session")
     if not token:
         auth_hdr = request.headers.get("Authorization")
         if auth_hdr and auth_hdr.startswith("Bearer "):
@@ -1494,7 +1493,7 @@ class MongoJSONResponse(JSONResponse):
 
 
 app = FastAPI(
-    title="DigiBuzz AI Calling Agent",
+    title="AI Customer Calling Agent",
     description="Multi-tenant Voice-based AI Customer Support Platform powered by Gemini and MongoDB Atlas.",
     version="3.0.0",
     default_response_class=MongoJSONResponse,
@@ -1512,9 +1511,10 @@ async def on_startup_warmup():
 async def add_security_headers(request: Request, call_next):
     response = await call_next(request)
     response.headers["X-Content-Type-Options"] = "nosniff"
-    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["X-Frame-Options"] = "SAMEORIGIN"
     response.headers["X-XSS-Protection"] = "1; mode=block"
     response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+    response.headers["Permissions-Policy"] = "microphone=(self)"
     return response
 
 
@@ -1527,7 +1527,8 @@ async def serve_index():
     """Serve the single-page web dashboard."""
     if INDEX_HTML.exists():
         return FileResponse(INDEX_HTML)
-    return {"message": "DigiBuzz AI Calling Agent API is running."}
+    b_name = get_business_setting("business_name", "AI Calling Agent")
+    return {"message": f"{b_name} API is running."}
 
 
 @app.get("/favicon.ico", include_in_schema=False)
@@ -2721,7 +2722,7 @@ async def websocket_ai_call_endpoint(websocket: WebSocket):
 
     # Extract authenticated user context if cookie or token present
     opt_user = None
-    token = websocket.cookies.get(COOKIE_NAME)
+    token = websocket.cookies.get(COOKIE_NAME) or websocket.cookies.get("digibuzz_session")
     if not token and "token" in websocket.query_params:
         token = websocket.query_params["token"]
     if token:
@@ -3511,19 +3512,16 @@ async def get_recent_calls(
     request: Request,
     limit: int = Query(default=50, ge=1, le=100),
     target_user_id: int | None = Query(default=None),
+    current_user: dict = Depends(get_current_user),
 ):
     """Return recent calls from MongoDB: Regular users strictly see their own; Admins can see all."""
-    user = await get_optional_user(request)
-
     def query():
         query_filter = {}
-        if user and user.get("role") == "admin":
+        if current_user.get("role") == "admin":
             if target_user_id:
                 query_filter["user_id"] = target_user_id
-        elif user:
-            query_filter["user_id"] = user["id"]
         else:
-            query_filter["user_id"] = None
+            query_filter["user_id"] = current_user["id"]
 
         rows = list(mongo_db["calls"].find(query_filter).sort("id", -1).limit(limit))
         out = []
@@ -3547,18 +3545,16 @@ async def get_recent_calls(
 async def get_conversation_history(
     request: Request,
     session_id: str = Query(..., pattern=SESSION_ID_PATTERN),
+    current_user: dict = Depends(get_current_user),
 ):
     """Return full conversation transcript for a session, checking tenant ownership."""
-    user = await get_optional_user(request)
-
     def query():
         call = mongo_db["calls"].find_one({"session_id": session_id})
         if not call:
             return 404, []
 
-        if call.get("user_id") is not None:
-            if not user or (user.get("role") != "admin" and user.get("id") != call.get("user_id")):
-                return 403, []
+        if current_user.get("role") != "admin" and call.get("user_id") != current_user.get("id"):
+            return 403, []
 
         rows = list(mongo_db["call_messages"].find({"call_id": call.get("id")}).sort("id", 1))
         return 200, serialize_docs(rows)
@@ -3573,15 +3569,18 @@ async def get_conversation_history(
 
 
 @app.post("/api/calls/sync")
-async def sync_client_calls(req: SyncCallRequest, request: Request):
+async def sync_client_calls(
+    req: SyncCallRequest,
+    request: Request,
+    current_user: dict = Depends(get_current_user),
+):
     """Sync client-side recorded session logs into MongoDB database with user binding."""
-    user = await get_optional_user(request)
-    user_id = user["id"] if user else None
+    user_id = current_user["id"]
 
     def _sync():
         existing = mongo_db["calls"].find_one({"session_id": req.session_id})
         if existing and existing.get("user_id") is not None:
-            if user_id != existing.get("user_id") and (not user or user.get("role") != "admin"):
+            if user_id != existing.get("user_id") and current_user.get("role") != "admin":
                 return {"status": "error", "detail": "Access denied. Cannot sync to another user's session."}
 
         call_id = get_or_create_call(req.session_id, user_id)
@@ -3620,6 +3619,25 @@ async def sync_client_calls(req: SyncCallRequest, request: Request):
         return {"status": "error", "detail": str(exc)}
 
 
+@app.delete("/api/calls/{call_id}")
+async def delete_call_log(
+    call_id: int,
+    current_user: dict = Depends(get_current_user),
+):
+    """Delete a call log and associated messages. Regular users delete only their own; Admins delete any."""
+    def _delete():
+        call = mongo_db["calls"].find_one(make_id_query(call_id))
+        if not call:
+            raise HTTPException(status_code=404, detail="Call record not found.")
+        if current_user.get("role") != "admin" and call.get("user_id") != current_user.get("id"):
+            raise HTTPException(status_code=403, detail="Access denied. You do not own this call log.")
+        mongo_db["call_messages"].delete_many({"call_id": call.get("id")})
+        mongo_db["calls"].delete_one({"_id": call["_id"]})
+        return {"status": "success", "message": f"Call {call_id} and transcripts deleted."}
+
+    return await asyncio.to_thread(_delete)
+
+
 # =====================================================================
 # 17B. Business Settings Endpoints (Phase 4 Generic Store & Services)
 # =====================================================================
@@ -3644,6 +3662,8 @@ async def update_business_settings_endpoint(settings: BusinessSettingsUpdate, ad
             )
         refresh_business_settings_cache()
         CACHED_STREAM_SYSTEM_INSTRUCTION.clear()
+        CACHED_FAQS.clear()
+        CACHED_PRODUCTS.clear()
         return get_all_business_settings()
 
     return await asyncio.to_thread(_update)

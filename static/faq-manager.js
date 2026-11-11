@@ -1,7 +1,7 @@
 "use strict";
 
 // =====================================================================
-// DigiBuzz AI Calling Agent — FAQ Manager (Multi-Tenant Scoped)
+// AI Calling Agent — FAQ Manager (Multi-Tenant Scoped)
 // =====================================================================
 
 const faqState = {

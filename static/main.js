@@ -346,9 +346,37 @@ function updateSessionDisplay() {
   if (settEl) { settEl.textContent = short; settEl.title = state.sessionId || ""; }
 }
 
-function recordClientCallTurn(sessionId, userText, botReply, intent, outcome) {
+function getGuestUsageCount() {
   try {
-    const raw = localStorage.getItem("digibuzz_call_logs");
+    return parseInt(localStorage.getItem("guest_turn_count") || "0", 10);
+  } catch (_) {
+    return 0;
+  }
+}
+
+function incrementGuestUsageCount() {
+  try {
+    const next = getGuestUsageCount() + 1;
+    localStorage.setItem("guest_turn_count", String(next));
+    return next;
+  } catch (_) {
+    return 1;
+  }
+}
+
+window.resetGuestUsageCount = function() {
+  try {
+    localStorage.removeItem("guest_turn_count");
+  } catch (_) {}
+};
+
+function recordClientCallTurn(sessionId, userText, botReply, intent, outcome) {
+  // Call logs are strictly protected: unauthenticated guests have NO access to store or view logs!
+  if (!window.authState || !window.authState.user) {
+    return;
+  }
+  try {
+    const raw = localStorage.getItem("calling_agent_logs");
     const logs = raw ? JSON.parse(raw) : {};
     if (!logs[sessionId]) {
       logs[sessionId] = {
@@ -372,7 +400,7 @@ function recordClientCallTurn(sessionId, userText, botReply, intent, outcome) {
       detected_intent: intent || "general_inquiry",
       outcome: outcome || "Resolved",
     });
-    localStorage.setItem("digibuzz_call_logs", JSON.stringify(logs));
+    localStorage.setItem("calling_agent_logs", JSON.stringify(logs));
 
     // Non-blocking sync to server database
     fetch("/api/calls/sync", {
@@ -391,6 +419,14 @@ function recordClientCallTurn(sessionId, userText, botReply, intent, outcome) {
 // =====================================================================
 async function startCall() {
   if (state.isOnCall) return;
+
+  // Guest Quota: 3 interactions max for unauthenticated guests
+  if (!window.authState?.user && (state.guestLimitReached || getGuestUsageCount() >= 3)) {
+    state.guestLimitReached = true;
+    showGuestLimitNotice("You have reached the free guest limit of 3 interactions. Please sign in or create an account to start a call.");
+    return;
+  }
+
   state.isOnCall = true;
 
   // Ensure AudioContext is initialized and unlocked during user gesture
@@ -420,7 +456,8 @@ async function startCall() {
   await initMicAudioStream();
 
   hidePlaceholder();
-  const greeting = "Hello! I am the DigiBuzz AI Calling Agent. How may I assist you with our products or services today?";
+  const bName = state.businessName || "AI";
+  const greeting = state.greeting || `Hello! I am the ${bName} AI Calling Agent. How may I assist you with our products or services today?`;
   addBotMessage(greeting);
   loadChips();
 
@@ -492,10 +529,11 @@ function hidePlaceholder() {
 
 function clearChat() {
   const win = $("chatWindow");
+  const bName = state.businessName || "AI";
   win.innerHTML = `
     <div class="chat-placeholder" id="chatPlaceholder">
-      <div class="placeholder-icon">🎙️</div>
-      <p>Click <strong>Start Call</strong> to connect with the DigiBuzz AI Calling Agent.</p>
+      <div class="placeholder-icon" aria-hidden="true">🎙️</div>
+      <p id="chatPlaceholderMsg">Click <strong>Start Call</strong> to connect with the ${escapeHtml(bName)} AI Calling Agent.</p>
       <p class="text-muted">You can type or use voice to ask questions about products, pricing, delivery, and more.</p>
     </div>`;
 }
@@ -635,7 +673,7 @@ function setCallState(newState, detailText = "") {
       state.isBusy = true;
       state.agentSpeaking = false;
       if (dot) dot.className = "status-dot thinking";
-      if (label) label.textContent = detailText || "DigiBuzz AI is thinking…";
+      if (label) label.textContent = detailText || `${state.businessName || "AI"} is thinking…`;
       if (typing) typing.classList.remove("hidden");
       if (micBtn) {
         micBtn.classList.remove("listening", "speaking-muted");
@@ -650,7 +688,7 @@ function setCallState(newState, detailText = "") {
       state.isBusy = true;
       state.agentSpeaking = true;
       if (dot) dot.className = "status-dot speaking";
-      if (label) label.textContent = detailText || "DigiBuzz AI is speaking…";
+      if (label) label.textContent = detailText || `${state.businessName || "AI"} is speaking…`;
       if (typing) typing.classList.add("hidden");
       if (micBtn) {
         micBtn.classList.remove("listening");
@@ -1525,6 +1563,17 @@ async function sendMessage(text) {
   text = (text || $("chatInput").value).trim();
   if (!text || !state.isOnCall || state.isBusy) return;
 
+  // Guest Quota: 3 interactions max for unauthenticated guests
+  if (!window.authState?.user) {
+    if (state.guestLimitReached || getGuestUsageCount() >= 3) {
+      state.guestLimitReached = true;
+      if (state.isOnCall) endCall();
+      showGuestLimitNotice("You have reached the free guest limit of 3 messages. Please sign in or create an account to continue.");
+      return;
+    }
+    incrementGuestUsageCount();
+  }
+
   $("chatInput").value = "";
   addUserMessage(text);
   state.activeUserText = text;
@@ -1552,9 +1601,10 @@ async function sendMessage(text) {
   // Check if caller wants to finish the call via voice command
   if (isEndCallPhrase(text)) {
     const isUrdu = ARABIC_SCRIPT_REGEX.test(text) || detectInputLanguage(text) !== "en";
+    const bName = state.businessName || "our support";
     const farewell = isUrdu
       ? "کال کرنے کا بہت شکریہ۔ اپنا خیال رکھیے گا، اللہ حافظ!"
-      : "Thank you for calling DigiBuzz Support. Have a wonderful day ahead! Goodbye.";
+      : `Thank you for calling ${bName}. Have a wonderful day ahead! Goodbye.`;
     addBotMessage(farewell);
     
     if (state.isVoiceEnabled) {
@@ -2189,10 +2239,10 @@ function sleep(ms) {
 }
 
 // =====================================================================
-// Theme Manager (Dark & Light)
+// Theme Manager (Dark & Light — WCAG AAA Compliant)
 // =====================================================================
 function initTheme() {
-  const saved = localStorage.getItem("digibuzz_theme");
+  const saved = localStorage.getItem("app_theme") || localStorage.getItem("digibuzz_theme");
   const prefersDark = window.matchMedia("(prefers-color-scheme: dark)").matches;
   const theme = saved || (prefersDark ? "dark" : "light");
   applyTheme(theme);
@@ -2218,7 +2268,8 @@ function initTheme() {
 
 function applyTheme(theme) {
   document.documentElement.setAttribute("data-theme", theme);
-  localStorage.setItem("digibuzz_theme", theme);
+  localStorage.setItem("app_theme", theme);
+  try { localStorage.setItem("digibuzz_theme", theme); } catch (_) {}
   
   const icon = $("themeToggleIcon");
   const text = $("themeToggleText");
@@ -2241,11 +2292,68 @@ function applyTheme(theme) {
 }
 
 // =====================================================================
+// Dynamic Branding & Whitelabeling Engine (Centralized Business Profile)
+// =====================================================================
+window.applyGlobalBranding = function(settings) {
+  if (!settings) return;
+  const bName = settings.business_name || "AI Calling Support";
+  const bType = settings.business_type || "Products & Services";
+  const greeting = settings.greeting || `Hello! I am the automated calling assistant for ${bName}. How may I assist you today?`;
+
+  state.businessName = bName;
+  state.businessType = bType;
+  state.greeting = greeting;
+  state.businessSettings = settings;
+
+  // 1. Document title
+  const docTitle = document.getElementById("docTitle") || document.querySelector("title");
+  if (docTitle) docTitle.textContent = `${bName} — Voice Customer Support SaaS`;
+
+  // 2. Navbar brand name
+  const navBrand = document.getElementById("navBrandName");
+  if (navBrand) {
+    navBrand.innerHTML = `${escapeHtml(bName)} <span class="brand-accent">AI</span>`;
+  }
+
+  // 3. Page home title & subtitle
+  const homeTitle = document.getElementById("pageHomeTitle");
+  if (homeTitle) homeTitle.textContent = `${bName} AI Calling Agent`;
+
+  const homeSub = document.getElementById("pageHomeSubtitle");
+  if (homeSub) homeSub.textContent = `Voice-first AI Customer Support Agent for ${bName} — Ask anything about ${bType.toLowerCase()}`;
+
+  // 4. Chat placeholder text
+  const chatPh = document.getElementById("chatPlaceholderMsg");
+  if (chatPh) chatPh.innerHTML = `Click <strong>Start Call</strong> to connect with the ${escapeHtml(bName)} AI Calling Agent.`;
+
+  // 5. Typing indicator label
+  const tl = document.getElementById("typingLabel");
+  if (tl) tl.textContent = `${bName} AI is responding…`;
+
+  // 6. Settings platform edition
+  const pe = document.getElementById("settingsPlatformEdition");
+  if (pe) pe.textContent = `${bName} SaaS v3.0`;
+};
+
+async function loadGlobalBranding() {
+  try {
+    const res = await fetch("/api/business-settings", { credentials: "same-origin" });
+    if (res.ok) {
+      const data = await res.json();
+      window.applyGlobalBranding(data);
+    }
+  } catch (err) {
+    console.warn("Could not fetch business settings on boot:", err);
+  }
+}
+
+// =====================================================================
 // Initialization
 // =====================================================================
 document.addEventListener("DOMContentLoaded", () => {
   initTheme();
   initNavigation();
+  loadGlobalBranding();
   initSession();
   initSpeechRecognition();
   loadChips();
@@ -2433,11 +2541,12 @@ async function handleConfirmCustomerCancel() {
 }
 
 function showGuestLimitNotice(msg) {
+  state.guestLimitReached = true;
   const container = document.getElementById("toastNotificationContainer") || document.body;
   const toast = document.createElement("div");
   toast.className = "notification-toast urgent";
-  toast.style.cssText = "position:fixed;top:20px;right:20px;z-index:9999;background:#ef4444;color:#fff;padding:14px 20px;border-radius:10px;box-shadow:0 6px 18px rgba(0,0,0,0.35);font-size:0.92rem;max-width:400px;line-height:1.4;";
-  toast.innerHTML = `<strong>⚠️ Guest Limit Reached</strong><br>${msg || "You have reached the free guest call limit. Please sign up or log in to continue."}`;
+  toast.style.cssText = "position:fixed;top:20px;right:20px;z-index:9999;background:var(--red);color:#fff;padding:14px 20px;border-radius:10px;box-shadow:0 6px 18px rgba(0,0,0,0.35);font-size:0.92rem;max-width:400px;line-height:1.4;";
+  toast.innerHTML = `<strong>⚠️ Free Guest Quota Reached</strong><br>${msg || "You have reached the free guest limit of 3 interactions. Please sign in or create an account to continue."}`;
   container.appendChild(toast);
   setTimeout(() => {
     toast.style.opacity = "0";
@@ -2445,9 +2554,12 @@ function showGuestLimitNotice(msg) {
     setTimeout(() => toast.remove(), 500);
   }, 6000);
 
+  // Reveal the mandatory guest limit banner in the auth modal and trigger wall
+  const banner = document.getElementById("authGuestLimitBanner");
+  if (banner) banner.classList.remove("hidden");
   if (typeof openAuthModal === "function") {
     setTimeout(() => {
-      openAuthModal("register");
-    }, 1200);
+      openAuthModal("login");
+    }, 400);
   }
 }

@@ -1,7 +1,7 @@
 "use strict";
 
 // =====================================================================
-// DigiBuzz AI Calling Agent — Product Catalog Manager (Multi-Tenant)
+// AI Calling Agent — Product Catalog Manager (Multi-Tenant)
 // =====================================================================
 
 const productState = {

@@ -11,10 +11,10 @@ from pymongo import MongoClient
 
 load_dotenv()
 
-MONGODB_URI = os.getenv(
-    "MONGODB_URI",
-    "mongodb://sheikh66752_db_user:NEmB6MVobQzWfBL9@ac-zlwkrvq-shard-00-00.ksuapus.mongodb.net:27017,ac-zlwkrvq-shard-00-01.ksuapus.mongodb.net:27017,ac-zlwkrvq-shard-00-02.ksuapus.mongodb.net:27017/?ssl=true&replicaSet=atlas-tgmsyx-shard-0&authSource=admin",
-)
+MONGODB_URI = os.getenv("MONGODB_URI")
+if not MONGODB_URI:
+    print("Error: MONGODB_URI environment variable is not set. Please configure .env")
+    exit(1)
 MONGODB_DB_NAME = os.getenv("MONGODB_DB_NAME", "ai_calling_db")
 
 parser = argparse.ArgumentParser(description="View AI calling assistant logs from MongoDB Atlas")

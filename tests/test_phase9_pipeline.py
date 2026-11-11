@@ -46,7 +46,7 @@ def test_instant_fast_path_greetings():
 
     assert len(sentence_events) >= 1
     full_sentence = " ".join(s["text"] for s in sentence_events)
-    assert any(term in full_sentence for term in ["Apex", "assistance", "DigiBuzz", "Hello"])
+    assert any(term in full_sentence for term in ["Apex", "assistance", "DigiBuzz", "Hello", "AI", "Calling", "Agent"])
     assert meta_event["intent"] == "greeting"
     assert meta_event["confidence"] == 1.0
     assert done_event["type"] == "done"
@@ -122,7 +122,7 @@ def test_call_messages_persistence():
 
 def test_tts_cache():
     async def _run():
-        text = "Hello! Welcome to DigiBuzz."
+        text = "Hello! Welcome to our automated assistance."
         # First call synthesizes
         audio1 = await synthesize_edge_tts(text)
         assert len(audio1) > 0
@@ -136,6 +136,58 @@ def test_tts_cache():
 
     asyncio.run(_run())
 
+def test_unauthenticated_call_logs_protection():
+    """Verify that unauthenticated guest users are strictly rejected with 401 on call logs."""
+    # 1. GET /api/calls without session cookie
+    res = client.get("/api/calls")
+    assert res.status_code == 401, f"Expected 401 Unauthorized for guest call logs, got {res.status_code}"
+
+    # 2. GET /api/history without session cookie
+    res_hist = client.get("/api/history?session_id=test_phase9_1")
+    assert res_hist.status_code == 401, f"Expected 401 Unauthorized for guest transcript, got {res_hist.status_code}"
+
+    # 3. POST /api/calls/sync without session cookie
+    res_sync = client.post("/api/calls/sync", json={"session_id": "test_sync", "messages": []})
+    assert res_sync.status_code == 401, f"Expected 401 Unauthorized for guest sync, got {res_sync.status_code}"
+    print("[OK] test_unauthenticated_call_logs_protection passed (401 enforced)")
+
+def test_guest_quota_enforcement():
+    """Verify that guest quota enforces max 3 interactions before triggering mandatory auth barrier."""
+    guest_sid = f"guest_quota_session_{int(time.time())}"
+    # Turn 1
+    r1 = client.post("/api/chat/stream", json={"session_id": guest_sid, "message": "hello"})
+    assert r1.status_code == 200
+    events1 = parse_sse_events(r1.text)
+    assert not any(e.get("type") == "guest_limit" for e in events1)
+
+    # Turn 2
+    r2 = client.post("/api/chat/stream", json={"session_id": guest_sid, "message": "what is your working hours?"})
+    assert r2.status_code == 200
+    events2 = parse_sse_events(r2.text)
+    assert not any(e.get("type") == "guest_limit" for e in events2)
+
+    # Turn 3
+    r3 = client.post("/api/chat/stream", json={"session_id": guest_sid, "message": "do you sell laptops?"})
+    assert r3.status_code == 200
+    events3 = parse_sse_events(r3.text)
+    assert not any(e.get("type") == "guest_limit" for e in events3)
+
+    # Turn 4 (Exceeds GUEST_CALL_LIMIT=3) -> Guest limit reached
+    r4 = client.post("/api/chat/stream", json={"session_id": guest_sid, "message": "how much is dell laptop?"})
+    assert r4.status_code == 200
+    events4 = parse_sse_events(r4.text)
+    assert any(e.get("type") == "guest_limit" or e.get("intent") == "guest_limit_reached" for e in events4)
+    print("[OK] test_guest_quota_enforcement passed (quota wall triggered after 3 turns)")
+
+def test_dynamic_branding_public():
+    """Verify GET /api/business-settings is public and dynamic branding reflects immediately."""
+    res = client.get("/api/business-settings")
+    assert res.status_code == 200
+    settings = res.json()
+    assert "business_name" in settings
+    assert len(settings["business_name"]) > 0
+    print(f"[OK] test_dynamic_branding_public passed (business_name: '{settings['business_name']}')")
+
 if __name__ == "__main__":
     print("\n--- Running Phase 9 Automated Verification ---")
     test_fillers_endpoint()
@@ -147,4 +199,7 @@ if __name__ == "__main__":
     test_direct_handoff_api()
     test_call_messages_persistence()
     test_tts_cache()
-    print("\nALL PHASE 9 VERIFICATION TESTS PASSED SUCCESSFULLY!\n")
+    test_unauthenticated_call_logs_protection()
+    test_guest_quota_enforcement()
+    test_dynamic_branding_public()
+    print("\nALL VERIFICATION TESTS PASSED SUCCESSFULLY!\n")

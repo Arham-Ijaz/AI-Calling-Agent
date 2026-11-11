@@ -105,7 +105,7 @@ assert.strictEqual(ro1, true, "Roman Urdu echo should be detected");
 console.log("[PASS] Roman Urdu echo detected");
 
 // 4. Legitimate user requests (must NOT be discarded!)
-const leg1 = isEcho("Can you tell me about the Dell XPS laptop specifications?", "Hello! Welcome to DigiBuzz AI calling service. How may I assist you?");
+const leg1 = isEcho("Can you tell me about the Dell XPS laptop specifications?", "Hello! Welcome to our AI calling service. How may I assist you?");
 assert.strictEqual(leg1, false, "Legitimate inquiry should NOT be detected as echo");
 console.log("[PASS] Legitimate product inquiry NOT discarded");
 

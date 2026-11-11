@@ -77,8 +77,8 @@
     },
     {
       "intent": "account_registration",
-      "question": "How can I register my shop on the DigiBuzz B2B Network?",
-      "answer": "Download the app and enter your phone number, shop name and address. Your account activates immediately."
+      "question": "How can I register my account or shop with your network?",
+      "answer": "Sign up online or contact our team with your business name and address. Your account activates immediately."
     },
     {
       "intent": "offline_usage",
